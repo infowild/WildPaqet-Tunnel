@@ -1,0 +1,3 @@
+# Force shell scripts to LF so Linux shebangs never break (bad interpreter)
+*.sh text eol=lf
+*.md text eol=lf

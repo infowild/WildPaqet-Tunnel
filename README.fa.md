@@ -1,184 +1,181 @@
-# WildPaqet-Tunnel | [📄 English](README.md)
+<div align="center">
 
-اسکریپت مدیریتی برای **paqet**: تونل مبتنی بر Raw Socket و KCP برای عبور از فایروال و DPI. از سناریوی **سرور خارج (Kharej)** و **کلاینت ایران** پشتیبانی می‌کند.
+# WildPaqet Tunnel
 
-این مخزن فورک نگهداری‌شده از [Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager) است و با نام **WildPaqet Tunnel Manager v7.1** به‌روز شده است.
+**منیجر تونل Raw-Packet + KCP برای شبکه‌های محدود**
 
-**آدرس پروژه:** https://github.com/infowild/WildPaqet-Tunnel
+[![Version](https://img.shields.io/badge/version-7.1-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
+[![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
+[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/main/wildpaqet.sh)
+
+[English](README.md) · [مخزن](https://github.com/infowild/WildPaqet-Tunnel) · [هسته paqet](https://github.com/hanselime/paqet)
+
+<br/>
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+```
+
+بعد از اولین اجرا:
+
+```bash
+wildpaqet
+```
+
+</div>
 
 ---
 
-## فهرست مطالب
+## چرا WildPaqet؟
 
-* [شروع سریع](#شروع-سریع)
-* [نصب به‌عنوان دستور سیستم](#نصب-بهعنوان-دستور-سیستم)
-* [مراحل نصب](#مراحل-نصب)
-* [تنظیمات پیشرفته (KCP)](#تنظیمات-پیشرفته-حالتهای-kcp)
-* [بهینه‌سازی شبکه](#بهینهسازی-شبکه-اختیاری)
-* [ابزارها](#ابزارهای-استفادهشده)
-* [عیب‌یابی](#عیبیابی-مشکلات-نصب-paqet)
-* [پیش‌نیازها](#پیشنیازها)
-* [تغییرات v7.1](#تغییرات-v71)
-* [قدردانی](#قدردانی)
-* [لایسنس](#لایسنس)
+مدیریت حرفه‌ای هسته [paqet](https://github.com/hanselime/paqet) برای سناریوی **خارج ↔ ایران**:
+
+| قابلیت | توضیح |
+|--------|--------|
+| یک دستور | نصب یک‌بار، اجرا با `wildpaqet` |
+| دو نقش | سرور خارج + کلاینت ایران (Forward / SOCKS5) |
+| چند لوکیشن | چند سرویس روی یک ایران → چند خارج |
+| چند پورت | لیست پورت با کاما + tcp/udp |
+| پاکسازی کامل | Uninstall برای برگرداندن تغییرات اسکریپت |
+
+فورک نگهداری‌شده از [Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager).
+
+---
+
+## معماری
+
+```mermaid
+flowchart LR
+  U[کاربر / پنل] --> IR[سرور ایران<br/>کلاینت wildpaqet]
+  IR -->|تونل KCP| KH1[خارج A]
+  IR -->|تونل KCP| KH2[خارج B]
+  KH1 --> NET[اینترنت / سرویس اصلی]
+  KH2 --> NET
+```
+
+- **خارج:** `role: server`  
+- **ایران:** Forward یا SOCKS5  
+- **کلید و نسخه هسته** دو طرف یکسان باشد  
 
 ---
 
 ## شروع سریع
 
-روی **هر دو سرور** با **root**:
+### ۱) اجرا با root
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
-> نسخه قدیمی‌تر منیجر (در صورت نیاز):
+در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود.
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager3-8.sh)
-```
-
----
-
-## نصب به‌عنوان دستور سیستم
-
-داخل منیجر:
-
-1. گزینه **0** → Install Paqet Binary / Manager  
-2. گزینه **4** → Install script  
-
-اسکریپت در مسیر `/usr/local/bin/wildpaqet` نصب می‌شود.
-
-بعد از آن هر وقت با این دستور اجرا کنید:
+### ۲) خارج → گزینه ۲  
+### ۳) ایران → گزینه ۳  
+### ۴) استفاده روزانه
 
 ```bash
 wildpaqet
 ```
 
+اگر `command not found` دیدی:
+
+```bash
+export PATH="/usr/local/bin:$PATH" && hash -r
+# یا
+/usr/local/bin/wildpaqet
+```
+
 ---
 
-## مراحل نصب
+## پیش‌فرض‌های v7.1
 
-### مرحله ۱: سرور خارج (Kharej)
+| مورد | سرور | کلاینت |
+|------|------|--------|
+| Mode | `fast` | `fast` |
+| Conn | `4` | `1` |
+| MTU | `1350` | `1350` |
+| Encryption | `aes-128-gcm` | `aes-128-gcm` |
+
+---
+
+## منو
+
+| # | کار |
+|---|-----|
+| 0 | نصب/آپدیت هسته و منیجر |
+| 2 / 3 | کانفیگ خارج / ایران |
+| 4 / 5 | مدیریت سرویس‌ها |
+| 7 | بهینه‌سازی |
+| 8 | حذف کامل |
+| 9 | ربات تلگرام |
+
+---
+
+## آپدیت
 
 ```bash
 wildpaqet
-# یا اولین اجرا:
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+# 0 → 5
 ```
 
-1. **گزینه 2** (Kharej)  
-2. نام سرویس  
-3. پورت Listen  
-4. Enter برای ساخت Secret Key  
-5. تأیید با **`Y`**  
-6. حالت KCP (پیشنهادی: `fast`)  
-7. **conn** → پیش‌فرض سرور: `4`  
-8. **MTU** → پیش‌فرض: `1350`  
-9. Encryption (پیش‌فرض: `aes-128-gcm`)  
-10. بافرها → Enter  
-
-### مرحله ۲: سرور ایران (Client)
-
-1. **گزینه 3** (Iran)  
-2. نام سرویس  
-3. IP سرور خارج  
-4. پورت تونل  
-5. Secret Key  
-6. حالت KCP  
-7. **conn** → پیش‌فرض کلاینت: `1`  
-8. **MTU** → `1350`  
-9. Encryption  
-10. بافرها → Enter  
-11. Port Forwarding یا SOCKS5  
-12. پورت‌های Forward و پروتکل  
-
-**نکته:** نسخه هسته روی هر دو سرور باید یکسان باشد.
-
-### نصب هسته از URL سفارشی
-
-`wildpaqet` → گزینه **0** → گزینه **3** → لینک آرشیو را وارد کنید.
-
-ریلیز رسمی هسته: [hanselime/paqet releases](https://github.com/hanselime/paqet/releases)
-
 ---
 
-## تنظیمات پیشرفته (حالت‌های KCP)
-
-0. **normal** – معمولی  
-1. **fast** – متعادل (پیشنهادی)  
-2. **fast2** – سریع‌تر  
-3. **fast3** – حداکثر سرعت  
-4. **manual** – دستی  
-
----
-
-## بهینه‌سازی شبکه (اختیاری)
-
-`wildpaqet` → گزینه **7**: BBR / DNS Finder / Mirror Selector
-
----
-
-## ابزارهای استفاده‌شده
-
-* [BBR – teddysun/across](https://github.com/teddysun/across/)  
-* [IranDNSFinder](https://github.com/alinezamifar/IranDNSFinder)  
-* [DetectUbuntuMirror](https://github.com/alinezamifar/DetectUbuntuMirror)  
-
----
-
-## عیب‌یابی: مشکلات نصب Paqet
-
-### ۱) دانلود / پیدا نشدن باینری
-
-فایل را در `/root/paqet/` بگذارید و از نصب فایل محلی استفاده کنید.
-
-### ۲) خطای GLIBC
-
-ارتقای OS یا بیلد از سورس (دستورها در README انگلیسی).
-
-### ۳) پورت در حال استفاده
+## حذف کامل
 
 ```bash
-ss -tuln | grep 8443
-lsof -i :8443
+wildpaqet
+# گزینه 8 → تایپ YES
 ```
 
-### حذف کامل (Uninstall)
-
-`wildpaqet` → گزینه **8** → تایپ **`YES`**
-
-سرویس‌ها، cron، هسته، کانفیگ، دستور `wildpaqet`، ربات تلگرام، sysctl/limits اسکریپت، و قوانین iptables محافظتی Paqet پاک می‌شوند. پاک کردن NAT و پوشه‌های `/root/paqet` و بکاپ اختیاری است. پکیج‌های apt/yum و BBR خارجی به‌صورت خودکار برنمی‌گردند.
+سرویس، cron، هسته، کانفیگ، دستور `wildpaqet`، ربات، sysctl/limits اسکریپت و قوانین محافظتی پاک می‌شوند. پکیج‌های سیستم و BBR خارجی دست نخورده می‌مانند.
 
 ---
 
-## پیش‌نیازها
+## عیب‌یابی سریع
 
-* لینوکس + root  
-* `libpcap-dev` ، `iptables`  
-* باینری `paqet`  
+<details>
+<summary><b>wildpaqet پیدا نمی‌شود</b></summary>
+
+یک‌بار لانچر curl را با root اجرا کن، یا:
+```bash
+ls -l /usr/local/bin/wildpaqet
+/usr/local/bin/wildpaqet
+```
+</details>
+
+<details>
+<summary><b>bad interpreter</b></summary>
+
+معمولاً CRLF است — آپدیت منیجر (0→5)؛ اسکریپت `\r` را پاک می‌کند.
+</details>
+
+<details>
+<summary><b>GLIBC / پورت اشغال</b></summary>
+
+OS جدیدتر یا بیلد از سورس؛ برای پورت: `ss -tuln` / `lsof`.
+</details>
 
 ---
 
-## تغییرات v7.1
+## پیش‌نیاز
 
-* دستور اجرا: **`wildpaqet`** (`/usr/local/bin/wildpaqet`)  
-* فایل اصلی: **`wildpaqet.sh`**  
-* بنر رنگی جدید WildPaqet + لینک گیت‌هاب  
-* آدرس‌ها روی `infowild/WildPaqet-Tunnel`  
-* فیکس باگ duplicate `conn` و نصب امن‌تر هسته  
-* یکدست‌سازی MTU/conn  
-* حذف پروکسی تلگرام شخص‌ثالث  
-* **Uninstall کامل** برای برگرداندن سرویس/کرون/باینری/کانفیگ/منیجر/ربات/sysctl/iptables
+لینوکس + root + `libpcap` + `iptables` + `curl` + هسته paqet یکسان دو طرف
+
 ---
 
 ## قدردانی
 
-* **[paqet](https://github.com/hanselime/paqet)** – hanselime  
-* **[Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager)** – behzadea12  
+- [paqet](https://github.com/hanselime/paqet) — hanselime  
+- [Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager) — منیجر اولیه  
 
 ---
 
 ## لایسنس
 
-MIT (مطابق upstream؛ در صورت تمایل فایل `LICENSE` اضافه کنید).
+MIT
+
+<div align="center">
+
+**WildPaqet** · [InfoWild](https://github.com/infowild)
+
+</div>

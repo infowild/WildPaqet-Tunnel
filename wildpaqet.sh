@@ -192,7 +192,57 @@ show_banner() {
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
+        echo -e "${YELLOW}Try:${NC} ${CYAN}sudo wildpaqet${NC}  or  ${CYAN}sudo bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)${NC}"
         exit 1
+    fi
+}
+
+# Ensure /usr/local/bin/wildpaqet exists so the command works after first run
+ensure_manager_command() {
+    local installed=0
+    if [ -x "$MANAGER_PATH" ] && grep -q 'MANAGER_NAME="wildpaqet"' "$MANAGER_PATH" 2>/dev/null; then
+        # Fix accidental Windows CRLF that breaks shebang: bad interpreter
+        if grep -q $'\r' "$MANAGER_PATH" 2>/dev/null; then
+            sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+            chmod +x "$MANAGER_PATH"
+        fi
+        installed=1
+    fi
+
+    if [ "$installed" -eq 0 ]; then
+        print_step "Installing system command ${CYAN}wildpaqet${NC} ..."
+        local copied=0
+        # Works for normal file runs and usually for bash <(curl ...) via /dev/fd/*
+        if [ -n "${BASH_SOURCE[0]:-}" ] && [ -e "${BASH_SOURCE[0]}" ]; then
+            if cp -f "${BASH_SOURCE[0]}" "$MANAGER_PATH" 2>/dev/null; then
+                copied=1
+            fi
+        fi
+        if [ "$copied" -eq 0 ]; then
+            local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
+            if ! curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
+                print_warning "Could not install wildpaqet command automatically"
+                print_info "Install manually: option 0 → 4"
+                return 1
+            fi
+        fi
+        sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+        chmod +x "$MANAGER_PATH"
+        rm -f /usr/local/bin/paqet-manager 2>/dev/null || true
+        print_success "Installed: $MANAGER_PATH"
+    fi
+
+    # Fallback PATH for minimal systems
+    if ! command -v wildpaqet >/dev/null 2>&1; then
+        ln -sf "$MANAGER_PATH" /usr/bin/wildpaqet 2>/dev/null || true
+    fi
+    hash -r 2>/dev/null || true
+
+    if command -v wildpaqet >/dev/null 2>&1; then
+        print_info "Run anytime with: ${CYAN}wildpaqet${NC}"
+    else
+        print_warning "Command not in PATH yet. Use: ${CYAN}$MANAGER_PATH${NC}"
+        print_info "Or: ${CYAN}export PATH=\"/usr/local/bin:\$PATH\" && hash -r${NC}"
     fi
 }
 
@@ -2755,14 +2805,20 @@ install_manager_script() {
     print_info "Downloading from: $manager_url"
     
     if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
+        sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
         chmod +x "$MANAGER_PATH"
         # Remove legacy command name if present
         rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
+        ln -sf "$MANAGER_PATH" /usr/bin/wildpaqet 2>/dev/null || true
+        hash -r 2>/dev/null || true
         print_success "✅ WildPaqet Manager installed to $MANAGER_PATH"
         echo -e "\n${GREEN}You can now run the manager with:${NC}"
         echo -e " ${CYAN}wildpaqet${NC}"
-        echo -e "\n${YELLOW}Note: If the command is not found, open a new shell or run:${NC}"
-        echo -e " ${CYAN}hash -r${NC}"
+        if ! command -v wildpaqet >/dev/null 2>&1; then
+            echo -e "\n${YELLOW}If command not found:${NC}"
+            echo -e " ${CYAN}export PATH=\"/usr/local/bin:\$PATH\" && hash -r${NC}"
+            echo -e " or run: ${CYAN}$MANAGER_PATH${NC}"
+        fi
     else
         print_error "Failed to download manager script"
         pause
@@ -2798,8 +2854,11 @@ update_manager_script() {
     print_info "Downloading latest version..."
     
     if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
+        sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
         chmod +x "$MANAGER_PATH"
         rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
+        ln -sf "$MANAGER_PATH" /usr/bin/wildpaqet 2>/dev/null || true
+        hash -r 2>/dev/null || true
         print_success "✅ WildPaqet Manager updated successfully!"
         echo -e "\n${GREEN}Manager updated to latest version${NC}"
         echo -e "${GREEN}Run with:${NC} ${CYAN}wildpaqet${NC}"
@@ -4902,6 +4961,7 @@ uninstall_paqet() {
     print_step "Removing WildPaqet manager command..."
     rm -f "$MANAGER_PATH" 2>/dev/null || true
     rm -f /usr/local/bin/paqet-manager 2>/dev/null || true
+    rm -f /usr/bin/wildpaqet 2>/dev/null || true
     print_success "Manager command removed (wildpaqet)"
 
     # --- 8) Optional caches ---
@@ -5871,4 +5931,5 @@ main_menu() {
 # ================================================
 
 check_root
+ensure_manager_command
 main_menu
