@@ -11,9 +11,8 @@ This repository is a maintained fork of [Paqet-Tunnel-Manager](https://github.co
 ## Table of Contents
 
 * [Quick Start](#quick-start)
+* [Install as system command](#install-as-system-command)
 * [Installation Steps](#installation-steps)
-  * [Step 1: Setup Server (Kharej)](#step-1-setup-server-kharej--vpn-server)
-  * [Step 2: Setup Server (Iran)](#step-2-setup-server-iran--cliententry-point)
 * [Advanced Configuration (KCP Modes)](#advanced-configuration-kcp-modes)
 * [Network Optimization (Optional)](#network-optimization-optional)
 * [Included Tools](#included-tools)
@@ -27,10 +26,10 @@ This repository is a maintained fork of [Paqet-Tunnel-Manager](https://github.co
 
 ## Quick Start
 
-Run the script on **both servers** as **root**:
+Run once on **both servers** as **root**:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
 > **Older manager builds** (if needed):
@@ -39,7 +38,22 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/ma
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager3-8.sh)
 ```
 
-Select **option 0**, then **option 1** to install prerequisites / core.
+---
+
+## Install as system command
+
+After opening the manager, choose:
+
+1. Option **0** → Install Paqet Binary / Manager  
+2. Option **4** → Install script  
+
+The manager is installed to `/usr/local/bin/wildpaqet`.
+
+Then run anytime with:
+
+```bash
+wildpaqet
+```
 
 ---
 
@@ -48,7 +62,9 @@ Select **option 0**, then **option 1** to install prerequisites / core.
 ### Step 1: Setup Server (Kharej – VPN Server)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager.sh)
+wildpaqet
+# or first run:
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
 1. **Select option 2** (Kharej)
@@ -57,56 +73,55 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/ma
 4. Press Enter to auto-generate the **secret key** (save it)
 5. Confirm with **`Y`**
 6. Select **KCP mode** (default: `fast`)
-7. **conn** → number of KCP connections (default: `4`)
-8. **MTU** → default `1350` (or set manually, e.g. `1200`)
+7. **conn** → default `4` on server
+8. **MTU** → default `1350`
 9. Select **encryption** (default: `aes-128-gcm`)
-10. **pcap sockbuf** / **transport tcpbuf** / **transport udpbuf** → Enter to skip defaults
+10. Buffer options → Enter to skip
 
 ### Step 2: Setup Server (Iran – Client/Entry Point)
 
 1. **Select option 3** (Iran)
 2. Enter a **service name**
 3. Enter the **Kharej server IP**
-4. Enter the **server port** used between the two servers
-5. Enter the **secret key** from the server side
+4. Enter the **server port**
+5. Enter the **secret key**
 6. Select **KCP mode** (default: `fast`)
 7. **conn** → default `1` on client
 8. **MTU** → default `1350`
-9. Select **encryption** (default: `aes-128-gcm`)
+9. Select **encryption**
 10. Buffer options → Enter to skip
-11. Choose traffic type: **Port Forwarding** or **SOCKS5**
-12. For forwarding: enter ports (e.g. `333` or `333,394,395`) and protocol per port (`tcp` / `udp` / both)
+11. Choose **Port Forwarding** or **SOCKS5**
+12. For forwarding: ports (e.g. `333` or `333,394,395`) and protocol per port
 
 **Important:** Use the **same paqet core version** on both servers.
 
 ### Optional: Install core from a custom URL
 
-1. Run the manager → option **0**
-2. Option **3** (Download from custom URL)
-3. Paste an archive URL matching your arch (`amd64` / `arm64`)
-4. Restart services (option **5** → restart all if needed)
+1. `wildpaqet` → option **0** → option **3** (custom URL)
+2. Paste an archive URL for your arch
+3. Restart services
 
-Official core releases: [hanselime/paqet releases](https://github.com/hanselime/paqet/releases)
+Official core: [hanselime/paqet releases](https://github.com/hanselime/paqet/releases)
 
 ---
 
 ## Advanced Configuration (KCP Modes)
 
 0. **normal** – Normal speed, normal latency, low usage  
-1. **fast** – Balanced (recommended for most setups)  
-2. **fast2** – Higher speed, lower latency, moderate usage  
-3. **fast3** – Max speed, very low latency, high CPU  
+1. **fast** – Balanced (recommended)  
+2. **fast2** – Higher speed, moderate usage  
+3. **fast3** – Max speed, high CPU  
 4. **manual** – Advanced parameters  
 
 ---
 
 ## Network Optimization (Optional)
 
-Select **option 7**:
+`wildpaqet` → option **7**:
 
-1. **BBR** – TCP congestion control *(recommended on external servers)*
-2. **DNS Finder** – Best DNS for Iran *(recommended on Iran servers)*
-3. **Mirror Selector** – Fastest APT mirror *(Ubuntu/Debian)*
+1. **BBR** – recommended on external servers  
+2. **DNS Finder** – recommended on Iran servers  
+3. **Mirror Selector** – Ubuntu/Debian APT mirrors  
 
 ---
 
@@ -122,13 +137,11 @@ Select **option 7**:
 
 ### 1) Download / binary not found
 
-1. Download from [paqet releases](https://github.com/hanselime/paqet/releases)
-2. Place the archive in `/root/paqet/`
-3. Re-run the manager and use **local file** install (option 0 → 2)
+Place the archive in `/root/paqet/` and use local install (option 0 → 2).
 
 ### 2) `GLIBC_2.32` / `GLIBC_2.34` not found
 
-Upgrade OS (Ubuntu 22.04+ / Debian 12+), build from source, or use a newer VPS:
+Upgrade OS or build from source:
 
 ```bash
 apt install -y golang git
@@ -145,44 +158,40 @@ ss -tuln | grep 8443
 lsof -i :8443
 ```
 
-Change the port or stop the conflicting process. Remove duplicate `forward` listen entries in `/etc/paqet/*.yaml` if needed.
-
 ### 4) Duplicate `conn:` after bulk edit (fixed in v7.1)
 
-Older v7.0 could append a second `conn` under `transport`. Upgrade to this manager and re-apply connections once, or manually keep a single indented `conn:` under `transport:`.
+Upgrade manager and re-apply connections once, or keep a single indented `conn:` under `transport:`.
 
 ---
 
 ## Requirements
 
-* Linux server (Ubuntu, Debian, CentOS, …)
-* Root access
-* `libpcap-dev`, `iptables`
-* `paqet` core binary
+* Linux + root  
+* `libpcap-dev`, `iptables`  
+* `paqet` core binary  
 
 ---
 
 ## Changelog (v7.1)
 
-* Retargeted manager URLs to `infowild/WildPaqet-Tunnel`
-* Fixed bulk **connections** edit creating duplicate `conn` keys
-* Safer core install (extract to temp first; keep previous binary backup)
-* Aligned defaults: MTU `1350`, client connections `1`, server connections `4`
-* Fixed KCP mode menu descriptions
-* Kernel backup filenames use timestamp at backup time
-* Removed third-party Telegram proxy; official API (+ optional SOCKS5)
-* BBR download uses `curl` with TLS verification
-* Removed misleading `GOMAXPROCS=0` from systemd unit
+* Command name: **`wildpaqet`** (installed to `/usr/local/bin/wildpaqet`)
+* Main script file: **`wildpaqet.sh`**
+* New multi-color **WildPaqet** banner + GitHub link
+* Retargeted URLs to `infowild/WildPaqet-Tunnel`
+* Fixed bulk connections duplicate-`conn` bug
+* Safer core install; aligned MTU/conn defaults
+* Official Telegram API only (+ optional SOCKS5)
+* TLS-verified BBR download; removed `GOMAXPROCS=0`
 
 ---
 
 ## Credits
 
-* **[paqet](https://github.com/hanselime/paqet)** – raw packet tunneling by hanselime
-* **[Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager)** – original manager by behzadea12
+* **[paqet](https://github.com/hanselime/paqet)** – by hanselime  
+* **[Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager)** – original manager by behzadea12  
 
 ---
 
 ## License
 
-MIT (as stated by the upstream projects; add a `LICENSE` file to this repo if you want it explicit on GitHub).
+MIT (as stated by the upstream projects; add a `LICENSE` file if you want it explicit on GitHub).

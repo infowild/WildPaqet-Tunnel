@@ -26,8 +26,9 @@ readonly NC='\033[0m'
 
 # Script Configuration
 readonly SCRIPT_VERSION="7.1"
-readonly MANAGER_NAME="paqet-manager"
+readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
+readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
 
 # Paths
 readonly CONFIG_DIR="/etc/paqet"
@@ -133,7 +134,7 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
-    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager.sh"
+    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh"
     ["6.0"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager6-0.sh"
     ["5.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager5-1.sh"
     ["3.8"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager3-8.sh"
@@ -161,23 +162,30 @@ pause() {
 # Clear screen and show banner
 show_banner() {
     clear
-    echo -e "${MAGENTA}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                                                              ║"
-    echo "║     ██████╗  █████╗  ██████╗ ███████╗████████╗               ║"
-    echo "║     ██╔══██╗██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝               ║"
-    echo "║     ██████╔╝███████║██║   ██║█████╗     ██║                  ║"
-    echo "║     ██╔═══╝ ██╔══██║██║▄▄ ██║██╔══╝     ██║                  ║"
-    echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
-    echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
-    echo "║                                                              ║"
-    echo "║          WildPaqet Tunnel Manager - Firewall Bypass          ║"
-    echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
-    echo "║                                                              ║"
-    echo "║          https://github.com/infowild/WildPaqet-Tunnel        ║"
-    echo "║                                                              ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo ""
+    echo -e "${CYAN}    ╔════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${WHITE}██╗    ██╗██╗██╗     ██████╗${NC}                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${WHITE}██║    ██║██║██║     ██╔══██╗${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${WHITE}██║ █╗ ██║██║██║     ██║  ██║${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${WHITE}██║███╗██║██║██║     ██║  ██║${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${WHITE}╚███╔███╔╝██║███████╗██████╔╝${NC}                           ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}   ${WHITE}╚══╝╚══╝ ╚═╝╚══════╝╚═════╝${NC}                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}██████╗  █████╗  ██████╗ ███████╗████████╗${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}██╔══██╗██╔══██╗██╔═══██╗██╔════╝╚══██╔══╝${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}██████╔╝███████║██║   ██║█████╗     ██║${NC}                 ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}██╔═══╝ ██╔══██║██║▄▄ ██║██╔══╝     ██║${NC}                 ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}██║     ██║  ██║╚██████╔╝███████╗   ██║${NC}                 ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${GREEN}╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝${NC}                 ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}     ${YELLOW}✦  Raw Packet Tunnel  ·  Firewall Bypass  ✦${NC}          ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}              ${MAGENTA}Manager v${SCRIPT_VERSION}${NC}  ·  ${WHITE}by InfoWild${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}  ${BLUE}https://github.com/infowild/WildPaqet-Tunnel${NC}             ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
+    echo -e "${CYAN}    ╚════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
 }
 
 # Check root
@@ -2740,18 +2748,21 @@ install_paqet() {
 install_manager_script() {
     clear
     show_banner
-    print_step "Installing Paqet Manager script...\n"
+    print_step "Installing WildPaqet Manager script...\n"
     
-    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/paqet-manager.sh"
+    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
     
     print_info "Downloading from: $manager_url"
     
     if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
         chmod +x "$MANAGER_PATH"
-        print_success "✅ Paqet Manager installed to $MANAGER_PATH"
-        echo -e "\n${GREEN}You can now run the manager using command:${NC}"
-        echo -e " ${CYAN}paqet-manager${NC}"
-        echo -e "\n${YELLOW}Note: You may need to log out and back in for the command to be available.${NC}"
+        # Remove legacy command name if present
+        rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
+        print_success "✅ WildPaqet Manager installed to $MANAGER_PATH"
+        echo -e "\n${GREEN}You can now run the manager with:${NC}"
+        echo -e " ${CYAN}wildpaqet${NC}"
+        echo -e "\n${YELLOW}Note: If the command is not found, open a new shell or run:${NC}"
+        echo -e " ${CYAN}hash -r${NC}"
     else
         print_error "Failed to download manager script"
         pause
@@ -2766,7 +2777,7 @@ install_manager_script() {
 update_manager_script() {
     clear
     show_banner
-    print_step "Updating Paqet Manager script...\n"
+    print_step "Updating WildPaqet Manager script...\n"
     
     if [ ! -f "$MANAGER_PATH" ]; then
         print_warning "Manager script not found at $MANAGER_PATH"
@@ -2778,18 +2789,20 @@ update_manager_script() {
     fi
     
     mkdir -p "$BACKUP_DIR"
-    local backup_path="${BACKUP_DIR}/paqet-manager.backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_path="${BACKUP_DIR}/wildpaqet.backup-$(date +%Y%m%d-%H%M%S)"
     cp "$MANAGER_PATH" "$backup_path"
     print_info "Backup created at $backup_path"
     
-    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/paqet-manager.sh"
+    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
     
     print_info "Downloading latest version..."
     
     if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
         chmod +x "$MANAGER_PATH"
-        print_success "✅ Paqet Manager updated successfully!"
+        rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
+        print_success "✅ WildPaqet Manager updated successfully!"
         echo -e "\n${GREEN}Manager updated to latest version${NC}"
+        echo -e "${GREEN}Run with:${NC} ${CYAN}wildpaqet${NC}"
         echo -e "${YELLOW}Backup saved at:${NC} $backup_path"
         
         local new_version
@@ -2810,7 +2823,7 @@ update_manager_script() {
 switch_manager_version() {
     clear
     show_banner
-    print_step "Switch Paqet Manager Version\n"
+    print_step "Switch WildPaqet Manager Version\n"
     
     echo -e "${YELLOW}Available versions:${NC}"
     echo -e "────────────────────────────────────────────────────────────────"
@@ -2855,15 +2868,17 @@ switch_manager_version() {
     
     if [ -f "$MANAGER_PATH" ]; then
         mkdir -p "$BACKUP_DIR"
-        local backup_path="${BACKUP_DIR}/paqet-manager.backup-$(date +%Y%m%d-%H%M%S)"
+        local backup_path="${BACKUP_DIR}/wildpaqet.backup-$(date +%Y%m%d-%H%M%S)"
         cp "$MANAGER_PATH" "$backup_path"
         print_info "Backup created at $backup_path"
     fi
     
     if curl -fsSL "$selected_url" -o "$MANAGER_PATH" 2>/dev/null; then
         chmod +x "$MANAGER_PATH"
+        rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
         print_success "✅ Switched to version $selected_version"
         echo -e "\n${GREEN}Manager version changed successfully!${NC}"
+        echo -e "${GREEN}Run with:${NC} ${CYAN}wildpaqet${NC}"
         echo -e "${YELLOW}Backup saved at:${NC} $backup_path"
     else
         print_error "Failed to download version $selected_version"
@@ -2879,7 +2894,7 @@ switch_manager_version() {
 uninstall_manager_script() {
     clear
     show_banner
-    print_step "Uninstall Paqet Manager\n"
+    print_step "Uninstall WildPaqet Manager\n"
     
     if [ ! -f "$MANAGER_PATH" ]; then
         print_info "Manager script not found at $MANAGER_PATH"
@@ -2887,7 +2902,7 @@ uninstall_manager_script() {
         return 0
     fi
     
-    echo -e "${RED}WARNING: This will remove the Paqet Manager command.${NC}"
+    echo -e "${RED}WARNING: This will remove the WildPaqet command (${MANAGER_NAME}).${NC}"
     echo -e "${YELLOW}The manager script will be deleted from:${NC} $MANAGER_PATH\n"
     
     read -p "Are you sure you want to uninstall? (y/N): " confirm
@@ -2899,14 +2914,14 @@ uninstall_manager_script() {
     fi
     
     mkdir -p "$BACKUP_DIR"
-    local backup_path="${BACKUP_DIR}/paqet-manager.backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_path="${BACKUP_DIR}/wildpaqet.backup-$(date +%Y%m%d-%H%M%S)"
     cp "$MANAGER_PATH" "$backup_path"
     print_info "Backup created at $backup_path"
     
     rm -f "$MANAGER_PATH"
     
     if [ ! -f "$MANAGER_PATH" ]; then
-        print_success "✅ Paqet Manager uninstalled successfully"
+        print_success "✅ WildPaqet Manager uninstalled successfully"
         echo -e "\n${YELLOW}Backup saved at:${NC} $backup_path"
         echo -e "${YELLOW}To restore, run:${NC} cp $backup_path $MANAGER_PATH"
     else
@@ -5660,7 +5675,7 @@ main_menu() {
         show_banner
         
         echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${GREEN}║ Main Menu                                                ║${NC}"
+        echo -e "${GREEN}║ WildPaqet Main Menu                                      ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
         
         if [ -f "$BIN_DIR/paqet" ]; then
