@@ -158,9 +158,11 @@ ss -tuln | grep 8443
 lsof -i :8443
 ```
 
-### 4) Duplicate `conn:` after bulk edit (fixed in v7.1)
+### Full uninstall
 
-Upgrade manager and re-apply connections once, or keep a single indented `conn:` under `transport:`.
+`wildpaqet` → option **8** → type **`YES`**
+
+Removes services, cron, core binary, configs, manager command (`wildpaqet`), Telegram bot, kernel/limits drop-ins, and Paqet iptables protection rules. Optionally flushes NAT and deletes `/root/paqet` + backup folder. Apt/yum packages and external BBR installer changes are not reverted automatically.
 
 ---
 
@@ -182,6 +184,7 @@ Upgrade manager and re-apply connections once, or keep a single indented `conn:`
 * Safer core install; aligned MTU/conn defaults
 * Official Telegram API only (+ optional SOCKS5)
 * TLS-verified BBR download; removed `GOMAXPROCS=0`
+* **Full uninstall** restores services/cron/binaries/configs/manager/bot/sysctl/limits/iptables protection (optional NAT flush)
 
 ---
 

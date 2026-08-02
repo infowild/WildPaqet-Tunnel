@@ -3905,7 +3905,8 @@ remove_connection_protection() {
     echo -e "${YELLOW}Remove Connection Protection Rules${NC}"
     echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
     
-    print_warning "This will remove all Paqet-related iptables protection rules."
+    print_warning "This will remove Paqet-related iptables protection rules (from configs)."
+    echo -e "${CYAN}Note: This does NOT flush entire raw/mangle tables.${NC}"
     echo ""
     read -p "Are you sure? (y/N): " confirm
     
@@ -3915,34 +3916,9 @@ remove_connection_protection() {
         return
     fi
     
-    local rules_removed=0
-    
-    # Find and remove all Paqet-related rules
-    # Method 1: Remove rules based on port ranges (common paqet ports)
-    for table in raw mangle; do
-        # Get all rules in the table
-        while IFS= read -r rule; do
-            if [[ "$rule" == *"paqet"* ]] || [[ "$rule" == *"NOTRACK"* ]] || [[ "$rule" == *"RST"* ]]; then
-                # This is a simplistic approach - better to track specific rules
-                iptables -t "$table" -F 2>/dev/null && ((rules_removed+=10))
-                break
-            fi
-        done < <(iptables -t "$table" -L 2>/dev/null | head -20)
-    done
-    
-    # More precise: Flush only specific chains if we want to be careful
-    iptables -t raw -F 2>/dev/null && ((rules_removed+=5))
-    iptables -t mangle -F 2>/dev/null && ((rules_removed+=5))
-    
-    print_success "Removed protection rules (approx $rules_removed rules flushed)"
-    
-    # Save iptables rules (now empty)
-    if command -v iptables-save &>/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
-        iptables-save > /etc/iptables.up.rules 2>/dev/null || true
-        print_success "Iptables rules saved (protection removed)"
-    fi
+    cleanup_paqet_iptables_from_configs
+    save_iptables >/dev/null 2>&1 || true
+    print_success "Paqet protection rules removed (best-effort)"
     
     pause
 }
@@ -4757,53 +4733,209 @@ save_iptables() {
 # UNINSTALL & UTILITY FUNCTIONS
 # ================================================
 
-# Uninstall Paqet
+# Delete matching iptables rules repeatedly (duplicates possible)
+_iptables_delete_loop() {
+    local table="$1"
+    shift
+    local i
+    for ((i=0; i<20; i++)); do
+        iptables -t "$table" -D "$@" 2>/dev/null || return 0
+    done
+}
+
+# Remove WildPaqet/Paqet protection rules derived from live configs
+cleanup_paqet_iptables_from_configs() {
+    command -v iptables &>/dev/null || return 0
+
+    local config port sip sport proto
+    while IFS= read -r -d '' config; do
+        local role
+        role=$(grep "^role:" "$config" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+
+        if [ "$role" = "server" ]; then
+            port=$(grep -A5 "^listen:" "$config" 2>/dev/null | grep "addr:" | \
+                   sed -n 's/.*:\([0-9]*\)".*/\1/p' | head -1 | tr -d ' ')
+            if validate_port "$port"; then
+                for proto in tcp udp; do
+                    _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -j NOTRACK
+                    _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -j NOTRACK
+                done
+                _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+                _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+            fi
+        elif [ "$role" = "client" ]; then
+            local server
+            server=$(grep -A2 "^server:" "$config" 2>/dev/null | grep "addr:" | \
+                     awk '{print $2}' | tr -d '"' | head -1)
+            sip="${server%%:*}"
+            sport="${server##*:}"
+            if [ -n "$sip" ] && validate_port "$sport"; then
+                _iptables_delete_loop raw OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
+                _iptables_delete_loop raw PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
+                _iptables_delete_loop mangle OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
+                _iptables_delete_loop mangle PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP
+            fi
+
+            # Forward / SOCKS listen ports from client yaml
+            while IFS= read -r port; do
+                [ -z "$port" ] && continue
+                if validate_port "$port"; then
+                    for proto in tcp udp; do
+                        _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -j NOTRACK
+                        _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -j NOTRACK
+                    done
+                    _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+                    _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+                fi
+            done < <(grep -E 'listen:[[:space:]]*"' "$config" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
+        fi
+    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+}
+
+cleanup_wildpaqet_bot_silent() {
+    systemctl stop "${BOT_SERVICE:-telegram-paqet-bot}" 2>/dev/null || true
+    systemctl disable "${BOT_SERVICE:-telegram-paqet-bot}" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" 2>/dev/null || true
+    rm -f "${BOT_SCRIPT:-/usr/local/bin/telegram-paqet-bot}" 2>/dev/null || true
+    rm -rf "${BOT_CONFIG_DIR:-/etc/telegram-paqet-bot}" 2>/dev/null || true
+    rm -f "${BOT_LOG_FILE:-/var/log/telegram-paqet-bot.log}" 2>/dev/null || true
+}
+
+cleanup_kernel_optimizations_silent() {
+    rm -f "$SYSCTL_FILE" 2>/dev/null || true
+    rm -f "$LIMITS_FILE" 2>/dev/null || true
+    # IP forward file created by NAT helpers in this script
+    rm -f /etc/sysctl.d/30-ip_forward.conf 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1 || true
+    # Best-effort restore of common defaults (may already be set by distro)
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || \
+        sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+}
+
+# Full uninstall: restore server as close as possible to pre-WildPaqet state
 uninstall_paqet() {
     clear
     show_banner
     echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║ Uninstall Paqet                                          ║${NC}"
+    echo -e "${RED}║ Uninstall WildPaqet (Full Cleanup)                       ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    read -p "Are you sure? (y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+
+    echo -e "${YELLOW}This will remove:${NC}"
+    echo -e "  • All paqet-* systemd services and auto-restart cron jobs"
+    echo -e "  • Paqet core binary (+ backups) and install files"
+    echo -e "  • Configs in $CONFIG_DIR"
+    echo -e "  • Manager command: ${CYAN}wildpaqet${NC} (and legacy paqet-manager)"
+    echo -e "  • Telegram bot service/files"
+    echo -e "  • Kernel sysctl/limits applied by this script"
+    echo -e "  • Paqet iptables protection rules (from configs)"
+    echo -e "  • Optional: NAT rules / download cache / backup folder"
+    echo ""
+    echo -e "${RED}Type YES to continue full uninstall:${NC}"
+    read -p "> " confirm
+    if [ "$confirm" != "YES" ]; then
+        print_info "Uninstall cancelled"
+        pause
         return
     fi
-    
-    print_step "Stopping services..."
-    
+
+    # --- 1) iptables protection (before deleting configs) ---
+    print_step "Removing Paqet iptables protection rules..."
+    cleanup_paqet_iptables_from_configs
+    print_success "Protection rules cleaned (best-effort from configs)"
+
+    # --- 2) NAT / forwarding leftovers ---
+    echo ""
+    read -p "Flush ALL iptables NAT rules (DNAT/MASQUERADE etc.)? Recommended for full restore (y/N): " flush_nat
+    if [[ "$flush_nat" =~ ^[Yy]$ ]]; then
+        print_step "Flushing NAT table..."
+        if command -v iptables &>/dev/null; then
+            iptables -t nat -F 2>/dev/null || true
+            iptables -t nat -X 2>/dev/null || true
+            print_success "NAT table flushed"
+        fi
+    else
+        print_info "NAT table left unchanged"
+    fi
+
+    # --- 3) Stop services + cron ---
+    print_step "Stopping and removing Paqet services..."
     local services=()
     mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                           grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
-    
+
+    local service
     for service in "${services[@]}"; do
+        local service_name="${service%.service}"
+        print_info "Removing $service_name"
+        remove_cronjob "$service_name" >/dev/null 2>&1 || true
         systemctl stop "$service" 2>/dev/null || true
         systemctl disable "$service" 2>/dev/null || true
         rm -f "$SERVICE_DIR/$service" 2>/dev/null || true
     done
-    
-    for service in "${services[@]}"; do
-        local service_name="${service%.service}"
-        remove_cronjob "$service_name" 2>/dev/null || true
-    done
-    
-    systemctl daemon-reload
-    
-    print_step "Removing files..."
-    rm -f "$BIN_DIR/paqet" 2>/dev/null || true
-    
-    read -p "Remove configuration files? (y/N): " remove_configs
-    if [[ "$remove_configs" =~ ^[Yy]$ ]]; then
-        rm -rf "$CONFIG_DIR" 2>/dev/null || true
-        rm -rf "$INSTALL_DIR" 2>/dev/null || true
-        print_success "All files removed"
-    else
-        print_info "Configuration preserved in $CONFIG_DIR/"
+
+    # Catch any leftover paqet restart cron lines
+    if crontab -l >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -v 'systemctl restart paqet-' | crontab - 2>/dev/null || true
     fi
-    
-    print_success "✅ Paqet uninstalled"
+
+    # --- 4) Telegram bot ---
+    print_step "Removing Telegram bot..."
+    cleanup_wildpaqet_bot_silent
+    print_success "Telegram bot removed"
+
+    # --- 5) Kernel / limits / ip_forward drop-in ---
+    print_step "Removing kernel optimizations and limits..."
+    cleanup_kernel_optimizations_silent
+    print_success "Kernel drop-in configs removed"
+
+    # --- 6) Binaries and data dirs ---
+    print_step "Removing binaries and data..."
+    rm -f "$BIN_DIR/paqet" 2>/dev/null || true
+    rm -f "$BIN_DIR"/paqet.bak-* 2>/dev/null || true
+    rm -rf "$CONFIG_DIR" 2>/dev/null || true
+    rm -rf "$INSTALL_DIR" 2>/dev/null || true
+    rm -f /tmp/paqet.tar.gz 2>/dev/null || true
+    rm -rf /tmp/paqet-extract.* 2>/dev/null || true
+
+    # --- 7) Manager command ---
+    print_step "Removing WildPaqet manager command..."
+    rm -f "$MANAGER_PATH" 2>/dev/null || true
+    rm -f /usr/local/bin/paqet-manager 2>/dev/null || true
+    print_success "Manager command removed (wildpaqet)"
+
+    # --- 8) Optional caches ---
+    echo ""
+    read -p "Remove download cache /root/paqet ? (y/N): " rm_cache
+    if [[ "$rm_cache" =~ ^[Yy]$ ]]; then
+        rm -rf /root/paqet 2>/dev/null || true
+        print_success "Removed /root/paqet"
+    fi
+
+    read -p "Remove backup folder $BACKUP_DIR ? (y/N): " rm_bak
+    if [[ "$rm_bak" =~ ^[Yy]$ ]]; then
+        rm -rf "$BACKUP_DIR" 2>/dev/null || true
+        print_success "Removed $BACKUP_DIR"
+    else
+        print_info "Backups kept at $BACKUP_DIR (if any)"
+    fi
+
+    # --- 9) Persist firewall + reload units ---
+    print_step "Reloading systemd and saving firewall rules..."
+    systemctl daemon-reload 2>/dev/null || true
+    save_iptables >/dev/null 2>&1 || true
+
+    echo ""
+    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}✅ WildPaqet full uninstall completed${NC}"
+    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Notes:${NC}"
+    echo -e "  • Packages installed via apt/yum (curl, iptables-persistent, …) were NOT removed"
+    echo -e "  • If BBR was installed via external teddysun script, undo that separately if needed"
+    echo -e "  • A reboot is recommended for a fully clean sysctl/limits session state"
+    echo ""
     pause
-    return
+    return 0
 }
 # ================================================
 # TELEGRAM BOT CONFIGURATION
@@ -5705,7 +5837,7 @@ main_menu() {
         echo -e "${CYAN}5.${NC}🔄 Manage All Services (Restart/Logs/Delete)"
         echo -e "${CYAN}6.${NC}📊 Test Connection"
         echo -e "${CYAN}7.${NC}🚀 Optimize Server"
-        echo -e "${CYAN}8.${NC}🗑️  Uninstall Paqet"
+        echo -e "${CYAN}8.${NC}🗑️  Uninstall WildPaqet (Full Cleanup)"
         echo -e "${CYAN}9.${NC}🤖 Telegram Bot Manager"
         echo -e "${CYAN}10.${NC}🚪 Exit"
         echo ""
