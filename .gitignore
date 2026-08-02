@@ -1,0 +1,16 @@
+# Local project rules / progress — never publish to GitHub
+rules_and_progress.md
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/
+
+# Local scratch / review artifacts
+_review_*
+*.local.md
+.env
+.env.*
