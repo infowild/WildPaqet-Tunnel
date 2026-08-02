@@ -1,10 +1,11 @@
 #!/bin/bash
 #=================================================
-# Paqet Tunnel Manager
-# Version: 7.0
+# WildPaqet Tunnel Manager
+# Version: 7.1
 # Raw packet-level tunneling for bypassing network restrictions
-# GitHub: https://github.com/hanselime/paqet
-# Manager GitHub: https://github.com/behzadea12/Paqet-Tunnel-Manager
+# Core: https://github.com/hanselime/paqet
+# Manager: https://github.com/infowild/WildPaqet-Tunnel
+# Forked from: https://github.com/behzadea12/Paqet-Tunnel-Manager
 #=================================================
 
 # ================================================
@@ -24,7 +25,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="7.0"
+readonly SCRIPT_VERSION="7.1"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -37,21 +38,21 @@ readonly BACKUP_DIR="/root/paqet-backups"
 
 # Repositories
 readonly GITHUB_REPO="hanselime/paqet"
-readonly MANAGER_GITHUB_REPO="behzadea12/Paqet-Tunnel-Manager"
+readonly MANAGER_GITHUB_REPO="infowild/WildPaqet-Tunnel"
 readonly SERVICE_NAME="paqet"
+readonly TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
 
 # Kernel optimization settings
 readonly SYSCTL_FILE="/etc/sysctl.d/99-paqet-tunnel.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-paqet.conf"
-readonly BACKUP_SYSCTL="${BACKUP_DIR}/sysctl-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
-readonly BACKUP_LIMITS="${BACKUP_DIR}/limits-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
 
 # Default Values
 readonly DEFAULT_LISTEN_PORT="8888"
 readonly DEFAULT_KCP_MODE="fast"
 readonly DEFAULT_ENCRYPTION="aes-128-gcm"
 readonly DEFAULT_CONNECTIONS="4"
-readonly DEFAULT_MTU="1150"
+readonly DEFAULT_CONNECTIONS_CLIENT="1"
+readonly DEFAULT_MTU="1350"
 readonly DEFAULT_PCAP_SOCKBUF_SERVER="8388608"
 readonly DEFAULT_PCAP_SOCKBUF_CLIENT="4194304"
 readonly DEFAULT_TRANSPORT_TCPBUF="8192"
@@ -60,13 +61,13 @@ readonly DEFAULT_AUTO_RESTART_INTERVAL="1hour"
 readonly DEFAULT_V2RAY_PORTS="9090"
 readonly DEFAULT_SOCKS5_PORT="1080"
 
-# KCP Mode Descriptions
+# KCP Mode Descriptions (name:description)
 declare -A KCP_MODES=(
-    ["0"]="normal:normal:Normal speed / Normal latency / Low usage"
-    ["1"]="fast:fast:Balanced speed / Low latency / Normal usage"
-    ["2"]="fast2:fast2:High speed / Lower latency / Medium usage"
-    ["3"]="fast3:fast3:Max speed / Very low latency / High CPU"
-    ["4"]="manual:manual:Advanced settings"
+    ["0"]="normal:Normal speed / Normal latency / Low usage"
+    ["1"]="fast:Balanced speed / Low latency / Normal usage"
+    ["2"]="fast2:High speed / Lower latency / Medium usage"
+    ["3"]="fast3:Max speed / Very low latency / High CPU"
+    ["4"]="manual:Advanced settings"
 )
 
 # Encryption Options
@@ -132,10 +133,10 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
-    ["latest"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager.sh"
-    ["6.0"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager6-0.sh"
-    ["5.1"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager5-1.sh"
-    ["3.8"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager3-8.sh"
+    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager.sh"
+    ["6.0"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager6-0.sh"
+    ["5.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager5-1.sh"
+    ["3.8"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager3-8.sh"
 )
 
 # ================================================
@@ -170,11 +171,10 @@ show_banner() {
     echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
-    echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
+    echo "║          WildPaqet Tunnel Manager - Firewall Bypass          ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
-    echo "║          https://t.me/behzad_developer                       ║"
-    echo "║          https://github.com/behzadea12                       ║"    
+    echo "║          https://github.com/infowild/WildPaqet-Tunnel        ║"
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -509,7 +509,6 @@ ExecStart=$BIN_DIR/paqet run -c $CONFIG_DIR/${config_name}.yaml
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
-Environment="GOMAXPROCS=0"
 
 [Install]
 WantedBy=multi-user.target
@@ -1406,7 +1405,7 @@ configure_server() {
             echo -e "┌──────────────────────────────────────────────────────────────┐"
             printf "│ %-14s : %-44s │\n" "Public IP" "$public_ip"
             printf "│ %-14s : %-44s │\n" "Listen Port" "$port"
-            printf "│ %-14s : %-44s │\n" "Connections" "${conn:-1}"
+            printf "│ %-14s : %-44s │\n" "Connections" "${conn:-$DEFAULT_CONNECTIONS}"
             printf "│ %-14s : %-44s │\n" "Auto Restart" "Every ${DEFAULT_AUTO_RESTART_INTERVAL}"
             echo -e "└──────────────────────────────────────────────────────────────┘\n"
             
@@ -1419,7 +1418,7 @@ configure_server() {
             echo -e "┌──────────────────────────────────────────────────────────────┐"
             printf "│ %-14s : %-44s │\n" "Mode" "$mode_name"
             printf "│ %-14s : %-44s │\n" "Encryption" "$block"
-            printf "│ %-14s : %-44s │\n" "MTU" "${mtu:-1350}"
+            printf "│ %-14s : %-44s │\n" "MTU" "${mtu:-$DEFAULT_MTU}"
             echo -e "└──────────────────────────────────────────────────────────────┘\n"
             
             echo ""
@@ -1550,12 +1549,12 @@ configure_client() {
         echo -e "[5/15] KCP Mode : ${CYAN}$mode_name${NC}"
         
         # [6/15] Connections
-        echo -en "${YELLOW}[6/15] Connections [1-32, 0=skip] (default $DEFAULT_CONNECTIONS): ${NC}"
+        echo -en "${YELLOW}[6/15] Connections [1-32, 0=skip] (default $DEFAULT_CONNECTIONS_CLIENT): ${NC}"
         read -r conn_input
         local conn=""
         if [ -z "$conn_input" ]; then
-            conn="$DEFAULT_CONNECTIONS"
-            echo -e "[6/15] Connections : ${CYAN}$DEFAULT_CONNECTIONS (default)${NC}"
+            conn="$DEFAULT_CONNECTIONS_CLIENT"
+            echo -e "[6/15] Connections : ${CYAN}$DEFAULT_CONNECTIONS_CLIENT (default)${NC}"
         elif [ "$conn_input" = "0" ]; then
             conn=""
             echo -e "[6/15] Connections : ${CYAN}- (skipped)${NC}"
@@ -1563,9 +1562,9 @@ configure_client() {
             conn="$conn_input"
             echo -e "[6/15] Connections : ${CYAN}$conn_input${NC}"
         else
-            conn="$DEFAULT_CONNECTIONS"
-            echo -e "${YELLOW}Invalid, using default $DEFAULT_CONNECTIONS${NC}"
-            echo -e "[6/15] Connections : ${CYAN}$DEFAULT_CONNECTIONS (corrected)${NC}"
+            conn="$DEFAULT_CONNECTIONS_CLIENT"
+            echo -e "${YELLOW}Invalid, using default $DEFAULT_CONNECTIONS_CLIENT${NC}"
+            echo -e "[6/15] Connections : ${CYAN}$DEFAULT_CONNECTIONS_CLIENT (corrected)${NC}"
         fi
         
         # [7/15] MTU
@@ -1889,7 +1888,7 @@ configure_client() {
                 fi
             fi
             
-            printf "│ %-16s : %-42s │\n" "Connections" "${conn:-1}"
+            printf "│ %-16s : %-42s │\n" "Connections" "${conn:-$DEFAULT_CONNECTIONS_CLIENT}"
             printf "│ %-16s : %-42s │\n" "Auto Restart" "Every ${DEFAULT_AUTO_RESTART_INTERVAL}"
             echo -e "└──────────────────────────────────────────────────────────────┘\n"
             
@@ -1897,7 +1896,7 @@ configure_client() {
             echo -e "┌──────────────────────────────────────────────────────────────┐"
             printf "│ %-14s : %-44s │\n" "Mode" "$mode_name"
             printf "│ %-14s : %-44s │\n" "Encryption" "$block"
-            printf "│ %-14s : %-44s │\n" "MTU" "${mtu:-1350}"
+            printf "│ %-14s : %-44s │\n" "MTU" "${mtu:-$DEFAULT_MTU}"
             echo -e "└──────────────────────────────────────────────────────────────┘\n"
             
             echo ""
@@ -2625,39 +2624,84 @@ install_paqet() {
 
     mkdir -p "$INSTALL_DIR"
     print_step "Extracting archive..."
-    rm -rf "$INSTALL_DIR"/*    
-    tar -xzf "/tmp/paqet.tar.gz" -C "$INSTALL_DIR" 2>/dev/null || {
+
+    # Extract to a temp dir first so a bad archive cannot wipe a working install
+    local extract_tmp
+    extract_tmp=$(mktemp -d /tmp/paqet-extract.XXXXXX 2>/dev/null || mktemp -d)
+    if ! tar -xzf "/tmp/paqet.tar.gz" -C "$extract_tmp" 2>/dev/null; then
         print_error "Failed to extract archive"
         echo -e "\n${YELLOW}Possible issues:${NC}"
         echo -e " 1. Corrupted download"
         echo -e " 2. Wrong file format"
         echo -e " 3. Incompatible archive"
+        rm -rf "$extract_tmp"
         rm -f "/tmp/paqet.tar.gz"
         pause
         return 1
-    }
-    
-    print_success "Archive extracted to $INSTALL_DIR"
+    fi
+
     local binary_file=""
-    local standard_binary="$INSTALL_DIR/paqet_linux_${arch_name}"
-    if [ -f "$standard_binary" ]; then
-        binary_file="$standard_binary"
-    else
-        binary_file=$(find "$INSTALL_DIR" -type f -name "*paqet*" -exec file {} \; | grep -i "executable" | cut -d: -f1 | head -1)
+    # Support both naming styles: paqet_linux_amd64 and paqet-linux-amd64
+    for candidate in \
+        "$extract_tmp/paqet_linux_${arch_name}" \
+        "$extract_tmp/paqet-linux-${arch_name}" \
+        "$extract_tmp/paqet" \
+        "$extract_tmp/paqet_linux_arm64" \
+        "$extract_tmp/paqet-linux-arm64"; do
+        if [ -f "$candidate" ]; then
+            binary_file="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$binary_file" ] || [ ! -f "$binary_file" ]; then
+        binary_file=$(find "$extract_tmp" -type f \( -name "*paqet*" -o -name "paqet" \) 2>/dev/null | while read -r f; do
+            if file "$f" 2>/dev/null | grep -qiE 'executable|ELF'; then
+                echo "$f"
+                break
+            fi
+        done)
     fi
 
     if [ -z "$binary_file" ] || [ ! -f "$binary_file" ]; then
-        for file in "$INSTALL_DIR"/*; do
-            if [ -f "$file" ] && [ -x "$file" ]; then
+        while IFS= read -r -d '' file; do
+            if [ -x "$file" ] || file "$file" 2>/dev/null | grep -qiE 'executable|ELF'; then
                 binary_file="$file"
                 break
             fi
-        done
+        done < <(find "$extract_tmp" -type f -print0 2>/dev/null)
     fi
-    
+
+    if [ -z "$binary_file" ] || [ ! -f "$binary_file" ]; then
+        print_error "Binary not found in archive"
+        echo -e "\n${YELLOW}Archive contents:${NC}"
+        ls -la "$extract_tmp"
+        rm -rf "$extract_tmp"
+        rm -f "/tmp/paqet.tar.gz"
+        pause
+        return 1
+    fi
+
+    # Promote extracted files only after binary is found
+    rm -rf "$INSTALL_DIR"/*
+    cp -a "$extract_tmp"/. "$INSTALL_DIR"/
+    rm -rf "$extract_tmp"
+
+    print_success "Archive extracted to $INSTALL_DIR"
+    # Prefer promoted path under INSTALL_DIR
+    if [ -f "$INSTALL_DIR/$(basename "$binary_file")" ]; then
+        binary_file="$INSTALL_DIR/$(basename "$binary_file")"
+    else
+        binary_file=$(find "$INSTALL_DIR" -type f -name "$(basename "$binary_file")" 2>/dev/null | head -1)
+    fi
+
     if [ -n "$binary_file" ] && [ -f "$binary_file" ]; then
         print_info "Found binary: $(basename "$binary_file")"
-        rm -f "$BIN_DIR/paqet"
+        local previous_binary=""
+        if [ -f "$BIN_DIR/paqet" ]; then
+            previous_binary="${BIN_DIR}/paqet.bak-$(date +%Y%m%d-%H%M%S)"
+            cp "$BIN_DIR/paqet" "$previous_binary" 2>/dev/null || true
+        fi
         cp "$binary_file" "$BIN_DIR/paqet"
         chmod +x "$BIN_DIR/paqet"
         
@@ -2668,28 +2712,20 @@ install_paqet() {
         if [ -n "$new_version" ]; then
             print_info "Installed version: ${CYAN}$new_version${NC}"
             
-            if [ "$new_version" != "$latest_version" ]; then
+            if [ -n "$latest_version" ] && [ "$new_version" != "$latest_version" ]; then
                 print_warning "Expected version $latest_version but got $new_version"
             fi
         else
-            print_warning "Could not determine installed version"
+            print_warning "Could not determine installed version (binary may still work)"
+            if [ -n "$previous_binary" ] && [ -f "$previous_binary" ]; then
+                print_info "Previous binary backup kept at: $previous_binary"
+            fi
         fi
     else
-        print_error "Binary not found in archive"
-        echo -e "\n${YELLOW}Archive contents:${NC}"
-        ls -la "$INSTALL_DIR"
-        local any_file=$(find "$INSTALL_DIR" -type f | head -1)
-        if [ -n "$any_file" ]; then
-            print_info "Trying to make file executable: $any_file"
-            chmod +x "$any_file"
-            if [ -x "$any_file" ] && file "$any_file" | grep -q "executable"; then
-                cp "$any_file" "$BIN_DIR/paqet"
-                print_success "Paqet installed using alternative method"
-            fi
-        else
-            pause
-            return 1
-        fi
+        print_error "Binary not found after install promotion"
+        rm -f "/tmp/paqet.tar.gz"
+        pause
+        return 1
     fi
     
     # پاک کردن فایل موقت
@@ -2904,9 +2940,11 @@ apply_kernel_optimizations() {
     # Create backup directory
     mkdir -p "$BACKUP_DIR"
     
-    # Backup existing configs
-    [ -f "$SYSCTL_FILE" ] && cp "$SYSCTL_FILE" "$BACKUP_SYSCTL" && print_info "Backed up $SYSCTL_FILE"
-    [ -f "$LIMITS_FILE" ] && cp "$LIMITS_FILE" "$BACKUP_LIMITS" && print_info "Backed up $LIMITS_FILE"
+    # Backup existing configs (timestamp at backup time, not script start)
+    local backup_sysctl="${BACKUP_DIR}/sysctl-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
+    local backup_limits="${BACKUP_DIR}/limits-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
+    [ -f "$SYSCTL_FILE" ] && cp "$SYSCTL_FILE" "$backup_sysctl" && print_info "Backed up $SYSCTL_FILE"
+    [ -f "$LIMITS_FILE" ] && cp "$LIMITS_FILE" "$backup_limits" && print_info "Backed up $LIMITS_FILE"
     
     print_step "Creating sysctl configuration..."
     
@@ -3000,8 +3038,8 @@ EOF
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}\n"
     
     echo -e "${YELLOW}Backup files:${NC}"
-    [ -f "$BACKUP_SYSCTL" ] && echo -e "  • $BACKUP_SYSCTL"
-    [ -f "$BACKUP_LIMITS" ] && echo -e "  • $BACKUP_LIMITS"
+    [ -f "$backup_sysctl" ] && echo -e "  • $backup_sysctl"
+    [ -f "$backup_limits" ] && echo -e "  • $backup_limits"
     
     echo -e "\n${YELLOW}Applied settings:${NC}"
     echo -e "  • TCP Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A')"
@@ -3136,7 +3174,7 @@ install_bbr_legacy() {
     
     print_step "Downloading and installing BBR (legacy)..."
     
-    if wget --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh -O /tmp/bbr.sh 2>/dev/null; then
+    if curl -fsSL https://github.com/teddysun/across/raw/master/bbr.sh -o /tmp/bbr.sh 2>/dev/null; then
         chmod +x /tmp/bbr.sh
         print_success "BBR installer downloaded"
         
@@ -3155,7 +3193,7 @@ install_bbr_legacy() {
     else
         print_error "Failed to download BBR installer"
         echo -e "\n${YELLOW}You can install BBR manually with:${NC}"
-        echo -e "${CYAN}wget --no-check-certificate https://github.com/teddysun/across/raw/master/bbr.sh && chmod +x bbr.sh && ./bbr.sh${NC}"
+        echo -e "${CYAN}curl -fsSL https://github.com/teddysun/across/raw/master/bbr.sh -o bbr.sh && chmod +x bbr.sh && ./bbr.sh${NC}"
     fi
     
     pause
@@ -3515,8 +3553,8 @@ change_mode_all_services() {
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
         
-        if grep -q "mode:" "$config"; then
-            sed -i "s/mode:.*/mode: \"$new_mode\"/" "$config"
+        if grep -qE '^[[:space:]]*mode:' "$config"; then
+            sed -i -E "s/^([[:space:]]*)mode:.*/\\1mode: \"$new_mode\"/" "$config"
             echo -e " ${GREEN}✓${NC} Updated $config_name"
             ((modified++))
         else
@@ -3554,7 +3592,9 @@ change_conn_all_services() {
     while IFS= read -r -d '' file; do
         configs+=("$file")
         local config_name=$(basename "$file" .yaml)
-        local current_conn=$(grep "^conn:" "$file" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+        # Match indented conn under transport (not only ^conn:)
+        local current_conn
+        current_conn=$(grep -E '^[[:space:]]*conn:' "$file" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
         echo -e " ${config_name}: ${current_conn:-Not set (using default: $DEFAULT_CONNECTIONS)}"
     done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
     
@@ -3573,8 +3613,9 @@ change_conn_all_services() {
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
         
-        if grep -q "^conn:" "$config"; then
-            sed -i "s/^conn:.*/conn: $new_conn/" "$config"
+        if grep -qE '^[[:space:]]*conn:' "$config"; then
+            # Preserve indentation; update existing conn line only
+            sed -i -E "s/^([[:space:]]*)conn:.*/\\1conn: $new_conn/" "$config"
             echo -e " ${GREEN}✓${NC} Updated $config_name"
             ((modified++))
         else
@@ -3642,8 +3683,8 @@ change_block_all_services() {
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
         
-        if grep -q "block:" "$config"; then
-            sed -i "s/block:.*/block: \"$new_block\"/" "$config"
+        if grep -qE '^[[:space:]]*block:' "$config"; then
+            sed -i -E "s/^([[:space:]]*)block:.*/\\1block: \"$new_block\"/" "$config"
             echo -e " ${GREEN}✓${NC} Updated $config_name"
             ((modified++))
         else
@@ -3952,10 +3993,9 @@ set_global_mtu() {
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
         
-        # Check if file has mtu setting
-        if grep -q "mtu:" "$config"; then
-            # Update existing mtu
-            sed -i "s/mtu:.*/mtu: $new_mtu/" "$config"
+        if grep -qE '^[[:space:]]*mtu:' "$config"; then
+            # Update existing mtu (preserve indentation)
+            sed -i -E "s/^([[:space:]]*)mtu:.*/\\1mtu: $new_mtu/" "$config"
             echo -e " ${GREEN}✓${NC} Updated $config_name"
         else
             # Add mtu under kcp section
@@ -4279,7 +4319,7 @@ run_mtu_test() {
                     print_info "Backup created: $(basename "$backup_file")"
 
                     if grep -q "mtu:" "$target_config"; then
-                        sed -i "s/mtu:.*/mtu: $recommended/" "$target_config"
+                        sed -i -E "s/^([[:space:]]*)mtu:.*/\\1mtu: $recommended/" "$target_config"
                     else
                         if grep -q "kcp:" "$target_config"; then
                             sed -i "/kcp:/a\    mtu: $recommended" "$target_config"
@@ -4798,7 +4838,7 @@ init_bot_config() {
     mkdir -p "$BOT_CONFIG_DIR"
     if [ ! -f "$BOT_CONFIG_FILE" ]; then
         cat > "$BOT_CONFIG_FILE" << EOF
-# Paqet Telegram Bot Configuration
+# WildPaqet Telegram Bot Configuration
 # Last updated: $(date)
 BOT_TOKEN=""
 CHAT_ID=""
@@ -4808,6 +4848,7 @@ ENABLE_SERVICE_WATCH="true"
 WATCH_INTERVAL="60"
 SOCKS5_PROXY=""
 USE_SOCKS5="false"
+TELEGRAM_API_BASE="https://api.telegram.org"
 EOF
         chmod 600 "$BOT_CONFIG_FILE"
         print_success "Bot configuration created at $BOT_CONFIG_FILE"
@@ -4827,13 +4868,14 @@ load_bot_config() {
         WATCH_INTERVAL="60"
         SOCKS5_PROXY=""
         USE_SOCKS5="false"
+        TELEGRAM_API_BASE="https://api.telegram.org"
     fi
 }
 
 # Save bot configuration
 save_bot_config() {
     cat > "$BOT_CONFIG_FILE" << EOF
-# Paqet Telegram Bot Configuration
+# WildPaqet Telegram Bot Configuration
 # Last updated: $(date)
 BOT_TOKEN="$BOT_TOKEN"
 CHAT_ID="$CHAT_ID"
@@ -4843,6 +4885,7 @@ ENABLE_SERVICE_WATCH="$ENABLE_SERVICE_WATCH"
 WATCH_INTERVAL="$WATCH_INTERVAL"
 SOCKS5_PROXY="$SOCKS5_PROXY"
 USE_SOCKS5="$USE_SOCKS5"
+TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
 EOF
     chmod 600 "$BOT_CONFIG_FILE"
     print_success "Bot configuration saved"
@@ -4943,13 +4986,12 @@ send_telegram_message() {
     
     local success=1
     local response
+    local api_base="${TELEGRAM_API_BASE:-https://api.telegram.org}"
     
-    # ============================================
-    # METHOD 1: Through detected SOCKS5 proxy
-    # ============================================
+    # Prefer SOCKS5 when configured (useful on restricted networks)
     if [ "$USE_SOCKS5" = "true" ] && [ -n "$SOCKS5_PROXY" ]; then
         response=$(curl -s --max-time 8 --socks5-hostname "$SOCKS5_PROXY" \
-            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
         
@@ -4959,49 +5001,30 @@ send_telegram_message() {
         fi
     fi
     
-    # ============================================
-    # METHOD 2: Through behzad.workers.dev (Proxy)
-    # ============================================
+    # Direct Telegram API (JSON)
     if [ $success -ne 0 ]; then
         response=$(curl -s --max-time 8 \
-            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+            -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
             -H "Content-Type: application/json" \
             -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
         
         if echo "$response" | grep -q '"ok":true'; then
             success=0
-            echo "[$(date)] Message sent via behzad.workers.dev" >> "$BOT_LOG_FILE"
+            echo "[$(date)] Message sent via Telegram API" >> "$BOT_LOG_FILE"
         fi
     fi
     
-    # ============================================
-    # METHOD 3: Direct connection (No proxy)
-    # ============================================
-    if [ $success -ne 0 ]; then
-        response=$(curl -s --max-time 5 \
-            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-            -H "Content-Type: application/json" \
-            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
-        
-        if echo "$response" | grep -q '"ok":true'; then
-            success=0
-            echo "[$(date)] Message sent directly" >> "$BOT_LOG_FILE"
-        fi
-    fi
-    
-    # ============================================
-    # METHOD 4: Through workers.dev with URL-encoded (Last resort)
-    # ============================================
+    # Fallback: form-urlencoded
     if [ $success -ne 0 ]; then
         response=$(curl -s --max-time 8 \
-            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+            -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
             --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=$message" \
             --data-urlencode "parse_mode=$parse_mode" 2>&1)
         
         if echo "$response" | grep -q '"ok":true'; then
             success=0
-            echo "[$(date)] Message sent via workers.dev (URL-encoded)" >> "$BOT_LOG_FILE"
+            echo "[$(date)] Message sent via Telegram API (form)" >> "$BOT_LOG_FILE"
         fi
     fi
     
@@ -5052,11 +5075,11 @@ send_alert() {
         
         local success=1
         local response
+        local api_base="${TELEGRAM_API_BASE:-https://api.telegram.org}"
         
-        # METHOD 1: Through SOCKS5 proxy (if configured)
         if [ "$USE_SOCKS5" = "true" ] && [ -n "$SOCKS5_PROXY" ]; then
             response=$(curl -s --max-time 8 --socks5-hostname "$SOCKS5_PROXY" \
-                -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+                -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
                 -H "Content-Type: application/json" \
                 -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
             
@@ -5066,43 +5089,28 @@ send_alert() {
             fi
         fi
         
-        # METHOD 2: Through behzad.workers.dev (JSON)
         if [ $success -ne 0 ]; then
             response=$(curl -s --max-time 8 \
-                -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+                -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
                 -H "Content-Type: application/json" \
                 -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
             
             if echo "$response" | grep -q '"ok":true'; then
                 success=0
-                log "Alert sent via behzad.workers.dev (JSON)"
+                log "Alert sent via Telegram API"
             fi
         fi
         
-        # METHOD 3: Direct connection
-        if [ $success -ne 0 ]; then
-            response=$(curl -s --max-time 5 \
-                -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-                -H "Content-Type: application/json" \
-                -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"HTML"}' "$CHAT_ID" "$message")" 2>&1)
-            
-            if echo "$response" | grep -q '"ok":true'; then
-                success=0
-                log "Alert sent directly"
-            fi
-        fi
-        
-        # METHOD 4: Through workers.dev with URL-encoded
         if [ $success -ne 0 ]; then
             response=$(curl -s --max-time 8 \
-                -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+                -X POST "$api_base/bot$BOT_TOKEN/sendMessage" \
                 --data-urlencode "chat_id=$CHAT_ID" \
                 --data-urlencode "text=$message" \
                 --data-urlencode "parse_mode=HTML" 2>&1)
             
             if echo "$response" | grep -q '"ok":true'; then
                 success=0
-                log "Alert sent via workers.dev (URL-encoded)"
+                log "Alert sent via Telegram API (form)"
             fi
         fi
         
