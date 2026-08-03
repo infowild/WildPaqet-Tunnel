@@ -198,38 +198,65 @@ check_root() {
 }
 
 # Ensure /usr/local/bin/wildpaqet exists so the command works after first run
+# IMPORTANT: never cp from process-substitution (/dev/fd/*) — that consumes the
+# remaining script stream and installs a truncated file (e.g. only "main_menu").
+is_manager_binary_ok() {
+    local f="${1:-$MANAGER_PATH}"
+    [ -f "$f" ] && [ -x "$f" ] || return 1
+    grep -q 'MANAGER_NAME="wildpaqet"' "$f" 2>/dev/null || return 1
+    grep -q '^main_menu()' "$f" 2>/dev/null || return 1
+    local sz
+    sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ' || echo 0)
+    [ "$sz" -gt 50000 ] || return 1
+    return 0
+}
+
 ensure_manager_command() {
-    local installed=0
-    if [ -x "$MANAGER_PATH" ] && grep -q 'MANAGER_NAME="wildpaqet"' "$MANAGER_PATH" 2>/dev/null; then
-        # Fix accidental Windows CRLF that breaks shebang: bad interpreter
+    if is_manager_binary_ok "$MANAGER_PATH"; then
         if grep -q $'\r' "$MANAGER_PATH" 2>/dev/null; then
             sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
             chmod +x "$MANAGER_PATH"
         fi
-        installed=1
-    fi
-
-    if [ "$installed" -eq 0 ]; then
+    else
         print_step "Installing system command ${CYAN}wildpaqet${NC} ..."
-        local copied=0
-        # Works for normal file runs and usually for bash <(curl ...) via /dev/fd/*
-        if [ -n "${BASH_SOURCE[0]:-}" ] && [ -e "${BASH_SOURCE[0]}" ]; then
-            if cp -f "${BASH_SOURCE[0]}" "$MANAGER_PATH" 2>/dev/null; then
-                copied=1
+        # Remove broken/truncated previous install
+        rm -f "$MANAGER_PATH" 2>/dev/null || true
+
+        local installed_ok=0
+        local src="${BASH_SOURCE[0]:-}"
+
+        # Only copy from a real on-disk script path (not /dev/fd or /proc/self/fd)
+        if [ -n "$src" ] && [ -f "$src" ] \
+            && [[ "$src" != /dev/fd/* && "$src" != /proc/self/fd/* && "$src" != /dev/stdin ]]; then
+            if cp -f "$src" "$MANAGER_PATH" 2>/dev/null; then
+                sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+                chmod +x "$MANAGER_PATH"
+                if is_manager_binary_ok "$MANAGER_PATH"; then
+                    installed_ok=1
+                fi
             fi
         fi
-        if [ "$copied" -eq 0 ]; then
+
+        if [ "$installed_ok" -eq 0 ]; then
             local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
-            if ! curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
-                print_warning "Could not install wildpaqet command automatically"
-                print_info "Install manually: option 0 → 4"
-                return 1
+            if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
+                sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+                chmod +x "$MANAGER_PATH"
+                if is_manager_binary_ok "$MANAGER_PATH"; then
+                    installed_ok=1
+                fi
             fi
         fi
-        sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
-        chmod +x "$MANAGER_PATH"
+
+        if [ "$installed_ok" -eq 0 ]; then
+            rm -f "$MANAGER_PATH" 2>/dev/null || true
+            print_warning "Could not install a valid wildpaqet command"
+            print_info "After this session, run: ${CYAN}curl -fsSL https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE} -o $MANAGER_PATH && chmod +x $MANAGER_PATH${NC}"
+            return 1
+        fi
+
         rm -f /usr/local/bin/paqet-manager 2>/dev/null || true
-        print_success "Installed: $MANAGER_PATH"
+        print_success "Installed: $MANAGER_PATH ($(wc -c < "$MANAGER_PATH" | tr -d ' ') bytes)"
     fi
 
     # Fallback PATH for minimal systems
