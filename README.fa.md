@@ -4,16 +4,24 @@
 
 **منیجر تونل Raw-Packet + KCP برای شبکه‌های محدود**
 
-[![Version](https://img.shields.io/badge/version-7.1-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
+[![Version](https://img.shields.io/badge/version-8.0--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
-[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/main/wildpaqet.sh)
+[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 
-[English](README.md) · [مخزن](https://github.com/infowild/WildPaqet-Tunnel) · [هسته paqet](https://github.com/hanselime/paqet)
+[English](README.md) · [مخزن](https://github.com/infowild/WildPaqet-Tunnel) · [هسته v2](./core) · [نصب v2](docs/V2-INSTALL.md)
 
 <br/>
 
+### پایدار (main)
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+```
+
+### WildPaqet v2 (برنچ تست — پیشنهاد فعلی)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
 ```
 
 بعد از اولین اجرا:
@@ -22,6 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/ma
 wildpaqet
 ```
 
+> منو **0 → 8** هستهٔ **WildPaqet Core v2** را از سورس می‌سازد. راهنما: [docs/V2-INSTALL.md](docs/V2-INSTALL.md).
 </div>
 
 ---
@@ -64,10 +73,10 @@ flowchart LR
 ### ۱) اجرا با root
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
 ```
 
-در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود.
+در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود. سپس برای هستهٔ v2: منو **0 → 8**.
 
 ### ۲) خارج → گزینه ۲  
 ### ۳) ایران → گزینه ۳  

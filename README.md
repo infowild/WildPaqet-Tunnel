@@ -4,25 +4,34 @@
 
 **Raw-packet KCP tunnel manager for restricted networks**
 
-[![Version](https://img.shields.io/badge/version-7.1-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
+[![Version](https://img.shields.io/badge/version-8.0--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
-[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/main/wildpaqet.sh)
+[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 
-[فارسی](README.fa.md) · [Repository](https://github.com/infowild/WildPaqet-Tunnel) · [Core: paqet](https://github.com/hanselime/paqet)
+[فارسی](README.fa.md) · [Repository](https://github.com/infowild/WildPaqet-Tunnel) · [Core tree](./core) · [v2 install](docs/V2-INSTALL.md)
 
 <br/>
+
+### Stable (main)
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
-Then open anytime with:
+### WildPaqet v2 (this branch — recommended for testing)
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
+```
+
+Then:
 
 ```bash
 wildpaqet
 ```
 
+> After first run, menu **0 → 8** builds **WildPaqet Core v2** from source (wire realism + mimic handshake + multi-addr). See [docs/V2-INSTALL.md](docs/V2-INSTALL.md).
 </div>
 
 ---
@@ -65,10 +74,12 @@ flowchart LR
 ### 1) Launch (root)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
 ```
 
-On first run the manager **auto-installs** the `wildpaqet` system command.
+On first run the manager **auto-installs** the `wildpaqet` system command from this branch.
+
+Then: **0 → 8** to build WildPaqet Core v2 (or **0 → 1** after a `core-v*` release).
 
 ### 2) Kharej
 

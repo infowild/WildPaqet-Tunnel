@@ -1,9 +1,10 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 7.1
+# Version: 8.0-v2
+# Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
 # Raw packet-level tunneling for bypassing network restrictions
-# Core: https://github.com/hanselime/paqet
+# Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
 # Forked from: https://github.com/behzadea12/Paqet-Tunnel-Manager
 #=================================================
@@ -25,10 +26,11 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="7.1"
+readonly SCRIPT_VERSION="8.0-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
+readonly MANAGER_BRANCH="wild-paqet-v2"
 
 # Paths
 readonly CONFIG_DIR="/etc/paqet"
@@ -36,12 +38,17 @@ readonly SERVICE_DIR="/etc/systemd/system"
 readonly BIN_DIR="/usr/local/bin"
 readonly INSTALL_DIR="/opt/paqet"
 readonly BACKUP_DIR="/root/paqet-backups"
+readonly CORE_SRC_DIR="/opt/wildpaqet-core-src"
 
 # Repositories
+# Upstream binary fallback (hanselime). WildPaqet v2 core builds publish on MANAGER repo.
 readonly GITHUB_REPO="hanselime/paqet"
+readonly CORE_GITHUB_REPO="infowild/WildPaqet-Tunnel"
 readonly MANAGER_GITHUB_REPO="infowild/WildPaqet-Tunnel"
 readonly SERVICE_NAME="paqet"
 readonly TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
+# Default wire profile written into new configs (requires WildPaqet Core v2)
+readonly DEFAULT_TCP_PRESET="restrictive"
 
 # Kernel optimization settings
 readonly SYSCTL_FILE="/etc/sysctl.d/99-paqet-tunnel.conf"
@@ -134,11 +141,18 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
-    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh"
+    ["v2"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh"
+    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh"
+    ["main-7.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh"
     ["6.0"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager6-0.sh"
     ["5.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager5-1.sh"
     ["3.8"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager3-8.sh"
 )
+
+# Raw URL for this branch's manager script (install / self-update shortcut)
+manager_script_url() {
+    echo "https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/${MANAGER_BRANCH}/${MANAGER_SCRIPT_FILE}"
+}
 
 # ================================================
 # UTILITY FUNCTIONS
@@ -181,6 +195,7 @@ show_banner() {
     echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
     echo -e "${CYAN}    ║${NC}     ${YELLOW}✦  Raw Packet Tunnel  ·  Firewall Bypass  ✦${NC}          ${CYAN}║${NC}"
     echo -e "${CYAN}    ║${NC}              ${MAGENTA}Manager v${SCRIPT_VERSION}${NC}  ·  ${WHITE}by InfoWild${NC}              ${CYAN}║${NC}"
+    echo -e "${CYAN}    ║${NC}           ${ORANGE}branch: ${MANAGER_BRANCH}${NC}                              ${CYAN}║${NC}"
     echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
     echo -e "${CYAN}    ║${NC}  ${BLUE}https://github.com/infowild/WildPaqet-Tunnel${NC}             ${CYAN}║${NC}"
     echo -e "${CYAN}    ║${NC}                                                            ${CYAN}║${NC}"
@@ -192,7 +207,7 @@ show_banner() {
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This script must be run as root"
-        echo -e "${YELLOW}Try:${NC} ${CYAN}sudo wildpaqet${NC}  or  ${CYAN}sudo bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)${NC}"
+        echo -e "${YELLOW}Try:${NC} ${CYAN}sudo wildpaqet${NC}  or  ${CYAN}sudo bash <(curl -fsSL $(manager_script_url))${NC}"
         exit 1
     fi
 }
@@ -238,7 +253,8 @@ ensure_manager_command() {
         fi
 
         if [ "$installed_ok" -eq 0 ]; then
-            local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
+            local manager_url
+            manager_url="$(manager_script_url)"
             if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
                 sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
                 chmod +x "$MANAGER_PATH"
@@ -251,7 +267,7 @@ ensure_manager_command() {
         if [ "$installed_ok" -eq 0 ]; then
             rm -f "$MANAGER_PATH" 2>/dev/null || true
             print_warning "Could not install a valid wildpaqet command"
-            print_info "After this session, run: ${CYAN}curl -fsSL https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE} -o $MANAGER_PATH && chmod +x $MANAGER_PATH${NC}"
+            print_info "After this session, run: ${CYAN}curl -fsSL $(manager_script_url) -o $MANAGER_PATH && chmod +x $MANAGER_PATH${NC}"
             return 1
         fi
 
@@ -501,15 +517,40 @@ generate_secret_key() {
     fi
 }
 
-# Get latest Paqet version from GitHub
+# Get latest Paqet / WildPaqet Core version from GitHub
+# Prefer WildPaqet-Tunnel core releases (tag core-v*), then upstream hanselime/paqet.
 get_latest_paqet_version() {
-    local version
-    version=$(curl -s "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 2>/dev/null)    
+    local version=""
+    version=$(curl -fsSL "https://api.github.com/repos/${CORE_GITHUB_REPO}/releases" 2>/dev/null \
+        | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4 \
+        | grep -E '^core-v|^v2\.|^wild-' | head -1)
+    if [ -z "$version" ]; then
+        version=$(curl -fsSL "https://api.github.com/repos/${CORE_GITHUB_REPO}/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+    fi
+    if [ -z "$version" ]; then
+        version=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+            | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+    fi
     if [ -n "$version" ]; then
         echo "$version"
     else
-        echo "v1.0.0-alpha.16"
+        echo "v1.0.0-alpha.20"
     fi
+}
+
+# Resolve download URL for a core release asset (Wild repo first, then upstream)
+resolve_core_download_url() {
+    local version="$1"
+    local expected_file="$2"
+    local url
+    url="https://github.com/${CORE_GITHUB_REPO}/releases/download/${version}/${expected_file}"
+    if curl -fsI "$url" >/dev/null 2>&1; then
+        echo "$url"
+        return 0
+    fi
+    url="https://github.com/${GITHUB_REPO}/releases/download/${version}/${expected_file}"
+    echo "$url"
 }
 
 # Compare floats (with bc fallback)
@@ -1437,6 +1478,7 @@ configure_server() {
             echo "    router_mac: \"$GATEWAY_MAC\""
             echo "  tcp:"
             echo "    local_flag: [\"PA\"]"
+            echo "    preset: \"${DEFAULT_TCP_PRESET}\""
             
             if [[ -n "$pcap_sockbuf" ]]; then
                 echo "  pcap:"
@@ -1595,6 +1637,21 @@ configure_client() {
         server_port="${server_port:-$DEFAULT_LISTEN_PORT}"
         validate_port "$server_port" || { print_error "Invalid port"; continue; }
         echo -e "[3/15] Server Port : ${CYAN}$server_port${NC}"
+
+        # Optional backup server addresses (WildPaqet Core v2 multi-addr)
+        echo -en "${YELLOW}[3b/15] Backup server addrs (comma IP:port, Enter=skip): ${NC}"
+        read -r backup_addrs_raw
+        local backup_addrs=()
+        if [ -n "$backup_addrs_raw" ]; then
+            IFS=',' read -ra _bak_parts <<< "$backup_addrs_raw"
+            for _b in "${_bak_parts[@]}"; do
+                _b=$(echo "$_b" | xargs)
+                [ -n "$_b" ] && backup_addrs+=("$_b")
+            done
+            echo -e "[3b/15] Backups : ${CYAN}${backup_addrs[*]}${NC}"
+        else
+            echo -e "[3b/15] Backups : ${CYAN}none${NC}"
+        fi
         
         # [4/15] Secret Key
         echo -en "${YELLOW}[4/15] Secret Key (from server) : ${NC}"
@@ -1908,6 +1965,7 @@ configure_client() {
             echo "  tcp:"
             echo "    local_flag: [\"PA\"]"
             echo "    remote_flag: [\"PA\"]"
+            echo "    preset: \"${DEFAULT_TCP_PRESET}\""
             
             if [[ -n "$pcap_sockbuf" ]]; then
                 echo "  pcap:"
@@ -1916,6 +1974,12 @@ configure_client() {
             
             echo "server:"
             echo "  addr: \"$server_ip:$server_port\""
+            if [ ${#backup_addrs[@]} -gt 0 ]; then
+                echo "  addrs:"
+                for _ba in "${backup_addrs[@]}"; do
+                    echo "    - \"$_ba\""
+                done
+            fi
             echo "transport:"
             echo "  protocol: \"kcp\""
             
@@ -2510,6 +2574,90 @@ install_iptables_persistent() {
     save_iptables
 }
 
+# Build WildPaqet Core v2 from the wild-paqet-v2 branch (./core)
+build_wildpaqet_core_from_source() {
+    local arch_name="${1:-amd64}"
+    print_step "Building WildPaqet Core v2 from source (branch ${MANAGER_BRANCH})..."
+
+    if ! command -v git >/dev/null 2>&1; then
+        print_error "git is required"
+        pause
+        return 1
+    fi
+
+    local os_id
+    os_id=$(detect_os)
+    case "$os_id" in
+        ubuntu|debian)
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y golang-go libpcap-dev build-essential git curl >/dev/null 2>&1 || {
+                print_warning "apt install may have failed; continuing if go/gcc already present"
+            }
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || true
+            else
+                yum install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+
+    if ! command -v go >/dev/null 2>&1; then
+        print_error "Go toolchain not found. Install Go 1.22+ and retry."
+        pause
+        return 1
+    fi
+
+    rm -rf "$CORE_SRC_DIR"
+    mkdir -p "$(dirname "$CORE_SRC_DIR")"
+    print_info "Cloning ${MANAGER_GITHUB_REPO}@${MANAGER_BRANCH} ..."
+    if ! git clone --depth 1 --branch "$MANAGER_BRANCH" \
+        "https://github.com/${MANAGER_GITHUB_REPO}.git" "$CORE_SRC_DIR" 2>/dev/null; then
+        print_error "Clone failed. Push branch ${MANAGER_BRANCH} to GitHub first, or copy core/ manually."
+        pause
+        return 1
+    fi
+
+    if [ ! -d "$CORE_SRC_DIR/core" ]; then
+        print_error "core/ directory missing in cloned repo"
+        pause
+        return 1
+    fi
+
+    local build_out="/tmp/paqet_linux_${arch_name}"
+    print_info "Compiling (CGO + libpcap)..."
+    (
+        cd "$CORE_SRC_DIR/core" || exit 1
+        export CGO_ENABLED=1
+        go build -trimpath -ldflags "-s -w \
+            -X 'paqet/cmd/version.Version=v2.0.0-wildpaqet' \
+            -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
+            -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
+            -o "$build_out" ./cmd/main.go
+    )
+    if [ $? -ne 0 ] || [ ! -f "$build_out" ]; then
+        print_error "Build failed"
+        pause
+        return 1
+    fi
+
+    mkdir -p "$INSTALL_DIR" "$BIN_DIR"
+    if [ -f "$BIN_DIR/paqet" ]; then
+        cp -f "$BIN_DIR/paqet" "$BIN_DIR/paqet.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+    fi
+    install -m 0755 "$build_out" "$BIN_DIR/paqet"
+    ln -sf "$BIN_DIR/paqet" "$INSTALL_DIR/paqet" 2>/dev/null || true
+
+    print_success "WildPaqet Core v2 installed to $BIN_DIR/paqet"
+    "$BIN_DIR/paqet" version 2>/dev/null || true
+    echo ""
+    echo -e "${YELLOW}Tip:${NC} New configs use ${CYAN}network.tcp.preset: ${DEFAULT_TCP_PRESET}${NC}"
+    echo -e "Both sides (Iran + Kharej) must run this same Core v2 binary."
+    pause
+    return 0
+}
+
 # Install Paqet binary
 install_paqet() {
     clear
@@ -2548,22 +2696,24 @@ install_paqet() {
     esac
     
     local expected_file="paqet-linux-${arch_name}-${latest_version}.tar.gz"
-    local download_url="https://github.com/${GITHUB_REPO}/releases/download/${latest_version}/${expected_file}"
+    local download_url
+    download_url=$(resolve_core_download_url "$latest_version" "$expected_file")
     
     echo -e "${YELLOW}Download URL:${NC} ${CYAN}$download_url${NC}\n"
     
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN} paqet core${NC}"
+    echo -e "${GREEN} WildPaqet Core v2 / paqet${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}Installation Options paqet core:${NC}"
+    echo -e "${YELLOW}Installation Options (core):${NC}"
     echo -e " 1) ${GREEN}Download/Update from GitHub (latest: $latest_version)${NC}"
     echo -e " 2) ${CYAN}Use local file from /root/paqet/${NC}"
     echo -e " 3) ${PURPLE}Download from custom URL${NC}"
+    echo -e " 8) ${ORANGE}Build WildPaqet Core v2 from source (branch ${MANAGER_BRANCH})${NC}"
     echo -e ""
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN} paqet manager${NC}"
+    echo -e "${GREEN} WildPaqet manager${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${YELLOW}Installation Options paqet manager:${NC}"
+    echo -e "${YELLOW}Installation Options (manager):${NC}"
     echo -e " 4) ${BLUE}Install script${NC}"
     echo -e " 5) ${BLUE}Update script${NC}"
     echo -e " 6) ${BLUE}Switch version${NC}"
@@ -2571,20 +2721,19 @@ install_paqet() {
     echo -e ""
     echo -e " 0) ${YELLOW}↩️ Back to main menu${NC}\n"
     
-    read -p "Choose option [0-7]: " install_choice
+    read -p "Choose option [0-8]: " install_choice
     
     case $install_choice in
         1)
-            print_info "Downloading latest version ($latest_version) from GitHub for $os/$arch_name..."
+            print_info "Downloading ($latest_version) for $os/$arch_name..."
             
             if ! curl -fsSL "$download_url" -o "/tmp/paqet.tar.gz" 2>/dev/null; then
                 print_error "Download failed from GitHub"
                 echo -e "\n${YELLOW}Please check:${NC}"
                 echo -e " 1. Internet connection"
-                echo -e " 2. GitHub repository access"
-                echo -e " 3. The version $latest_version exists"
+                echo -e " 2. GitHub repository access / release exists"
+                echo -e " 3. Or use option ${ORANGE}8${NC} to build Core v2 from source"
                 echo -e "\n${YELLOW}You can also:${NC}"
-                echo -e " - Try again later"
                 echo -e " - Download manually from: $download_url"
                 echo -e " - Save to: /root/paqet/$expected_file"
                 echo -e " - Then use option 2 to install from local file"
@@ -2680,6 +2829,10 @@ install_paqet() {
             else
                 print_success "Downloaded from custom URL"
             fi
+            ;;
+        8)
+            build_wildpaqet_core_from_source "$arch_name"
+            return $?
             ;;
         4)
             install_manager_script
@@ -2827,7 +2980,8 @@ install_manager_script() {
     show_banner
     print_step "Installing WildPaqet Manager script...\n"
     
-    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
+    local manager_url
+    manager_url="$(manager_script_url)"
     
     print_info "Downloading from: $manager_url"
     
@@ -2876,7 +3030,8 @@ update_manager_script() {
     cp "$MANAGER_PATH" "$backup_path"
     print_info "Backup created at $backup_path"
     
-    local manager_url="https://raw.githubusercontent.com/${MANAGER_GITHUB_REPO}/main/${MANAGER_SCRIPT_FILE}"
+    local manager_url
+    manager_url="$(manager_script_url)"
     
     print_info "Downloading latest version..."
     
