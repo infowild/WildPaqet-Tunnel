@@ -47,7 +47,7 @@ Both **Iran** and **Kharej** must run the **same Core v2** binary (`paqet versio
 ```yaml
 network:
   tcp:
-    preset: "restrictive"   # track_seq + mimic handshake
+    preset: "default"   # stable; use "restrictive" only if the path needs it
 ```
 
 4. Confirm:

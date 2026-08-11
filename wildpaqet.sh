@@ -47,8 +47,9 @@ readonly CORE_GITHUB_REPO="infowild/WildPaqet-Tunnel"
 readonly MANAGER_GITHUB_REPO="infowild/WildPaqet-Tunnel"
 readonly SERVICE_NAME="paqet"
 readonly TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
-# Default wire profile written into new configs (requires WildPaqet Core v2)
-readonly DEFAULT_TCP_PRESET="restrictive"
+# Default wire profile for new configs (Core v2).
+# "default" = stable midstream crafting; use "restrictive" only if path needs it.
+readonly DEFAULT_TCP_PRESET="default"
 
 # Kernel optimization settings
 readonly SYSCTL_FILE="/etc/sysctl.d/99-paqet-tunnel.conf"
@@ -1703,6 +1704,9 @@ configure_client() {
         elif [[ "$conn_input" =~ ^[1-9][0-9]?$ ]] && [ "$conn_input" -ge 1 ] && [ "$conn_input" -le 32 ]; then
             conn="$conn_input"
             echo -e "[6/15] Connections : ${CYAN}$conn_input${NC}"
+            if [ "$conn_input" -gt 4 ]; then
+                print_warning "High client conn ($conn_input) can cause reconnect loops on filtered paths; 1–2 is safer"
+            fi
         else
             conn="$DEFAULT_CONNECTIONS_CLIENT"
             echo -e "${YELLOW}Invalid, using default $DEFAULT_CONNECTIONS_CLIENT${NC}"
@@ -2630,6 +2634,9 @@ build_wildpaqet_core_from_source() {
     (
         cd "$CORE_SRC_DIR/core" || exit 1
         export CGO_ENABLED=1
+        # Iran-friendly module/toolchain mirrors (override if already set)
+        export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
+        export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         go build -trimpath -ldflags "-s -w \
             -X 'paqet/cmd/version.Version=v2.0.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
