@@ -184,9 +184,9 @@ wildpaqet
 # option 8 → type YES
 ```
 
-Removes services, cron, core, configs, `wildpaqet` command, Telegram bot, script sysctl/limits, and Paqet iptables protection. Optionally flushes NAT and deletes `/root/paqet` + backups.
+Removes **all** script/tunnel artifacts: services, cron, core + backups, `$INSTALL_DIR`, Core v2 source clone, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, Paqet iptables protection, `/root/paqet`, `/root/paqet-backups`, and `/tmp/paqet*`. Optionally flushes the NAT table.
 
-Does **not** remove distro packages (curl, iptables-persistent, …) or external BBR kernel installs.
+Does **not** remove distro packages (curl, iptables-persistent, golang, …) or external BBR kernel installs.
 
 ---
 
