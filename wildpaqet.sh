@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.0-v2
+# Version: 8.1-v2
 # Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.0-v2"
+readonly SCRIPT_VERSION="8.1-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -288,6 +288,85 @@ ensure_manager_command() {
         print_warning "Command not in PATH yet. Use: ${CYAN}$MANAGER_PATH${NC}"
         print_info "Or: ${CYAN}export PATH=\"/usr/local/bin:\$PATH\" && hash -r${NC}"
     fi
+}
+
+# Keep /usr/local/bin/wildpaqet on the same version as this running session.
+# Otherwise a curl one-liner heals this run, then the next `wildpaqet` is the old copy
+# that still writes network.tcp.preset: restrictive.
+sync_installed_manager_if_outdated() {
+    local installed_ver=""
+    if [ -f "$MANAGER_PATH" ]; then
+        installed_ver=$(grep '^readonly SCRIPT_VERSION=' "$MANAGER_PATH" 2>/dev/null | head -1 | cut -d'"' -f2)
+    fi
+    [ "$installed_ver" = "$SCRIPT_VERSION" ] && return 0
+
+    local src="${BASH_SOURCE[0]:-}"
+    local ok=0
+    if [ -n "$src" ] && [ -f "$src" ] \
+        && [[ "$src" != /dev/fd/* && "$src" != /proc/self/fd/* && "$src" != /dev/stdin && "$src" != "$MANAGER_PATH" ]]; then
+        if cp -f "$src" "$MANAGER_PATH" 2>/dev/null; then
+            sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+            chmod +x "$MANAGER_PATH"
+            is_manager_binary_ok "$MANAGER_PATH" && ok=1
+        fi
+    fi
+    if [ "$ok" -eq 0 ]; then
+        local manager_url
+        manager_url="$(manager_script_url)"
+        if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
+            sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+            chmod +x "$MANAGER_PATH"
+            is_manager_binary_ok "$MANAGER_PATH" && ok=1
+        fi
+    fi
+    if [ "$ok" -eq 1 ]; then
+        print_success "Manager command updated to v${SCRIPT_VERSION}"
+    else
+        print_warning "This session is v${SCRIPT_VERSION}; installed manager is v${installed_ver:-unknown}"
+        print_info "After GitHub is updated: ${CYAN}wildpaqet${NC} → 0 → 5"
+    fi
+}
+
+# Old Core v2 configs used preset: restrictive. On many paths that only sends SYNs
+# and the tunnel never comes up. New configs use default; heal existing YAML too.
+migrate_tcp_preset_to_default() {
+    [ -d "$CONFIG_DIR" ] || return 0
+
+    local changed=()
+    local f name svc
+    local old_nullglob
+    old_nullglob=$(shopt -p nullglob)
+    shopt -s nullglob
+    for f in "$CONFIG_DIR"/*.yaml "$CONFIG_DIR"/*.yml; do
+        [ -f "$f" ] || continue
+        grep -qE '^[[:space:]]*preset:[[:space:]]*"?restrictive"?' "$f" 2>/dev/null || continue
+        sed -i -E 's/^([[:space:]]*)preset:[[:space:]]*"?restrictive"?[[:space:]]*$/\1preset: "default"/' "$f"
+        if grep -qE '^[[:space:]]*preset:[[:space:]]*"?default"?' "$f"; then
+            name=$(basename "$f")
+            name=${name%.yaml}
+            name=${name%.yml}
+            changed+=("$name")
+        fi
+    done
+    eval "$old_nullglob" 2>/dev/null || shopt -u nullglob
+
+    [ ${#changed[@]} -eq 0 ] && return 0
+
+    echo ""
+    print_warning "Old tcp preset 'restrictive' breaks many Iran↔Kharej tunnels."
+    print_info "Switched to preset 'default' on: ${changed[*]}"
+    for name in "${changed[@]}"; do
+        svc="paqet-${name}.service"
+        if [ -f "$SERVICE_DIR/$svc" ]; then
+            if systemctl restart "$svc" >/dev/null 2>&1; then
+                print_success "Restarted $svc"
+            else
+                print_warning "Could not restart $svc"
+            fi
+        fi
+    done
+    echo ""
+    sleep 2
 }
 
 # Detect OS
@@ -6172,4 +6251,6 @@ main_menu() {
 
 check_root
 ensure_manager_command
+sync_installed_manager_if_outdated
+migrate_tcp_preset_to_default
 main_menu

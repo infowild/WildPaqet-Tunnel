@@ -4,7 +4,7 @@
 
 **Raw-packet KCP tunnel manager for restricted networks**
 
-[![Version](https://img.shields.io/badge/version-8.0--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-8.1--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -143,6 +143,7 @@ wildpaqet
 | KCP mode | `fast` | `fast` |
 | Connections | `4` | `1` |
 | MTU | `1350` | `1350` |
+| TCP preset | `default` | `default` |
 | Encryption | `aes-128-gcm` | `aes-128-gcm` |
 | Command | `wildpaqet` | `wildpaqet` |
 
