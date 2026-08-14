@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.1-v2
+# Version: 8.2-v2
 # Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.1-v2"
+readonly SCRIPT_VERSION="8.2-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -2662,12 +2662,6 @@ build_wildpaqet_core_from_source() {
     local arch_name="${1:-amd64}"
     print_step "Building WildPaqet Core v2 from source (branch ${MANAGER_BRANCH})..."
 
-    if ! command -v git >/dev/null 2>&1; then
-        print_error "git is required"
-        pause
-        return 1
-    fi
-
     local os_id
     os_id=$(detect_os)
     case "$os_id" in
@@ -2693,17 +2687,50 @@ build_wildpaqet_core_from_source() {
     fi
 
     rm -rf "$CORE_SRC_DIR"
-    mkdir -p "$(dirname "$CORE_SRC_DIR")"
-    print_info "Cloning ${MANAGER_GITHUB_REPO}@${MANAGER_BRANCH} ..."
-    if ! git clone --depth 1 --branch "$MANAGER_BRANCH" \
-        "https://github.com/${MANAGER_GITHUB_REPO}.git" "$CORE_SRC_DIR" 2>/dev/null; then
-        print_error "Clone failed. Push branch ${MANAGER_BRANCH} to GitHub first, or copy core/ manually."
+    mkdir -p "$CORE_SRC_DIR"
+    print_info "Fetching ${MANAGER_GITHUB_REPO}@${MANAGER_BRANCH} ..."
+
+    # git clone often stalls on restricted networks, so fetch the branch tarball
+    # over plain HTTPS (direct, then mirror) and keep git only as a last resort.
+    local tarball="/tmp/wildpaqet-core-${MANAGER_BRANCH}.tar.gz"
+    local codeload="https://codeload.github.com/${MANAGER_GITHUB_REPO}/tar.gz/refs/heads/${MANAGER_BRANCH}"
+    local sources=(
+        "$codeload"
+        "https://gh-proxy.com/${codeload}"
+    )
+
+    local fetched=0 url
+    rm -f "$tarball"
+    for url in "${sources[@]}"; do
+        if curl -fsSL --connect-timeout 15 --max-time 300 "$url" -o "$tarball" 2>/dev/null \
+            && [ -s "$tarball" ] \
+            && tar -xzf "$tarball" -C "$CORE_SRC_DIR" --strip-components=1 2>/dev/null; then
+            fetched=1
+            break
+        fi
+        rm -f "$tarball"
+    done
+    rm -f "$tarball"
+
+    if [ "$fetched" -eq 0 ] && command -v git >/dev/null 2>&1; then
+        print_warning "Tarball download failed; trying git clone..."
+        rm -rf "$CORE_SRC_DIR"
+        if GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
+            git clone --depth 1 --branch "$MANAGER_BRANCH" \
+            "https://github.com/${MANAGER_GITHUB_REPO}.git" "$CORE_SRC_DIR"; then
+            fetched=1
+        fi
+    fi
+
+    if [ "$fetched" -eq 0 ]; then
+        print_error "Could not download source from GitHub"
+        print_info "Check network, or copy core/ manually to ${CORE_SRC_DIR}/core"
         pause
         return 1
     fi
 
     if [ ! -d "$CORE_SRC_DIR/core" ]; then
-        print_error "core/ directory missing in cloned repo"
+        print_error "core/ directory missing in downloaded source"
         pause
         return 1
     fi
