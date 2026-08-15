@@ -2757,6 +2757,42 @@ install_iptables_persistent() {
     save_iptables
 }
 
+# Run a long step with a heartbeat, so a slow or filtered link never looks like
+# a frozen script. Returns the command's exit code (124 = timed out).
+run_with_progress() {
+    local secs="$1"; shift
+    local label="$1"; shift
+
+    echo -ne "${CYAN}  → ${label}${NC}"
+    ( timeout "$secs" "$@" >/dev/null 2>&1 ) &
+    local pid=$!
+    local waited=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 5
+        waited=$((waited + 5))
+        echo -n "."
+    done
+    wait "$pid"
+    local rc=$?
+
+    case $rc in
+        0)   echo -e " ${GREEN}ok${NC} (${waited}s)" ;;
+        124) echo -e " ${YELLOW}timed out after ${secs}s${NC}" ;;
+        *)   echo -e " ${YELLOW}failed (rc=$rc)${NC}" ;;
+    esac
+    return $rc
+}
+
+# True when everything the core build needs is already installed. Re-running the
+# package manager is the single biggest stall on restricted links, so skip it.
+build_deps_present() {
+    command -v go >/dev/null 2>&1 || return 1
+    command -v gcc >/dev/null 2>&1 || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    [ -f /usr/include/pcap.h ] || [ -f /usr/include/pcap/pcap.h ] || return 1
+    return 0
+}
+
 # Build WildPaqet Core v2 from the wild-paqet-v2 branch (./core)
 build_wildpaqet_core_from_source() {
     local arch_name="${1:-amd64}"
@@ -2765,23 +2801,39 @@ build_wildpaqet_core_from_source() {
     local os_id
     os_id=$(detect_os)
     # Package installs are the usual place this stalls on restricted networks,
-    # so keep them visible and time-boxed instead of silently hanging.
-    print_info "Installing build dependencies (may take a few minutes)..."
-    case "$os_id" in
-        ubuntu|debian)
-            timeout 240 apt-get update -y >/dev/null 2>&1 || print_warning "apt-get update timed out; using existing package lists"
-            timeout 600 apt-get install -y golang-go libpcap-dev build-essential git curl >/dev/null 2>&1 || {
-                print_warning "apt install failed or timed out; continuing if go/gcc already present"
-            }
-            ;;
-        centos|rhel|fedora|rocky|almalinux)
-            if command -v dnf >/dev/null 2>&1; then
-                timeout 600 dnf install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || print_warning "dnf install failed or timed out"
-            else
-                timeout 600 yum install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || print_warning "yum install failed or timed out"
-            fi
-            ;;
-    esac
+    # so skip them when possible and otherwise keep them visible and time-boxed.
+    if build_deps_present; then
+        print_info "Build dependencies already present, skipping package manager"
+    else
+        print_info "Installing build dependencies (may take a few minutes)..."
+        # Never let the package manager block on a prompt or on an unreachable
+        # mirror: both look identical to a frozen script from the operator side.
+        export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_MODE=a
+        local apt_opts=(
+            -o Acquire::http::Timeout=15
+            -o Acquire::https::Timeout=15
+            -o Acquire::Retries=1
+            -o Dpkg::Options::=--force-confold
+        )
+        case "$os_id" in
+            ubuntu|debian)
+                run_with_progress 150 "apt-get update" \
+                    apt-get update -y "${apt_opts[@]}" \
+                    || print_warning "Using existing package lists"
+                run_with_progress 420 "apt-get install (go, libpcap, gcc)" \
+                    apt-get install -y "${apt_opts[@]}" golang-go libpcap-dev build-essential git curl \
+                    || print_warning "Install incomplete; continuing if go/gcc already present"
+                ;;
+            centos|rhel|fedora|rocky|almalinux)
+                local pm="yum"
+                command -v dnf >/dev/null 2>&1 && pm="dnf"
+                run_with_progress 420 "$pm install (go, libpcap, gcc)" \
+                    "$pm" install -y --setopt=timeout=15 --setopt=retries=1 golang libpcap-devel gcc git curl \
+                    || print_warning "Install incomplete; continuing if go/gcc already present"
+                ;;
+        esac
+    fi
 
     if ! command -v go >/dev/null 2>&1; then
         print_error "Go toolchain not found. Install Go 1.22+ and retry."
@@ -2850,8 +2902,23 @@ build_wildpaqet_core_from_source() {
         newest=$(printf '%s\n%s\n' "$need_go" "$have_go" | sort -V | tail -1)
         if [ "$newest" = "$need_go" ]; then
             print_warning "Installed Go is ${have_go}, source needs ${need_go}"
-            print_info "Go will download the ${need_go} toolchain, which often stalls from Iran."
-            print_info "If it hangs, build on a Kharej server and copy $BIN_DIR/paqet over instead."
+            # Left to `go build`, this download retries silently for up to half
+            # an hour on a filtered link. Do it here, bounded and visible, so a
+            # blocked toolchain fails in minutes with usable instructions.
+            if ! run_with_progress 420 "Fetching Go ${need_go} toolchain" \
+                env GOTOOLCHAIN="go${need_go}" \
+                    GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
+                    GOSUMDB="${GOSUMDB:-sum.golang.google.cn}" \
+                    go version; then
+                print_error "Could not fetch the Go ${need_go} toolchain (network blocked?)"
+                echo ""
+                print_info "Build on a Kharej server instead, then copy the binary here:"
+                echo -e "  ${CYAN}Kharej:${NC} cd $BIN_DIR && python3 -m http.server 8899"
+                echo -e "  ${CYAN}Here:${NC}   curl -fsSL http://<KHAREJ_IP>:8899/paqet -o /tmp/paqet.new \\"
+                echo -e "           && chmod +x /tmp/paqet.new && mv -f /tmp/paqet.new $BIN_DIR/paqet"
+                pause
+                return 1
+            fi
         fi
     fi
 
