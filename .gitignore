@@ -3,6 +3,7 @@ rules_and_progress.md
 
 # Personal/local test harness — not published
 tests/
+*_test.go
 
 # Editor / OS junk
 .DS_Store
