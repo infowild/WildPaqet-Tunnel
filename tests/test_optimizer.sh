@@ -199,6 +199,66 @@ else
     echo "  FAIL: mq-safe remediator missing"; FAIL=$((FAIL + 1))
 fi
 
+echo "== uninstall wiring (lib-only source) =="
+# Source the whole manager without launching the interactive menu, then confirm
+# every function the full uninstall depends on is actually defined (catches
+# renames/typos that would make 'menu 8' crash halfway through cleanup).
+UNINSTALL_CHECK=$(
+    WILDPAQET_LIB_ONLY=1 bash --noprofile --norc -c '
+        set +e
+        source "'"$SCRIPT"'" >/dev/null 2>&1
+        for f in \
+            uninstall_paqet \
+            cleanup_kernel_optimizations_silent \
+            optimizer_restore_snapshot \
+            optimizer_remove_qdisc_persistence \
+            optimizer_latest_snapshot \
+            optimizer_apply_qdisc_targets \
+            optimizer_fix_fq_on_iface \
+            optimizer_snapshot; do
+            if declare -F "$f" >/dev/null 2>&1; then
+                echo "DEF $f"
+            else
+                echo "UNDEF $f"
+            fi
+        done
+    ' 2>/dev/null || true
+)
+if echo "$UNINSTALL_CHECK" | grep -q "UNDEF"; then
+    echo "  FAIL: uninstall references undefined function(s):"
+    echo "$UNINSTALL_CHECK" | grep "UNDEF" | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+else
+    echo "  PASS: all uninstall/optimizer functions defined"
+    PASS=$((PASS + 1))
+fi
+
+# cleanup_kernel_optimizations_silent must run to completion (exit 0) even when
+# no snapshot exists and system tools are absent (all system calls are guarded).
+CLEANUP_RUN=$(
+    WILDPAQET_LIB_ONLY=1 bash --noprofile --norc -c '
+        set +e
+        source "'"$SCRIPT"'" >/dev/null 2>&1
+        cleanup_kernel_optimizations_silent >/dev/null 2>&1
+        echo "RC=$?"
+    ' 2>/dev/null || true
+)
+assert_eq "cleanup_kernel_optimizations_silent returns 0" "$CLEANUP_RUN" "RC=0"
+
+# Uninstall must go through the shared snapshot-aware cleanup, not a blind wipe.
+assert_contains "uninstall calls shared cleanup" \
+    "$(sed -n '/^uninstall_paqet()/,/^}/p' "$SCRIPT")" \
+    "cleanup_kernel_optimizations_silent"
+assert_contains "cleanup restores snapshot" \
+    "$(sed -n '/^cleanup_kernel_optimizations_silent()/,/^}/p' "$SCRIPT")" \
+    "optimizer_restore_snapshot"
+assert_contains "cleanup removes qdisc persistence" \
+    "$(sed -n '/^cleanup_kernel_optimizations_silent()/,/^}/p' "$SCRIPT")" \
+    "optimizer_remove_qdisc_persistence"
+assert_not_contains "cleanup no blind cubic force" \
+    "$(sed -n '/^cleanup_kernel_optimizations_silent()/,/^}/p' "$SCRIPT")" \
+    "tcp_congestion_control=cubic"
+
 echo "== shellcheck (optional) =="
 if command -v shellcheck >/dev/null 2>&1; then
     if shellcheck -e SC2034,SC2086,SC2155,SC2162,SC1090,SC1091 "$ROOT/tests/test_optimizer.sh"; then

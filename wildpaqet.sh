@@ -6696,8 +6696,13 @@ main_menu() {
 # START
 # ================================================
 
-check_root
-ensure_manager_command
-sync_installed_manager_if_outdated
-migrate_tcp_preset_to_default
-main_menu
+# WILDPAQET_LIB_ONLY=1 lets tests source this file for its functions without
+# running the root check or launching the interactive manager
+# (see tests/test_optimizer.sh).
+if [ -z "${WILDPAQET_LIB_ONLY:-}" ]; then
+    check_root
+    ensure_manager_command
+    sync_installed_manager_if_outdated
+    migrate_tcp_preset_to_default
+    main_menu
+fi
