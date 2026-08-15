@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.2-v2
+# Version: 8.3-v2
 # Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.2-v2"
+readonly SCRIPT_VERSION="8.3-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -2664,18 +2664,21 @@ build_wildpaqet_core_from_source() {
 
     local os_id
     os_id=$(detect_os)
+    # Package installs are the usual place this stalls on restricted networks,
+    # so keep them visible and time-boxed instead of silently hanging.
+    print_info "Installing build dependencies (may take a few minutes)..."
     case "$os_id" in
         ubuntu|debian)
-            apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y golang-go libpcap-dev build-essential git curl >/dev/null 2>&1 || {
-                print_warning "apt install may have failed; continuing if go/gcc already present"
+            timeout 240 apt-get update -y >/dev/null 2>&1 || print_warning "apt-get update timed out; using existing package lists"
+            timeout 600 apt-get install -y golang-go libpcap-dev build-essential git curl >/dev/null 2>&1 || {
+                print_warning "apt install failed or timed out; continuing if go/gcc already present"
             }
             ;;
         centos|rhel|fedora|rocky|almalinux)
             if command -v dnf >/dev/null 2>&1; then
-                dnf install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || true
+                timeout 600 dnf install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || print_warning "dnf install failed or timed out"
             else
-                yum install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || true
+                timeout 600 yum install -y golang libpcap-devel gcc git curl >/dev/null 2>&1 || print_warning "yum install failed or timed out"
             fi
             ;;
     esac
@@ -2685,6 +2688,7 @@ build_wildpaqet_core_from_source() {
         pause
         return 1
     fi
+    print_success "Build dependencies ready ($(go version 2>/dev/null | awk '{print $3}'))"
 
     rm -rf "$CORE_SRC_DIR"
     mkdir -p "$CORE_SRC_DIR"
@@ -2735,6 +2739,22 @@ build_wildpaqet_core_from_source() {
         return 1
     fi
 
+    # Building needs the Go version go.mod asks for. If the installed Go is older,
+    # `go build` silently downloads a toolchain, which is what stalls behind
+    # restricted networks - so warn before spending 20 minutes on it.
+    local need_go have_go
+    need_go=$(awk '/^go /{print $2; exit}' "$CORE_SRC_DIR/core/go.mod" 2>/dev/null)
+    have_go=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+    if [ -n "$need_go" ] && [ -n "$have_go" ] && [ "$need_go" != "$have_go" ]; then
+        local newest
+        newest=$(printf '%s\n%s\n' "$need_go" "$have_go" | sort -V | tail -1)
+        if [ "$newest" = "$need_go" ]; then
+            print_warning "Installed Go is ${have_go}, source needs ${need_go}"
+            print_info "Go will download the ${need_go} toolchain, which often stalls from Iran."
+            print_info "If it hangs, build on a Kharej server and copy $BIN_DIR/paqet over instead."
+        fi
+    fi
+
     local build_out="/tmp/paqet_linux_${arch_name}"
     print_info "Compiling (CGO + libpcap)..."
     (
@@ -2743,13 +2763,20 @@ build_wildpaqet_core_from_source() {
         # Iran-friendly module/toolchain mirrors (override if already set)
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
-        go build -trimpath -ldflags "-s -w \
+        timeout 1800 go build -trimpath -ldflags "-s -w \
             -X 'paqet/cmd/version.Version=v2.0.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
     )
-    if [ $? -ne 0 ] || [ ! -f "$build_out" ]; then
+    local build_rc=$?
+    if [ "$build_rc" -eq 124 ]; then
+        print_error "Build timed out after 30 minutes"
+        print_info "Usually the Go toolchain download is blocked. Build on a Kharej server, then copy the binary to $BIN_DIR/paqet"
+        pause
+        return 1
+    fi
+    if [ "$build_rc" -ne 0 ] || [ ! -f "$build_out" ]; then
         print_error "Build failed"
         pause
         return 1
@@ -3290,6 +3317,24 @@ uninstall_manager_script() {
 # KERNEL OPTIMIZATION FUNCTIONS
 # ================================================
 
+# fq throttles the tunnel: raw-packet traffic collapses into a couple of kernel
+# flows and fq caps each at ~100 queued packets, so throughput spikes then drops.
+apply_qdisc_to_live_ifaces() {
+    command -v tc >/dev/null 2>&1 || return 0
+
+    local ifaces=() iface
+    mapfile -t ifaces < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v '^lo$')
+
+    for iface in "${ifaces[@]}"; do
+        tc qdisc show dev "$iface" 2>/dev/null | grep -qE '^qdisc fq [0-9]' || continue
+        if tc qdisc replace dev "$iface" root fq_codel 2>/dev/null; then
+            print_success "qdisc on $iface switched from fq to fq_codel"
+        else
+            print_warning "Could not change qdisc on $iface"
+        fi
+    done
+}
+
 # Apply full kernel optimizations
 apply_kernel_optimizations() {
     clear
@@ -3333,7 +3378,9 @@ net.core.optmem_max = 25165824
 net.ipv4.tcp_rmem = 4096 87380 134217728
 net.ipv4.tcp_wmem = 4096 65536 134217728
 net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = fq
+# fq_codel, not fq: paqet injects raw packets, so the whole tunnel looks like a
+# couple of kernel flows and fq's per-flow 100-packet limit drops them under load.
+net.core.default_qdisc = fq_codel
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_tw_reuse = 1
@@ -3373,6 +3420,9 @@ EOF
     else
         print_warning "Some sysctl settings could not be applied"
     fi
+
+    # default_qdisc only affects new devices, so move live interfaces off fq too
+    apply_qdisc_to_live_ifaces
     
     # Check if BBR is available, fallback to cubic
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
