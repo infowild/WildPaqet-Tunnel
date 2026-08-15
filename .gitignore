@@ -1,6 +1,9 @@
 # Local project rules / progress — never publish to GitHub
 rules_and_progress.md
 
+# Personal/local test harness — not published
+tests/
+
 # Editor / OS junk
 .DS_Store
 Thumbs.db

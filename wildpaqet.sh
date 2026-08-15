@@ -6696,9 +6696,8 @@ main_menu() {
 # START
 # ================================================
 
-# WILDPAQET_LIB_ONLY=1 lets tests source this file for its functions without
-# running the root check or launching the interactive manager
-# (see tests/test_optimizer.sh).
+# WILDPAQET_LIB_ONLY=1 lets a test harness source this file for its functions
+# without running the root check or launching the interactive manager.
 if [ -z "${WILDPAQET_LIB_ONLY:-}" ]; then
     check_root
     ensure_manager_command

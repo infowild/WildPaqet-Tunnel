@@ -99,9 +99,3 @@ Key rules in **8.4-v2+**:
 | legacy | remote `teddysun/bbr.sh` removed from the menu |
 
 Do **not** re-apply old “full kernel optimization” profiles from earlier managers; they used oversized buffers and often `fq`.
-
-Fixture tests (no root / no live mutation):
-
-```bash
-bash tests/test_optimizer.sh
-```
