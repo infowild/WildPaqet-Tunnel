@@ -1,6 +1,7 @@
 package socket
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net"
 	"runtime"
@@ -21,6 +22,21 @@ type decoder struct {
 	ip6     layers.IPv6
 	tcp     layers.TCP
 	decoded []gopacket.LayerType
+}
+
+// Packet is a decoded inbound TCP segment. Payload aliases the pcap capture
+// buffer and is only valid until the next Read on the same handle.
+type Packet struct {
+	Payload []byte
+	Addr    net.UDPAddr
+	Seq     uint32
+	Ack     uint32
+	TSVal   uint32
+	TSOK    bool
+	SYN     bool
+	ACK     bool
+	FIN     bool
+	RST     bool
 }
 
 type RecvHandle struct {
@@ -57,38 +73,52 @@ func NewRecvHandle(cfg *conf.Network) (*RecvHandle, error) {
 	return h, nil
 }
 
-func (h *RecvHandle) Read() ([]byte, net.Addr, error) {
+// Read decodes the next inbound segment into pkt. Control segments (SYN,
+// SYN-ACK, bare ACK) are returned too, so the handshake can be driven from
+// them; callers that only want data must check len(pkt.Payload).
+func (h *RecvHandle) Read(pkt *Packet) error {
 	data, _, err := h.handle.ReadPacketData()
 	if err != nil {
-		return nil, nil, err
+		return err
 	}
 
 	d := h.dPool.Get().(*decoder)
 	defer h.dPool.Put(d)
 
 	if err := d.parser.DecodeLayers(data, &d.decoded); err != nil {
-		return nil, nil, errNoPayload
+		return errNoPayload
 	}
 
-	addr := &net.UDPAddr{}
-	var payload []byte
+	*pkt = Packet{}
+	var sawTCP bool
 	for _, t := range d.decoded {
 		switch t {
 		case layers.LayerTypeIPv4:
-			addr.IP = d.ip4.SrcIP
+			pkt.Addr.IP = d.ip4.SrcIP
 		case layers.LayerTypeIPv6:
-			addr.IP = d.ip6.SrcIP
+			pkt.Addr.IP = d.ip6.SrcIP
 		case layers.LayerTypeTCP:
-			addr.Port = int(d.tcp.SrcPort)
-			payload = d.tcp.Payload
+			sawTCP = true
+			pkt.Addr.Port = int(d.tcp.SrcPort)
+			pkt.Payload = d.tcp.Payload
+			pkt.Seq = d.tcp.Seq
+			pkt.Ack = d.tcp.Ack
+			pkt.SYN, pkt.ACK, pkt.FIN, pkt.RST = d.tcp.SYN, d.tcp.ACK, d.tcp.FIN, d.tcp.RST
+			for _, o := range d.tcp.Options {
+				if o.OptionType == layers.TCPOptionKindTimestamps && len(o.OptionData) >= 8 {
+					pkt.TSVal = binary.BigEndian.Uint32(o.OptionData[0:4])
+					pkt.TSOK = true
+					break
+				}
+			}
 		}
 	}
 
-	if addr.IP == nil || len(payload) == 0 {
-		return nil, nil, errNoPayload
+	if pkt.Addr.IP == nil || !sawTCP {
+		return errNoPayload
 	}
 
-	return payload, addr, nil
+	return nil
 }
 
 func (h *RecvHandle) Close() {

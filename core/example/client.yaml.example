@@ -37,10 +37,12 @@ network:
     local_flag: ["PA"]                      # Local TCP flags (Push+Ack default)
     remote_flag: ["PA"]                     # Remote TCP flags (Push+Ack default)
     # WildPaqet v2 wire realism (optional)
-    preset: "restrictive"   # default|restrictive
-    # handshake: "mimic"
+    # default   = hardened: real 3-way handshake, tracked SEQ/ACK, no DSCP mark
+    # legacy    = pre-hardening wire behaviour (only for debugging an old peer)
+    preset: "default"       # default|legacy ("restrictive" is an alias of default)
+    # handshake: "mimic"    # mimic|none
     # track_seq: true
-    # ipv4_tos: 0
+    # ipv4_tos: 0           # keep 0; 184 (DSCP 46) is a rare, easily matched mark
     # ttl: 64
     # window: 65535
 

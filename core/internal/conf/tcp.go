@@ -82,44 +82,47 @@ func (t *TCP) validate() []error {
 func (t *TCP) resolveWire() []error {
 	var errors []error
 
+	// "restrictive" is kept as an alias of the hardened default so existing YAML
+	// keeps working; "legacy" restores the pre-hardening wire behaviour.
 	preset := t.Preset_
 	switch preset {
 	case "", "default", "restrictive":
-	default:
-		errors = append(errors, fmt.Errorf("tcp preset must be \"\", \"default\", or \"restrictive\""))
 		preset = ""
-	}
-	if preset == "default" {
+	case "legacy":
+	default:
+		errors = append(errors, fmt.Errorf("tcp preset must be \"default\", \"restrictive\", or \"legacy\""))
 		preset = ""
 	}
 	t.Preset = preset
-	restrictive := preset == "restrictive"
+	legacy := preset == "legacy"
 
 	handshake := t.Handshake_
 	if handshake == "" {
-		if restrictive {
-			handshake = "mimic"
-		} else {
+		if legacy {
 			handshake = "none"
+		} else {
+			handshake = "mimic"
 		}
 	}
 	switch handshake {
 	case "none", "mimic":
 	default:
 		errors = append(errors, fmt.Errorf("tcp handshake must be \"none\" or \"mimic\""))
-		handshake = "none"
+		handshake = "mimic"
 	}
 	t.Handshake = handshake
 
 	if t.TrackSeq_ != nil {
 		t.TrackSeq = *t.TrackSeq_
 	} else {
-		t.TrackSeq = restrictive
+		t.TrackSeq = !legacy
 	}
 
-	tos := 184
-	if restrictive {
-		tos = 0
+	// DSCP 46 (TOS 184) marks every packet as expedited-forwarding voice traffic,
+	// which is a rare and easily matched signature for a bulk tunnel.
+	tos := 0
+	if legacy {
+		tos = 184
 	}
 	if t.IPv4TOS_ != nil {
 		tos = *t.IPv4TOS_

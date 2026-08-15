@@ -1,8 +1,8 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.4-v2
-# Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
+# Version: 8.5-v2
+# Branch: wild-paqet-v2 (real 3-way handshake + tracked SEQ/ACK + no DSCP mark)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.4-v2"
+readonly SCRIPT_VERSION="8.5-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -331,8 +331,8 @@ sync_installed_manager_if_outdated() {
     fi
 }
 
-# Old Core v2 configs used preset: restrictive. On many paths that only sends SYNs
-# and the tunnel never comes up. New configs use default; heal existing YAML too.
+# Core v2 now treats "restrictive" as an alias of the hardened default, so this
+# only normalises older YAML to the name the examples and docs use.
 migrate_tcp_preset_to_default() {
     [ -d "$CONFIG_DIR" ] || return 0
 
@@ -357,8 +357,7 @@ migrate_tcp_preset_to_default() {
     [ ${#changed[@]} -eq 0 ] && return 0
 
     echo ""
-    print_warning "Old tcp preset 'restrictive' breaks many Iran↔Kharej tunnels."
-    print_info "Switched to preset 'default' on: ${changed[*]}"
+    print_info "Normalized tcp preset 'restrictive' to 'default' on: ${changed[*]}"
     for name in "${changed[@]}"; do
         svc="paqet-${name}.service"
         if [ -f "$SERVICE_DIR/$svc" ]; then
@@ -2797,7 +2796,8 @@ build_wildpaqet_core_from_source() {
     "$BIN_DIR/paqet" version 2>/dev/null || true
     echo ""
     echo -e "${YELLOW}Tip:${NC} New configs use ${CYAN}network.tcp.preset: ${DEFAULT_TCP_PRESET}${NC}"
-    echo -e "Both sides (Iran + Kharej) must run this same Core v2 binary."
+    echo -e "Preset ${CYAN}default${NC} now does a real TCP handshake, tracks SEQ/ACK and drops the DSCP mark."
+    echo -e "${YELLOW}Update BOTH sides${NC} (Iran + Kharej) — the handshake only completes when both run this build."
     pause
     return 0
 }

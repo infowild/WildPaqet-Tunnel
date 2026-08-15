@@ -4,7 +4,7 @@
 
 **Raw-packet KCP tunnel manager for restricted networks**
 
-[![Version](https://img.shields.io/badge/version-8.4--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-8.5--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -149,6 +149,22 @@ wildpaqet
 
 ---
 
+## Wire hardening (8.5-v2)
+
+The tunnel leg between Iran and Kharej used to be easy to single out on the wire. Preset `default` now makes it behave like an ordinary TCP connection:
+
+| Before | Now |
+|--------|-----|
+| A lone SYN with no answer, then data — worse than no handshake at all | Real three-way handshake: the server replies `SYN-ACK`, the client completes with `ACK` |
+| SEQ/ACK were pseudo-random and unrelated to the bytes sent | SEQ counts bytes sent, ACK follows bytes received, timestamps echo the peer |
+| Every packet marked DSCP 46 (`TOS 184`), the expedited-forwarding class used by VoIP | No DSCP mark (`TOS 0`), like normal traffic |
+
+Update **both ends** — the handshake only completes when Iran and Kharej run this build. A new client against an old server still connects; it just logs that no `SYN-ACK` arrived.
+
+Set `network.tcp.preset: "legacy"` on both sides to restore the old wire behaviour if you need to compare.
+
+---
+
 ## Menu Map
 
 | # | Action |
@@ -193,7 +209,7 @@ Does **not** remove distro packages (curl, iptables-persistent, golang, …). Ex
 
 ### Safe/Auto Network Optimizer (menu 7)
 
-WildPaqet **8.4-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian and RHEL-family hosts:
+WildPaqet **8.5-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian and RHEL-family hosts:
 
 - Uses **`fq_codel`** only — never `fq` (which caps each kernel flow at ~100 packets and collapses raw-packet Paqet tunnels under load).
 - Preserves **`mq`** multi-queue roots; only retargets `fq` leaves under `mq`, or replaces a single-queue `fq` root.

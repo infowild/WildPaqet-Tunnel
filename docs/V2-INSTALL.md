@@ -1,8 +1,8 @@
 # WildPaqet v2 — install & test on a server
 
 Branch: **`wild-paqet-v2`**  
-Manager: **`8.4-v2`**  
-Core tree: **`./core`** (wire realism + mimic handshake + multi-addr)
+Manager: **`8.5-v2`**  
+Core tree: **`./core`** (real 3-way handshake + tracked SEQ/ACK + no DSCP mark + multi-addr)
 
 > Push this branch to GitHub before using the one-liner on a VPS.
 
@@ -47,7 +47,8 @@ Both **Iran** and **Kharej** must run the **same Core v2** binary (`paqet versio
 ```yaml
 network:
   tcp:
-    preset: "default"   # stable; use "restrictive" only if the path needs it
+    preset: "default"   # hardened wire: real handshake + tracked SEQ/ACK + TOS 0
+                        # ("restrictive" is an alias; "legacy" restores pre-hardening behaviour)
 ```
 
 4. Confirm:
@@ -88,7 +89,7 @@ wildpaqet
 # 7 → 2  Status (must show default_qdisc=fq_codel and no live fq warning)
 ```
 
-Key rules in **8.4-v2+**:
+Key rules in **8.5-v2+** (same Safe/Auto rules as 8.4, plus hardened wire defaults):
 
 | Topic | Behavior |
 |-------|----------|

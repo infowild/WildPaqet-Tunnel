@@ -4,7 +4,7 @@
 
 **منیجر تونل Raw-Packet + KCP برای شبکه‌های محدود**
 
-[![Version](https://img.shields.io/badge/version-8.4--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-8.5--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 
@@ -108,6 +108,22 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ---
 
+## سخت‌سازی ترافیک روی سیم (8.5-v2)
+
+مسیر تونل بین ایران و خارج قبلاً روی سیم خیلی راحت قابل تشخیص بود. پریست `default` حالا کاری می‌کند که این مسیر مثل یک کانکشن عادی TCP رفتار کند:
+
+| قبلاً | حالا |
+|-------|------|
+| یک SYN تنها که جوابی نمی‌گرفت و بعد بلافاصله دیتا — مشکوک‌تر از نفرستادن SYN | هندشیک سه‌مرحله‌ای واقعی: سرور `SYN-ACK` می‌دهد و کلاینت با `ACK` تمامش می‌کند |
+| SEQ/ACK شبه‌تصادفی و بی‌ربط به بایت‌های ارسالی | SEQ بایت‌های ارسالی را می‌شمارد، ACK بایت‌های دریافتی را، و timestamp طرف مقابل echo می‌شود |
+| مارک DSCP 46 (`TOS 184`) روی همه پکت‌ها، همان کلاس مخصوص VoIP | بدون هیچ مارکی (`TOS 0`)، مثل ترافیک معمولی |
+
+**هر دو طرف** باید آپدیت شوند؛ هندشیک فقط وقتی کامل می‌شود که ایران و خارج هر دو این نسخه را داشته باشند. کلاینت جدید با سرور قدیمی هم وصل می‌شود، فقط در لاگ می‌نویسد که `SYN-ACK` نیامد.
+
+اگر خواستی رفتار قدیمی را برگردانی، روی هر دو طرف `network.tcp.preset: "legacy"` بگذار.
+
+---
+
 ## منو
 
 | # | کار |
@@ -145,7 +161,7 @@ wildpaqet
 
 ### بهینه‌ساز Safe/Auto شبکه (منوی ۷)
 
-از نسخه **8.4-v2** به بعد، Optimizer از نو بازنویسی شده است (Ubuntu/Debian و خانواده RHEL):
+از نسخه **8.5-v2** به بعد، Optimizer از نو بازنویسی شده است (Ubuntu/Debian و خانواده RHEL):
 
 - فقط **`fq_codel`** — هرگز `fq` (لیمیت حدود ۱۰۰ پکت روی هر flow باعث لگ اسپایک روی تانل raw-packet می‌شود).
 - ریشه **`mq`** چندصفی حفظ می‌شود؛ فقط leafهای `fq` زیر `mq` یا root تک‌صفی `fq` اصلاح می‌شوند.

@@ -12,7 +12,12 @@ import (
 	"github.com/gopacket/gopacket/pcap"
 
 	"paqet/internal/conf"
+	"paqet/internal/flog"
 )
+
+// How long a dial waits for the peer's SYN-ACK before giving up on the
+// handshake and starting to send data anyway.
+const synAckTimeout = 2 * time.Second
 
 type PacketConn struct {
 	cfg           *conf.Network
@@ -48,20 +53,38 @@ func New(cfg *conf.Network) (*PacketConn, error) {
 }
 
 func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
+	var pkt Packet
 	for {
 		if d, ok := c.readDeadline.Load().(time.Time); ok && !d.IsZero() && !time.Now().Before(d) {
 			return 0, nil, os.ErrDeadlineExceeded
 		}
 
-		p, addr, err := c.recvHandle.Read()
-		if err != nil {
+		if err := c.recvHandle.Read(&pkt); err != nil {
 			if errors.Is(err, pcap.NextErrorTimeoutExpired) || errors.Is(err, errNoPayload) {
 				continue
 			}
 			return 0, nil, err
 		}
 
-		return copy(data, p), addr, nil
+		c.sendHandle.noteRecv(&pkt)
+
+		// A peer opening a flow gets a real SYN-ACK, otherwise the port stays
+		// silent while carrying a heavy data flow, which is itself a giveaway.
+		if pkt.SYN && !pkt.ACK {
+			if c.mimic() {
+				peer := &net.UDPAddr{IP: pkt.Addr.IP, Port: pkt.Addr.Port}
+				if err := c.sendHandle.WriteControl(peer, conf.TCPF{SYN: true, ACK: true}); err != nil {
+					flog.Debugf("socket: failed to answer SYN from %s: %v", peer, err)
+				}
+			}
+			continue
+		}
+
+		if len(pkt.Payload) == 0 {
+			continue
+		}
+
+		return copy(data, pkt.Payload), &net.UDPAddr{IP: pkt.Addr.IP, Port: pkt.Addr.Port}, nil
 	}
 }
 
@@ -130,6 +153,37 @@ func (c *PacketConn) DeleteClientTCPF(addr net.Addr) {
 	c.sendHandle.deleteClientTCPF(addr)
 }
 
+func (c *PacketConn) mimic() bool {
+	return c.cfg.TCP.Handshake == "mimic"
+}
+
+// MimicHandshake performs the client half of a three-way handshake before any
+// tunnel data is sent, so the flow starts the way an ordinary TCP connection
+// does. A server that never answers (older build, or handshake disabled) is not
+// treated as fatal: the dial continues with a consistent sequence space.
 func (c *PacketConn) MimicHandshake(addr *net.UDPAddr) error {
-	return c.sendHandle.MimicHandshake(addr)
+	if err := c.sendHandle.WriteControl(addr, conf.TCPF{SYN: true}); err != nil {
+		return err
+	}
+
+	var pkt Packet
+	deadline := time.Now().Add(synAckTimeout)
+	for time.Now().Before(deadline) {
+		if err := c.recvHandle.Read(&pkt); err != nil {
+			if errors.Is(err, pcap.NextErrorTimeoutExpired) || errors.Is(err, errNoPayload) {
+				continue
+			}
+			return err
+		}
+
+		if !pkt.SYN || !pkt.ACK || pkt.Addr.Port != addr.Port || !pkt.Addr.IP.Equal(addr.IP) {
+			continue
+		}
+
+		c.sendHandle.syncSynAck(&pkt)
+		return c.sendHandle.WriteControl(addr, conf.TCPF{ACK: true})
+	}
+
+	flog.Debugf("socket: no SYN-ACK from %s within %s, continuing without it", addr, synAckTimeout)
+	return nil
 }
