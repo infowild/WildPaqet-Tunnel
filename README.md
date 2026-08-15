@@ -4,7 +4,7 @@
 
 **Raw-packet KCP tunnel manager for restricted networks**
 
-[![Version](https://img.shields.io/badge/version-8.3--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-8.4--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -160,7 +160,7 @@ wildpaqet
 | 4 | Manage one service |
 | 5 | Manage all (NAT, protection, bulk) |
 | 6 | Connectivity tests |
-| 7 | Optimize (BBR / DNS / Mirror) |
+| 7 | Optimize (Safe/Auto network + DNS / Mirror) |
 | 8 | **Full uninstall** |
 | 9 | Telegram bot |
 | 10 | Exit |
@@ -187,7 +187,21 @@ wildpaqet
 
 Removes **all** script/tunnel artifacts: services, cron, core + backups, `$INSTALL_DIR`, Core v2 source clone, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, Paqet iptables protection, `/root/paqet`, `/root/paqet-backups`, and `/tmp/paqet*`. Optionally flushes the NAT table.
 
-Does **not** remove distro packages (curl, iptables-persistent, golang, …) or external BBR kernel installs.
+Does **not** remove distro packages (curl, iptables-persistent, golang, …). External third-party BBR installers (if you ran them separately) are left alone.
+
+### Safe/Auto Network Optimizer (menu 7)
+
+WildPaqet **8.4-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian and RHEL-family hosts:
+
+- Uses **`fq_codel`** only — never `fq` (which caps each kernel flow at ~100 packets and collapses raw-packet Paqet tunnels under load).
+- Preserves **`mq`** multi-queue roots; only retargets `fq` leaves under `mq`, or replaces a single-queue `fq` root.
+- Enables **BBR** only after `modprobe` + availability check; otherwise keeps/falls back to `cubic`.
+- Conservative RAM-scaled buffers (no 256MB max / huge backlog / mega conntrack / forced `rp_filter` / `ip_forward`).
+- Snapshots under `/var/lib/wildpaqet/netopt/` before apply; **Rollback** restores the last snapshot (not a blind `cubic`/`pfifo_fast` wipe).
+- Remediates live qdisc on **default-route** interfaces only (`eth0`, `enp3s0`, …) — not Docker/VPN virtuals.
+- **Do not** re-run old manager “Kernel Optimization” / remote `teddysun/bbr.sh` flows — they can reintroduce `fq`.
+
+Menu: **7 → 1** Apply · **2** Status · **3** Rollback · **4** Reset owned drop-ins · DNS Finder / Mirror Selector.
 
 ---
 

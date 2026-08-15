@@ -1,7 +1,7 @@
 # WildPaqet v2 — install & test on a server
 
 Branch: **`wild-paqet-v2`**  
-Manager: **`8.0-v2`**  
+Manager: **`8.4-v2`**  
 Core tree: **`./core`** (wire realism + mimic handshake + multi-addr)
 
 > Push this branch to GitHub before using the one-liner on a VPS.
@@ -77,3 +77,31 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/ma
 ```
 
 Or inside menu **0 → 6 Switch version → main-7.1**.
+
+## 6) Safe/Auto Network Optimizer (menu 7)
+
+After tunnels are up, on **both** Iran and Kharej (especially if you ever ran an older optimize that set `fq`):
+
+```bash
+wildpaqet
+# 7 → 1  Apply Safe/Auto
+# 7 → 2  Status (must show default_qdisc=fq_codel and no live fq warning)
+```
+
+Key rules in **8.4-v2+**:
+
+| Topic | Behavior |
+|-------|----------|
+| qdisc | `fq_codel` only — never `fq` |
+| multi-queue NIC | keep `mq` root; fix `fq` leaves only |
+| iface scope | default-route NICs (`eth0` / `enp3s0` / …), not Docker/VPN |
+| rollback | restores `/var/lib/wildpaqet/netopt/snap-*` |
+| legacy | remote `teddysun/bbr.sh` removed from the menu |
+
+Do **not** re-apply old “full kernel optimization” profiles from earlier managers; they used oversized buffers and often `fq`.
+
+Fixture tests (no root / no live mutation):
+
+```bash
+bash tests/test_optimizer.sh
+```

@@ -4,7 +4,7 @@
 
 **منیجر تونل Raw-Packet + KCP برای شبکه‌های محدود**
 
-[![Version](https://img.shields.io/badge/version-8.3--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-8.4--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
 
@@ -115,7 +115,7 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 | 0 | نصب/آپدیت هسته و منیجر |
 | 2 / 3 | کانفیگ خارج / ایران |
 | 4 / 5 | مدیریت سرویس‌ها |
-| 7 | بهینه‌سازی |
+| 7 | بهینه‌سازی Safe/Auto شبکه + DNS / Mirror |
 | 8 | حذف کامل |
 | 9 | ربات تلگرام |
 
@@ -139,7 +139,21 @@ wildpaqet
 
 سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، کلون سورس Core v2، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین iptables محافظتی، کش `/root/paqet`، بکاپ‌ها و فایل‌های موقت `/tmp/paqet*` پاک می‌شوند. Flush جدول NAT اختیاری است.
 
-پکیج‌های سیستم (curl، golang، …) و نصب BBR خارجی دست نخورده می‌مانند.
+پکیج‌های سیستم (curl، golang، …) دست نخورده می‌مانند. نصب‌کننده‌های BBR شخص‌ثالث جداگانه (در صورت وجود) هم دست نخورده می‌مانند.
+
+### بهینه‌ساز Safe/Auto شبکه (منوی ۷)
+
+از نسخه **8.4-v2** به بعد، Optimizer از نو بازنویسی شده است (Ubuntu/Debian و خانواده RHEL):
+
+- فقط **`fq_codel`** — هرگز `fq` (لیمیت حدود ۱۰۰ پکت روی هر flow باعث لگ اسپایک روی تانل raw-packet می‌شود).
+- ریشه **`mq`** چندصفی حفظ می‌شود؛ فقط leafهای `fq` زیر `mq` یا root تک‌صفی `fq` اصلاح می‌شوند.
+- **BBR** فقط بعد از `modprobe` و بررسی دسترسی فعال می‌شود؛ وگرنه `cubic`.
+- بافرها بر اساس RAM و محافظه‌کارانه (بدون مقادیر غول‌آسای backlog/conntrack و بدون اجبار `rp_filter` / `ip_forward`).
+- قبل از اعمال، snapshot در `/var/lib/wildpaqet/netopt/`؛ **Rollback** همان snapshot را برمی‌گرداند.
+- فقط اینترفیس‌های مسیر پیش‌فرض (`eth0`، `enp3s0`، …) — نه Docker/VPN.
+- **Optimizer قدیمی** و `teddysun/bbr.sh` را دوباره اجرا نکنید؛ ممکن است دوباره `fq` بیاورند.
+
+منو: **۷ → ۱** اعمال · **۲** وضعیت · **۳** Rollback · **۴** Reset فایل‌های متعلق به WildPaqet.
 
 ---
 

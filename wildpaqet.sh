@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.3-v2
+# Version: 8.4-v2
 # Branch: wild-paqet-v2 (wire realism + mimic handshake + multi-addr core)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.3-v2"
+readonly SCRIPT_VERSION="8.4-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -51,9 +51,13 @@ readonly TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
 # "default" = stable midstream crafting; use "restrictive" only if path needs it.
 readonly DEFAULT_TCP_PRESET="default"
 
-# Kernel optimization settings
+# Kernel optimization settings (Safe/Auto network optimizer)
 readonly SYSCTL_FILE="/etc/sysctl.d/99-paqet-tunnel.conf"
 readonly LIMITS_FILE="/etc/security/limits.d/99-paqet.conf"
+readonly NETOPT_STATE_DIR="/var/lib/wildpaqet/netopt"
+readonly NETOPT_MARKER="wildpaqet-managed"
+readonly NETOPT_QDISC_UNIT="wildpaqet-qdisc.service"
+readonly NETOPT_QDISC_SCRIPT="/usr/local/lib/wildpaqet/fix-qdisc.sh"
 
 # Default Values
 readonly DEFAULT_LISTEN_PORT="8888"
@@ -3314,309 +3318,683 @@ uninstall_manager_script() {
 }
 
 # ================================================
-# KERNEL OPTIMIZATION FUNCTIONS
+# SAFE/AUTO NETWORK OPTIMIZER
 # ================================================
+# Designed for WildPaqet raw-packet tunnels:
+# - Never apply fq (per-flow 100p limit collapses KCP inject)
+# - Preserve mq root on multi-queue NICs; only retarget fq leaves
+# - Snapshot before mutate; rollback restores exact prior state
+# - Conservative buffers; no remote curl|bash BBR installers
 
-# fq throttles the tunnel: raw-packet traffic collapses into a couple of kernel
-# flows and fq caps each at ~100 queued packets, so throughput spikes then drops.
-apply_qdisc_to_live_ifaces() {
-    command -v tc >/dev/null 2>&1 || return 0
-
-    local ifaces=() iface
-    mapfile -t ifaces < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | grep -v '^lo$')
-
-    for iface in "${ifaces[@]}"; do
-        tc qdisc show dev "$iface" 2>/dev/null | grep -qE '^qdisc fq [0-9]' || continue
-        if tc qdisc replace dev "$iface" root fq_codel 2>/dev/null; then
-            print_success "qdisc on $iface switched from fq to fq_codel"
-        else
-            print_warning "Could not change qdisc on $iface"
-        fi
-    done
+# --- OPTIMIZER_TEST_EXPORT_BEGIN ---
+optimizer_owned_sysctl_keys() {
+    cat <<'EOF'
+net.core.rmem_max
+net.core.wmem_max
+net.core.netdev_max_backlog
+net.core.somaxconn
+net.core.optmem_max
+net.core.default_qdisc
+net.ipv4.tcp_rmem
+net.ipv4.tcp_wmem
+net.ipv4.tcp_congestion_control
+net.ipv4.tcp_slow_start_after_idle
+net.ipv4.tcp_mtu_probing
+net.ipv4.ip_local_port_range
+fs.file-max
+EOF
 }
 
-# Apply full kernel optimizations
-apply_kernel_optimizations() {
-    clear
-    show_banner
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║ Apply Kernel Optimizations (Recommended)                 ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    print_step "Applying full kernel optimizations..."
-    
-    # Check if running as root
+optimizer_ram_mb() {
+    local kb
+    kb=$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    echo $((kb / 1024))
+}
+
+# Pure helper (also used by tests): print safe profile as "key = value"
+optimizer_build_safe_profile() {
+    local ram_mb="${1:-0}"
+    local rmem_max=16777216
+    local wmem_max=16777216
+    local backlog=5000
+    local somax=4096
+    local tcp_rmem_max=16777216
+    local tcp_wmem_max=16777216
+    local file_max=1048576
+
+    if [ "$ram_mb" -ge 8192 ] 2>/dev/null; then
+        rmem_max=33554432
+        wmem_max=33554432
+        backlog=10000
+        somax=8192
+        tcp_rmem_max=33554432
+        tcp_wmem_max=33554432
+        file_max=2097152
+    elif [ "$ram_mb" -ge 4096 ] 2>/dev/null; then
+        rmem_max=25165824
+        wmem_max=25165824
+        backlog=8000
+        somax=6144
+        tcp_rmem_max=25165824
+        tcp_wmem_max=25165824
+    elif [ "$ram_mb" -gt 0 ] && [ "$ram_mb" -lt 2048 ] 2>/dev/null; then
+        rmem_max=8388608
+        wmem_max=8388608
+        backlog=2500
+        somax=2048
+        tcp_rmem_max=8388608
+        tcp_wmem_max=8388608
+        file_max=524288
+    fi
+
+    cat <<EOF
+# WildPaqet Safe/Auto network profile (${NETOPT_MARKER})
+# Paqet uses raw-packet inject; never set default_qdisc=fq on tunnel hosts.
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${wmem_max}
+net.core.netdev_max_backlog = ${backlog}
+net.core.somaxconn = ${somax}
+net.core.optmem_max = 65536
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_rmem = 4096 131072 ${tcp_rmem_max}
+net.ipv4.tcp_wmem = 4096 16384 ${tcp_wmem_max}
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.ip_local_port_range = 10000 65535
+fs.file-max = ${file_max}
+EOF
+}
+
+optimizer_iface_is_virtual() {
+    local iface="$1"
+    case "$iface" in
+        lo|docker*|br-*|veth*|virbr*|tun*|tap*|wg*|flannel*|cni*|tailscale*|zt*|vmnet*) return 0 ;;
+    esac
+    [ -d "/sys/class/net/$iface/device" ] || return 0
+    return 1
+}
+# --- OPTIMIZER_TEST_EXPORT_END ---
+
+# Default-route interfaces only (IPv4 then IPv6), skip virtuals.
+optimizer_detect_target_ifaces() {
+    local seen="" iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        optimizer_iface_is_virtual "$iface" && continue
+        case " $seen " in
+            *" $iface "*) continue ;;
+        esac
+        seen="$seen $iface"
+        printf '%s\n' "$iface"
+    done < <(
+        ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+        ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    )
+}
+
+optimizer_try_install_tools() {
+    local os
+    os=$(detect_os 2>/dev/null || echo unknown)
+    case "$os" in
+        ubuntu|debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y -qq iproute2 procps kmod >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|rocky|almalinux|fedora|oracle)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf install -y iproute procps-ng kmod >/dev/null 2>&1 || true
+            else
+                yum install -y iproute procps-ng kmod >/dev/null 2>&1 || true
+            fi
+            ;;
+    esac
+}
+
+optimizer_preflight() {
     if [[ $EUID -ne 0 ]]; then
         print_error "This must be run as root"
         return 1
     fi
-    
-    # Create backup directory
-    mkdir -p "$BACKUP_DIR"
-    
-    # Backup existing configs (timestamp at backup time, not script start)
-    local backup_sysctl="${BACKUP_DIR}/sysctl-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
-    local backup_limits="${BACKUP_DIR}/limits-99-paqet.backup-$(date +%Y%m%d-%H%M%S)"
-    [ -f "$SYSCTL_FILE" ] && cp "$SYSCTL_FILE" "$backup_sysctl" && print_info "Backed up $SYSCTL_FILE"
-    [ -f "$LIMITS_FILE" ] && cp "$LIMITS_FILE" "$backup_limits" && print_info "Backed up $LIMITS_FILE"
-    
-    print_step "Creating sysctl configuration..."
-    
-    # Create sysctl config
-    cat > "$SYSCTL_FILE" << 'EOF'
-# Paqet Tunnel - Kernel Optimizations
-# Network core settings
-net.core.rmem_max = 268435456
-net.core.wmem_max = 268435456
-net.core.rmem_default = 16777216
-net.core.wmem_default = 16777216
-net.core.netdev_max_backlog = 250000
-net.core.somaxconn = 65535
-net.core.optmem_max = 25165824
+    local miss=()
+    command -v ip >/dev/null 2>&1 || miss+=("ip")
+    command -v tc >/dev/null 2>&1 || miss+=("tc")
+    command -v sysctl >/dev/null 2>&1 || miss+=("sysctl")
+    if [ ${#miss[@]} -gt 0 ]; then
+        print_step "Installing network tools (${miss[*]})..."
+        optimizer_try_install_tools
+        miss=()
+        command -v ip >/dev/null 2>&1 || miss+=("ip")
+        command -v tc >/dev/null 2>&1 || miss+=("tc")
+        command -v sysctl >/dev/null 2>&1 || miss+=("sysctl")
+    fi
+    if [ ${#miss[@]} -gt 0 ]; then
+        print_error "Missing tools: ${miss[*]}"
+        print_info "Install iproute2 / procps first (menu 1 Dependencies)"
+        return 1
+    fi
+    return 0
+}
 
-# TCP settings
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_congestion_control = bbr
-# fq_codel, not fq: paqet injects raw packets, so the whole tunnel looks like a
-# couple of kernel flows and fq's per-flow 100-packet limit drops them under load.
-net.core.default_qdisc = fq_codel
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_syn_backlog = 65535
-net.ipv4.tcp_max_tw_buckets = 1440000
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_sack = 1
-net.ipv4.tcp_window_scaling = 1
+optimizer_ensure_bbr_module() {
+    if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        return 0
+    fi
+    modprobe tcp_bbr 2>/dev/null || true
+    sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr
+}
 
-# Connection tracking
-net.netfilter.nf_conntrack_max = 2097152
-net.netfilter.nf_conntrack_tcp_timeout_established = 86400
-net.netfilter.nf_conntrack_udp_timeout = 60
-net.netfilter.nf_conntrack_udp_timeout_stream = 180
+optimizer_latest_snapshot() {
+    local d
+    d=$(ls -1dt "$NETOPT_STATE_DIR"/snap-* 2>/dev/null | head -1)
+    [ -n "$d" ] && [ -d "$d" ] && echo "$d"
+}
 
-# IP settings
-net.ipv4.ip_forward = 1
-net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.conf.all.rp_filter = 1
-net.ipv4.conf.default.rp_filter = 1
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.conf.default.accept_source_route = 0
+optimizer_snapshot() {
+    local stamp snap
+    stamp=$(date +%Y%m%d-%H%M%S)
+    snap="${NETOPT_STATE_DIR}/snap-${stamp}"
+    mkdir -p "$snap/qdisc" "$snap/sysctl_values"
 
-# File limits
-fs.file-max = 4194304
-fs.inotify.max_user_instances = 8192
-fs.inotify.max_user_watches = 524288
+    local key
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        sysctl -n "$key" 2>/dev/null > "$snap/sysctl_values/$key" || true
+    done < <(optimizer_owned_sysctl_keys)
+
+    [ -f "$SYSCTL_FILE" ] && cp -a "$SYSCTL_FILE" "$snap/sysctl.dropin" || true
+    [ -f "$LIMITS_FILE" ] && cp -a "$LIMITS_FILE" "$snap/limits.dropin" || true
+
+    local iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        tc qdisc show dev "$iface" 2>/dev/null > "$snap/qdisc/${iface}.txt" || true
+    done < <(optimizer_detect_target_ifaces)
+
+    echo "$stamp" > "$snap/meta.stamp"
+    echo "safe-auto" > "$snap/meta.profile"
+    hostname > "$snap/meta.host" 2>/dev/null || true
+    echo "$snap"
+}
+
+# mq-safe fq remediation. Never replace mq root with a single fq_codel.
+optimizer_fix_fq_on_iface() {
+    local iface="$1"
+    local force="${2:-0}"
+    command -v tc >/dev/null 2>&1 || return 1
+    ip link show "$iface" >/dev/null 2>&1 || return 1
+
+    local root_kind
+    root_kind=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/^qdisc / && $0 !~ /parent/ {print $2; exit}')
+    [ -n "$root_kind" ] || return 0
+
+    case "$root_kind" in
+        mq)
+            local line parent
+            while IFS= read -r line; do
+                [[ "$line" =~ ^qdisc\ fq\  ]] || continue
+                parent=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="parent"){print $(i+1); exit}}')
+                [ -n "$parent" ] || continue
+                if tc qdisc replace dev "$iface" parent "$parent" fq_codel 2>/dev/null; then
+                    print_success "qdisc leaf on $iface ($parent): fq -> fq_codel"
+                else
+                    print_warning "Could not retarget fq leaf on $iface ($parent)"
+                    return 1
+                fi
+            done < <(tc qdisc show dev "$iface" 2>/dev/null)
+            ;;
+        fq)
+            if tc qdisc replace dev "$iface" root fq_codel 2>/dev/null; then
+                print_success "qdisc on $iface: fq -> fq_codel"
+            else
+                print_warning "Could not change root qdisc on $iface"
+                return 1
+            fi
+            ;;
+        htb|hfsc|cake|prio|tbf|clsact)
+            if [ "$force" = "1" ]; then
+                print_warning "Forced skip of classful/custom root qdisc ($root_kind) on $iface"
+            else
+                print_info "Leaving custom root qdisc ($root_kind) on $iface untouched"
+            fi
+            ;;
+        *)
+            # pfifo_fast / fq_codel / noqueue / etc. — OK
+            :
+            ;;
+    esac
+    return 0
+}
+
+optimizer_apply_qdisc_targets() {
+    local iface rc=0
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        optimizer_fix_fq_on_iface "$iface" 0 || rc=1
+    done < <(optimizer_detect_target_ifaces)
+    return $rc
+}
+
+optimizer_write_qdisc_helper_script() {
+    mkdir -p "$(dirname "$NETOPT_QDISC_SCRIPT")"
+    cat > "$NETOPT_QDISC_SCRIPT" <<'EOF'
+#!/bin/bash
+# wildpaqet-managed: re-apply Safe qdisc after boot (default_qdisc alone is not enough)
+set -euo pipefail
+is_virtual() {
+  case "$1" in
+    lo|docker*|br-*|veth*|virbr*|tun*|tap*|wg*|flannel*|cni*|tailscale*|zt*|vmnet*) return 0 ;;
+  esac
+  [ -d "/sys/class/net/$1/device" ] || return 0
+  return 1
+}
+targets() {
+  local seen="" iface
+  while IFS= read -r iface; do
+    [ -n "$iface" ] || continue
+    is_virtual "$iface" && continue
+    case " $seen " in *" $iface "*) continue ;; esac
+    seen="$seen $iface"
+    printf '%s\n' "$iface"
+  done < <(
+    ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+    ip -6 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+  )
+}
+fix_iface() {
+  local iface="$1" root parent line
+  root=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/^qdisc / && $0 !~ /parent/ {print $2; exit}')
+  case "$root" in
+    mq)
+      while IFS= read -r line; do
+        [[ "$line" =~ ^qdisc\ fq\  ]] || continue
+        parent=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="parent"){print $(i+1); exit}}')
+        [ -n "$parent" ] || continue
+        tc qdisc replace dev "$iface" parent "$parent" fq_codel 2>/dev/null || true
+      done < <(tc qdisc show dev "$iface" 2>/dev/null)
+      ;;
+    fq)
+      tc qdisc replace dev "$iface" root fq_codel 2>/dev/null || true
+      ;;
+  esac
+}
+modprobe sch_fq_codel 2>/dev/null || true
+sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+while IFS= read -r iface; do
+  [ -n "$iface" ] || continue
+  fix_iface "$iface"
+done < <(targets)
+exit 0
 EOF
-    
-    print_success "Sysctl configuration created at $SYSCTL_FILE"
-    
-    # Apply sysctl
-    print_step "Applying sysctl settings..."
-    if sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1; then
-        print_success "Sysctl settings applied successfully"
-    else
-        print_warning "Some sysctl settings could not be applied"
-    fi
+    chmod 0755 "$NETOPT_QDISC_SCRIPT"
+}
 
-    # default_qdisc only affects new devices, so move live interfaces off fq too
-    apply_qdisc_to_live_ifaces
-    
-    # Check if BBR is available, fallback to cubic
-    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-        print_warning "BBR congestion control not available in current kernel"
-        print_step "Falling back to cubic..."
-        sed -i 's/bbr/cubic/' "$SYSCTL_FILE"
-        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
-        print_info "Using cubic congestion control instead"
-    fi
-    
-    # Create limits.conf
-    print_step "Creating system limits configuration..."
-    cat > "$LIMITS_FILE" << 'EOF'
-# Paqet Tunnel - System Limits
+optimizer_install_qdisc_persistence() {
+    optimizer_write_qdisc_helper_script
+    cat > "/etc/systemd/system/${NETOPT_QDISC_UNIT}" <<EOF
+[Unit]
+Description=WildPaqet Safe qdisc (fq_codel, mq-preserving)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${NETOPT_QDISC_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now "$NETOPT_QDISC_UNIT" >/dev/null 2>&1 || \
+        systemctl enable "$NETOPT_QDISC_UNIT" >/dev/null 2>&1 || true
+}
+
+optimizer_remove_qdisc_persistence() {
+    systemctl disable --now "$NETOPT_QDISC_UNIT" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${NETOPT_QDISC_UNIT}" 2>/dev/null || true
+    rm -f "$NETOPT_QDISC_SCRIPT" 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+optimizer_apply_sysctl_file() {
+    local file="$1"
+    local key val line failed=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+        key=$(echo "$line" | awk -F= '{print $1}' | xargs)
+        val=$(echo "$line" | awk -F= '{sub(/^[^=]*=[[:space:]]*/,""); print}' | xargs)
+        [ -n "$key" ] || continue
+        if ! sysctl -w "$key=$val" >/dev/null 2>&1; then
+            print_warning "sysctl failed: $key=$val"
+            failed=1
+        else
+            print_info "sysctl ok: $key"
+        fi
+    done < "$file"
+    return $failed
+}
+
+optimizer_write_limits_file() {
+    cat > "$LIMITS_FILE" <<EOF
+# WildPaqet Safe/Auto limits (${NETOPT_MARKER})
+# Note: systemd units use LimitNOFILE; PAM limits apply to login sessions only.
 *               soft    nofile          1048576
 *               hard    nofile          1048576
 root            soft    nofile          1048576
 root            hard    nofile          1048576
-*               soft    nproc           unlimited
-*               hard    nproc           unlimited
-root            soft    nproc           unlimited
-root            hard    nproc           unlimited
 EOF
-    
-    print_success "System limits configured at $LIMITS_FILE"
-    
-    # Apply limits (will take effect on new sessions)
-    print_info "System limits will take effect for new sessions"
-    
-    echo -e "\n${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}✅ Kernel optimizations applied successfully!${NC}"
-    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}\n"
-    
-    echo -e "${YELLOW}Backup files:${NC}"
-    [ -f "$backup_sysctl" ] && echo -e "  • $backup_sysctl"
-    [ -f "$backup_limits" ] && echo -e "  • $backup_limits"
-    
-    echo -e "\n${YELLOW}Applied settings:${NC}"
-    echo -e "  • TCP Congestion Control: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A')"
-    echo -e "  • Default QDisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 'N/A')"
-    echo -e "  • Max File Descriptors: $(sysctl -n fs.file-max 2>/dev/null || echo 'N/A')"
-    echo -e "  • IP Forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 'N/A')"
-    
-    echo -e "\n${CYAN}Note: Some changes may require a reboot to take full effect.${NC}"
-    
-    pause
 }
 
-# Remove kernel optimizations
+optimizer_iface_has_fq() {
+    local iface="$1"
+    tc qdisc show dev "$iface" 2>/dev/null | grep -qE '^qdisc fq [0-9]'
+}
+
+optimizer_verify() {
+    local ok=1 iface
+    if [ ! -f "$SYSCTL_FILE" ]; then
+        print_warning "Drop-in missing: $SYSCTL_FILE"
+        ok=0
+    fi
+    local dq
+    dq=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    if [ "$dq" != "fq_codel" ]; then
+        print_warning "Runtime default_qdisc is '$dq' (want fq_codel)"
+        ok=0
+    fi
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        if optimizer_iface_has_fq "$iface"; then
+            print_warning "Live fq still present on $iface"
+            ok=0
+        fi
+        local root
+        root=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/^qdisc / && $0 !~ /parent/ {print $2; exit}')
+        if [ "$root" = "mq" ]; then
+            print_info "Preserved mq root on $iface"
+        fi
+    done < <(optimizer_detect_target_ifaces)
+    [ "$ok" -eq 1 ]
+}
+
+# Restore snapshot then drop owned files. Used by menu rollback and uninstall.
+optimizer_restore_snapshot() {
+    local snap="${1:-}"
+    if [ -z "$snap" ]; then
+        snap=$(optimizer_latest_snapshot)
+    fi
+    if [ -z "$snap" ] || [ ! -d "$snap" ]; then
+        return 1
+    fi
+
+    print_step "Restoring snapshot: $(basename "$snap")"
+
+    if [ -f "$snap/sysctl.dropin" ]; then
+        cp -a "$snap/sysctl.dropin" "$SYSCTL_FILE"
+    else
+        rm -f "$SYSCTL_FILE"
+    fi
+    if [ -f "$snap/limits.dropin" ]; then
+        cp -a "$snap/limits.dropin" "$LIMITS_FILE"
+    else
+        rm -f "$LIMITS_FILE"
+    fi
+
+    local keyfile key val
+    for keyfile in "$snap"/sysctl_values/*; do
+        [ -f "$keyfile" ] || continue
+        key=$(basename "$keyfile")
+        val=$(cat "$keyfile" 2>/dev/null || true)
+        [ -n "$val" ] || continue
+        sysctl -w "$key=$val" >/dev/null 2>&1 || true
+    done
+
+    # Best-effort: if snap captured fq, migrate to fq_codel for safety on tunnel hosts
+    local iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        optimizer_fix_fq_on_iface "$iface" 0 || true
+    done < <(optimizer_detect_target_ifaces)
+
+    sysctl --system >/dev/null 2>&1 || true
+    print_success "Snapshot restored"
+    return 0
+}
+
+optimizer_rollback_or_reset() {
+    if optimizer_restore_snapshot; then
+        return 0
+    fi
+    print_info "No snapshot found; removing owned drop-ins only"
+    rm -f "$SYSCTL_FILE" "$LIMITS_FILE"
+    optimizer_remove_qdisc_persistence
+    sysctl --system >/dev/null 2>&1 || true
+    # Keep fq_codel as safe runtime default for tunnel hosts if possible
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || \
+        sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+    optimizer_apply_qdisc_targets || true
+    return 0
+}
+
+apply_kernel_optimizations() {
+    clear
+    show_banner
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║ Safe/Auto Network Optimizer                              ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
+
+    print_info "Profile: Safe/Auto for WildPaqet raw-packet + co-located TCP"
+    print_info "Never applies fq; preserves mq; snapshots before change"
+    echo ""
+
+    if ! optimizer_preflight; then
+        pause
+        return 1
+    fi
+
+    local targets
+    targets=$(optimizer_detect_target_ifaces | tr '\n' ' ')
+    print_info "Target interfaces: ${targets:-none}"
+    echo ""
+    read -p "Apply Safe/Auto optimizations now? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        print_info "Cancelled"
+        pause
+        return 0
+    fi
+
+    mkdir -p "$NETOPT_STATE_DIR" "$BACKUP_DIR"
+    modprobe sch_fq_codel 2>/dev/null || true
+
+    local snap
+    snap=$(optimizer_snapshot) || true
+    [ -n "$snap" ] && print_success "Snapshot: $snap"
+
+    local ram_mb tmp_sysctl
+    ram_mb=$(optimizer_ram_mb)
+    print_info "Detected RAM: ${ram_mb} MiB"
+    tmp_sysctl=$(mktemp)
+    optimizer_build_safe_profile "$ram_mb" > "$tmp_sysctl"
+
+    if ! optimizer_ensure_bbr_module; then
+        print_warning "BBR not available; keeping cubic in profile"
+        sed -i 's/tcp_congestion_control = bbr/tcp_congestion_control = cubic/' "$tmp_sysctl"
+    fi
+
+    print_step "Writing drop-in $SYSCTL_FILE"
+    install -m 0644 "$tmp_sysctl" "$SYSCTL_FILE"
+    rm -f "$tmp_sysctl"
+
+    print_step "Applying sysctl keys..."
+    optimizer_apply_sysctl_file "$SYSCTL_FILE" || print_warning "Some sysctl keys failed (see above)"
+
+    print_step "Writing session limits (PAM)..."
+    optimizer_write_limits_file
+    print_success "Wrote $LIMITS_FILE"
+
+    print_step "Remediating live fq on default-route interfaces..."
+    optimizer_apply_qdisc_targets || print_warning "Some qdisc changes failed"
+
+    print_step "Installing boot persistence for qdisc..."
+    optimizer_install_qdisc_persistence
+    print_success "Enabled $NETOPT_QDISC_UNIT"
+
+    echo ""
+    if optimizer_verify; then
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN} Safe/Auto optimizer applied and verified${NC}"
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    else
+        print_error "Verification failed — rolling back"
+        optimizer_restore_snapshot "$snap" || optimizer_rollback_or_reset
+        pause
+        return 1
+    fi
+
+    echo -e "\n${YELLOW}Runtime:${NC}"
+    echo -e "  • Congestion: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
+    echo -e "  • default_qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
+    echo -e "  • rmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null || echo N/A)"
+    local iface
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        echo -e "  • $iface: $(tc qdisc show dev "$iface" 2>/dev/null | head -n 1)"
+    done < <(optimizer_detect_target_ifaces)
+    [ -n "$snap" ] && echo -e "\n${CYAN}Rollback snapshot:${NC} $snap"
+    pause
+    return 0
+}
+
 remove_kernel_optimizations() {
     clear
     show_banner
     echo -e "${RED}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${RED}║ Remove Kernel Optimizations                               ║${NC}"
+    echo -e "${RED}║ Rollback Network Optimizer                               ║${NC}"
     echo -e "${RED}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    print_warning "This will remove all Paqet kernel optimizations and restore system defaults."
+
+    local snap
+    snap=$(optimizer_latest_snapshot)
+    if [ -n "$snap" ]; then
+        echo -e "${YELLOW}Will restore snapshot:${NC} $snap"
+    else
+        echo -e "${YELLOW}No snapshot found — will only remove WildPaqet-owned drop-ins.${NC}"
+    fi
     echo ""
-    
-    read -p "Are you sure? (y/N): " confirm
+    read -p "Continue? (y/N): " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        print_info "Operation cancelled"
+        print_info "Cancelled"
         pause
-        return
+        return 0
     fi
-    
-    print_step "Removing kernel optimizations..."
-    
-    # Remove sysctl file
-    if [ -f "$SYSCTL_FILE" ]; then
-        rm -f "$SYSCTL_FILE"
-        print_success "Removed $SYSCTL_FILE"
-    else
-        print_info "Sysctl file not found"
-    fi
-    
-    # Remove limits file
-    if [ -f "$LIMITS_FILE" ]; then
-        rm -f "$LIMITS_FILE"
-        print_success "Removed $LIMITS_FILE"
-    else
-        print_info "Limits file not found"
-    fi
-    
-    # Reload system settings
-    print_step "Reloading system settings..."
-    sysctl --system >/dev/null 2>&1
-    
-    # Reset to system defaults
-    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
-    sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1
-    
-    print_success "System defaults restored"
-    echo -e "\n${YELLOW}Note: A reboot is recommended for complete reset.${NC}"
-    
+
+    optimizer_rollback_or_reset
+    print_success "Optimizer rolled back / reset"
     pause
 }
 
-# View current kernel status
+optimizer_reset_owned_settings() {
+    clear
+    show_banner
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║ Reset Owned Settings Only                                ║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════╝${NC}\n"
+    print_warning "Removes $SYSCTL_FILE / $LIMITS_FILE / qdisc oneshot without restoring a snapshot."
+    echo ""
+    read -p "Continue? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        print_info "Cancelled"
+        pause
+        return 0
+    fi
+    rm -f "$SYSCTL_FILE" "$LIMITS_FILE"
+    optimizer_remove_qdisc_persistence
+    sysctl --system >/dev/null 2>&1 || true
+    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
+    optimizer_apply_qdisc_targets || true
+    print_success "Owned settings removed"
+    pause
+}
+
 view_kernel_status() {
     clear
     show_banner
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║ Kernel Optimization Status                                ║${NC}"
+    echo -e "${CYAN}║ Network Optimizer Status                                 ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    print_step "Current Kernel Optimization Status"
-    
-    echo -e "\n${YELLOW}TCP Congestion Control:${NC}"
-    echo -e "  • Current: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'N/A')"
-    echo -e "  • Available: $(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | cut -d'=' -f2 | xargs || echo 'N/A')"
-    
-    echo -e "\n${YELLOW}Buffer Sizes:${NC}"
-    echo -e "  • net.core.rmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null || echo 'N/A')"
-    echo -e "  • net.core.wmem_max: $(sysctl -n net.core.wmem_max 2>/dev/null || echo 'N/A')"
-    echo -e "  • net.ipv4.tcp_rmem: $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo 'N/A')"
-    echo -e "  • net.ipv4.tcp_wmem: $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo 'N/A')"
-    
-    echo -e "\n${YELLOW}File Descriptors:${NC}"
-    echo -e "  • Current session: $(ulimit -n)"
-    echo -e "  • System max: $(sysctl -n fs.file-max 2>/dev/null || echo 'N/A')"
-    
-    echo -e "\n${YELLOW}Network Settings:${NC}"
-    echo -e "  • IP Forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 'N/A')"
-    echo -e "  • Default QDisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo 'N/A')"
-    echo -e "  • Local Port Range: $(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo 'N/A')"
-    
-    echo -e "\n${YELLOW}Configuration Files:${NC}"
+
+    echo -e "${YELLOW}Profile / files:${NC}"
     if [ -f "$SYSCTL_FILE" ]; then
-        echo -e "  • ${GREEN}✓ $SYSCTL_FILE${NC}"
-        echo -e "    └─ Modified: $(date -r "$SYSCTL_FILE" '+%Y-%m-%d %H:%M:%S')"
+        echo -e "  • ${GREEN}✓${NC} $SYSCTL_FILE ($(date -r "$SYSCTL_FILE" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown))"
+        grep -q "$NETOPT_MARKER" "$SYSCTL_FILE" 2>/dev/null && echo -e "    └─ marker: ${NETOPT_MARKER}"
     else
-        echo -e "  • ${RED}✗ $SYSCTL_FILE (not found)${NC}"
+        echo -e "  • ${RED}✗${NC} $SYSCTL_FILE (absent)"
     fi
-    
     if [ -f "$LIMITS_FILE" ]; then
-        echo -e "  • ${GREEN}✓ $LIMITS_FILE${NC}"
-        echo -e "    └─ Modified: $(date -r "$LIMITS_FILE" '+%Y-%m-%d %H:%M:%S')"
+        echo -e "  • ${GREEN}✓${NC} $LIMITS_FILE"
     else
-        echo -e "  • ${RED}✗ $LIMITS_FILE (not found)${NC}"
+        echo -e "  • ${RED}✗${NC} $LIMITS_FILE (absent)"
     fi
-    
+
+    local snap
+    snap=$(optimizer_latest_snapshot)
+    echo -e "\n${YELLOW}Snapshot:${NC} ${snap:-none}"
+
+    echo -e "\n${YELLOW}Runtime sysctl:${NC}"
+    echo -e "  • congestion: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
+    echo -e "  • available: $(sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | cut -d= -f2 | xargs || echo N/A)"
+    echo -e "  • default_qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
+    echo -e "  • rmem_max / wmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
+    echo -e "  • backlog / somaxconn: $(sysctl -n net.core.netdev_max_backlog 2>/dev/null) / $(sysctl -n net.core.somaxconn 2>/dev/null)"
+    echo -e "  • port range: $(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo N/A)"
+
+    echo -e "\n${YELLOW}Default-route interfaces / live qdisc:${NC}"
+    local iface found_fq=0
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        echo -e "  • ${CYAN}$iface${NC}"
+        tc qdisc show dev "$iface" 2>/dev/null | sed 's/^/      /' | head -n 6
+        if optimizer_iface_has_fq "$iface"; then
+            found_fq=1
+            echo -e "      ${RED}WARNING: fq present — harmful for WildPaqet raw tunnels${NC}"
+        fi
+    done < <(optimizer_detect_target_ifaces)
+
+    if [ "$found_fq" -eq 1 ]; then
+        echo -e "\n${RED}Action:${NC} run Safe/Auto Apply to migrate fq -> fq_codel"
+    fi
+
+    echo -e "\n${YELLOW}Persistence:${NC}"
+    if systemctl is-enabled "$NETOPT_QDISC_UNIT" >/dev/null 2>&1; then
+        echo -e "  • ${GREEN}✓${NC} $NETOPT_QDISC_UNIT enabled"
+    else
+        echo -e "  • ${YELLOW}○${NC} $NETOPT_QDISC_UNIT not enabled"
+    fi
+
+    echo -e "\n${YELLOW}Paqet service LimitNOFILE (sample):${NC}"
+    local svc
+    svc=$(systemctl list-unit-files --type=service --no-legend 2>/dev/null | awk '/^paqet-.*\.service/{print $1; exit}')
+    if [ -n "$svc" ]; then
+        systemctl show "$svc" -p LimitNOFILE --value 2>/dev/null | awk '{print "  • '$svc': "$0}'
+    else
+        echo -e "  • no paqet-*.service found"
+    fi
+
+    echo -e "\n${CYAN}Note:${NC} BBR paces kernel TCP (e.g. Xray), not paqet raw inject."
+    echo -e "The critical WildPaqet knob is egress qdisc != fq."
     pause
 }
 
-# ================================================
-# OPTIMIZATION FUNCTIONS
-# ================================================
-
-# Legacy BBR only installation
-install_bbr_legacy() {
-    clear
-    show_banner
-    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║ Install BBR Only (Legacy)                                 ║${NC}"
-    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
-    
-    echo -e "${YELLOW}This will install only BBR congestion control.${NC}"
-    echo -e "${YELLOW}For full optimization, use option 1 instead.${NC}\n"
-    
-    read -p "Do you want to install BBR only? (y/N): " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}BBR installation cancelled.${NC}"
-        pause
-        return
-    fi
-    
-    print_step "Downloading and installing BBR (legacy)..."
-    
-    if curl -fsSL https://github.com/teddysun/across/raw/master/bbr.sh -o /tmp/bbr.sh 2>/dev/null; then
-        chmod +x /tmp/bbr.sh
-        print_success "BBR installer downloaded"
-        
-        echo -e "\n${YELLOW}The BBR installer will now run.${NC}"
-        echo -e "${YELLOW}Follow the on-screen instructions.${NC}"
-        echo -e "\n${CYAN}Note: This may require a system reboot.${NC}\n"
-        
-        pause "Press Enter to continue with BBR installation..."
-        
-        /tmp/bbr.sh
-        
-        echo -e "\n${GREEN}✅ BBR installation completed!${NC}\n"
-        echo -e "${YELLOW}If the installer requested a reboot, please restart your server.${NC}"
-        
-        rm -f /tmp/bbr.sh
-    else
-        print_error "Failed to download BBR installer"
-        echo -e "\n${YELLOW}You can install BBR manually with:${NC}"
-        echo -e "${CYAN}curl -fsSL https://github.com/teddysun/across/raw/master/bbr.sh -o bbr.sh && chmod +x bbr.sh && ./bbr.sh${NC}"
-    fi
-    
-    pause
+# Compatibility wrappers kept for any external callers
+apply_qdisc_to_live_ifaces() {
+    optimizer_apply_qdisc_targets
 }
+
+# ================================================
+# OPTIMIZATION MENU (DNS / Mirror helpers retained)
+# ================================================
 
 # Install DNS Finder
 install_dns_finder() {
@@ -3696,7 +4074,6 @@ install_mirror_selector() {
 }
 
 # Optimization menu
-# Optimization menu
 optimize_server() {
     while true; do
         clear
@@ -3705,44 +4082,26 @@ optimize_server() {
         echo -e "${GREEN}║ Server Optimization Tools                                ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
         
-        echo -e "${CYAN}1.${NC} ${GREEN}Kernel Optimization (Recommended)${NC} - Full kernel tuning (BBR + buffers + limits)"
-        echo -e "${CYAN}2.${NC} ${PURPLE}DNS Finder${NC} - Find the best DNS servers for Iran"
-        echo -e "${CYAN}3.${NC} ${ORANGE}Mirror Selector${NC} - Find the fastest apt repository mirror"
-        echo -e "${CYAN}4.${NC} ${BLUE}BBR Only (Legacy)${NC} - Install only BBR congestion control"
+        echo -e "${CYAN}1.${NC} ${GREEN}Safe/Auto Network Optimizer${NC} - fq_codel + BBR + safe buffers (recommended)"
+        echo -e "${CYAN}2.${NC} ${CYAN}Diagnose / Status${NC} - desired vs runtime, live qdisc, fq warnings"
+        echo -e "${CYAN}3.${NC} ${YELLOW}Rollback to snapshot${NC} - restore pre-apply network state"
+        echo -e "${CYAN}4.${NC} ${ORANGE}Reset owned settings${NC} - remove WildPaqet drop-ins only"
+        echo -e "${CYAN}5.${NC} ${PURPLE}DNS Finder${NC} - Find the best DNS servers for Iran"
+        echo -e "${CYAN}6.${NC} ${ORANGE}Mirror Selector${NC} - Find the fastest apt repository mirror"
         echo -e "${CYAN}0.${NC} ↩️ Back to Main Menu"
         echo ""
+        echo -e "${YELLOW}Note:${NC} Legacy remote BBR installers were removed — they reintroduced fq."
+        echo ""
         
-        read -p "Select option [0-4]: " choice
+        read -p "Select option [0-6]: " choice
         
         case $choice in
-            1) 
-                while true; do
-                    clear
-                    show_banner
-                    echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
-                    echo -e "${GREEN}║ Kernel Optimization Menu                                 ║${NC}"
-                    echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}\n"
-                    
-                    echo -e " 1. Apply full kernel optimizations (BBR + buffers + limits)"
-                    echo -e " 2. Remove kernel optimizations (restore defaults)"
-                    echo -e " 3. View current kernel status"
-                    echo -e " 0. Back to optimization menu"
-                    echo ""
-                    
-                    read -p "Select option [0-3]: " kernel_choice
-                    
-                    case $kernel_choice in
-                        1) apply_kernel_optimizations ;;
-                        2) remove_kernel_optimizations ;;
-                        3) view_kernel_status ;;
-                        0) break ;;
-                        *) print_error "Invalid option"; sleep 1 ;;
-                    esac
-                done
-                ;;
-            2) install_dns_finder ;;
-            3) install_mirror_selector ;;
-            4) install_bbr_legacy ;;
+            1) apply_kernel_optimizations ;;
+            2) view_kernel_status ;;
+            3) remove_kernel_optimizations ;;
+            4) optimizer_reset_owned_settings ;;
+            5) install_dns_finder ;;
+            6) install_mirror_selector ;;
             0) return ;;
             *) print_error "Invalid option"; sleep 1 ;;
         esac
@@ -5234,13 +5593,23 @@ cleanup_wildpaqet_bot_silent() {
 }
 
 cleanup_kernel_optimizations_silent() {
+    # Prefer exact snapshot restore (same path as menu Rollback); avoid forcing cubic/pfifo.
+    if [ -d "$NETOPT_STATE_DIR" ]; then
+        local snap
+        snap=$(optimizer_latest_snapshot 2>/dev/null || true)
+        if [ -n "$snap" ] && [ -d "$snap" ]; then
+            optimizer_restore_snapshot "$snap" >/dev/null 2>&1 || true
+        fi
+    fi
     rm -f "$SYSCTL_FILE" 2>/dev/null || true
     rm -f "$LIMITS_FILE" 2>/dev/null || true
+    optimizer_remove_qdisc_persistence >/dev/null 2>&1 || true
     # IP forward file created by NAT helpers in this script
     rm -f /etc/sysctl.d/30-ip_forward.conf 2>/dev/null || true
+    rm -rf "$NETOPT_STATE_DIR" 2>/dev/null || true
     sysctl --system >/dev/null 2>&1 || true
-    # Best-effort restore of common defaults (may already be set by distro)
-    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
+    # Keep tunnel-safe egress qdisc if still on fq from an old/legacy optimizer
+    optimizer_apply_qdisc_targets >/dev/null 2>&1 || true
     sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || \
         sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
 }
@@ -5387,7 +5756,8 @@ uninstall_paqet() {
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
     echo -e "${YELLOW}Notes:${NC}"
     echo -e "  • Distro packages (curl, iptables-persistent, golang, libpcap-dev, …) were NOT removed"
-    echo -e "  • External BBR installs (e.g. teddysun) are left alone — undo separately if needed"
+    echo -e "  • Safe/Auto optimizer: owned drop-ins + snapshots removed; live fq remapped to fq_codel when possible"
+    echo -e "  • External third-party BBR installs (if any) are left alone — undo separately if needed"
     echo -e "  • Reboot recommended for a fully clean sysctl/limits session state"
     echo ""
     pause
