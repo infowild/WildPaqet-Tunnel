@@ -1,8 +1,8 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.5-v2
-# Branch: wild-paqet-v2 (real 3-way handshake + tracked SEQ/ACK + no DSCP mark)
+# Version: 8.6-v2
+# Branch: wild-paqet-v2 (real 3-way handshake + tracked SEQ/ACK + no DSCP mark + moving IP.id + FIN teardown)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.5-v2"
+readonly SCRIPT_VERSION="8.6-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -692,13 +692,106 @@ configure_iptables() {
         iptables -t raw -A OUTPUT -p "$proto" --sport "$port" -j NOTRACK
         
         if [ "$proto" = "tcp" ]; then
+            # Drop kernel RSTs on BOTH directions: the local kernel has no socket
+            # for our raw flow, so it would answer inbound segments with a RST and
+            # also emit outbound RSTs — either one tears the tunnel down.
             iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
             iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+            iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+            iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
         fi
     done
     
     print_success "iptables configured for $protocol on port $port"
     save_iptables
+}
+
+# Apply Anti-RST + NOTRACK for a client's remote peer (server ip:port). This is
+# the tunnel leg the client dials out on; without it the local kernel RSTs the
+# raw flow and conntrack burns memory. Idempotent (checks before adding).
+protect_client_peer() {
+    local sip="$1"
+    local sport="$2"
+
+    command -v iptables &>/dev/null || return 0
+    validate_ip "$sip" 2>/dev/null || return 0
+    validate_port "$sport" 2>/dev/null || return 0
+
+    iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
+    iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
+    iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
+    iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP
+}
+
+# Protect a client's primary server.addr plus every server.addrs[] failover
+# entry found in a config file.
+configure_client_iptables() {
+    local config="$1"
+
+    if ! command -v iptables &>/dev/null; then
+        print_warning "iptables not found, skipping client tunnel protection"
+        return 0
+    fi
+
+    local applied=0
+    local addr sip sport
+    while IFS= read -r addr; do
+        [ -z "$addr" ] && continue
+        sip="${addr%:*}"
+        sport="${addr##*:}"
+        if validate_ip "$sip" 2>/dev/null && validate_port "$sport" 2>/dev/null; then
+            protect_client_peer "$sip" "$sport"
+            ((applied++))
+        fi
+    done < <(extract_client_server_addrs "$config")
+
+    if [ "$applied" -gt 0 ]; then
+        print_success "Client tunnel protection applied to $applied peer(s)"
+        save_iptables
+    fi
+}
+
+# Print every server address (primary addr + addrs[] list) from a client config,
+# one ip:port per line.
+extract_client_server_addrs() {
+    local config="$1"
+    [ -f "$config" ] || return 0
+    awk '
+        /^server:/ { in_server=1; next }
+        /^[^[:space:]]/ { if (in_server) in_server=0 }
+        in_server {
+            if ($1 == "addr:") { v=$2; gsub(/"/,"",v); print v }
+            else if ($1 == "-") { v=$2; gsub(/"/,"",v); print v }
+        }
+    ' "$config"
+}
+
+# Install a binary onto a possibly-running path without hitting ETXTBSY.
+# Writing directly to a file that is currently executing fails with
+# "Text file busy"; renaming a sibling temp file swaps the directory entry
+# atomically and leaves the running inode untouched.
+atomic_install_binary() {
+    local src="$1"
+    local dest="${2:-$BIN_DIR/paqet}"
+    local dir
+    dir="$(dirname "$dest")"
+    mkdir -p "$dir"
+
+    local tmp="${dir}/.paqet.new.$$"
+    if ! cp -f "$src" "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    chmod 0755 "$tmp" 2>/dev/null || true
+    if ! mv -f "$tmp" "$dest" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 # Create systemd service
@@ -2094,6 +2187,10 @@ configure_client() {
         
         echo -e "[+] Configuration saved : ${CYAN}$CONFIG_DIR/${config_name}.yaml${NC}"
         
+        # Protect the outbound tunnel leg(s) before the service starts, so the
+        # first handshake is not RST'd by the local kernel.
+        configure_client_iptables "$CONFIG_DIR/${config_name}.yaml"
+        
         create_systemd_service "$config_name"
         local svc="paqet-${config_name}"
         systemctl enable "$svc" --now >/dev/null 2>&1
@@ -2789,7 +2886,11 @@ build_wildpaqet_core_from_source() {
     if [ -f "$BIN_DIR/paqet" ]; then
         cp -f "$BIN_DIR/paqet" "$BIN_DIR/paqet.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
     fi
-    install -m 0755 "$build_out" "$BIN_DIR/paqet"
+    if ! atomic_install_binary "$build_out" "$BIN_DIR/paqet"; then
+        print_error "Failed to install binary to $BIN_DIR/paqet"
+        pause
+        return 1
+    fi
     ln -sf "$BIN_DIR/paqet" "$INSTALL_DIR/paqet" 2>/dev/null || true
 
     print_success "WildPaqet Core v2 installed to $BIN_DIR/paqet"
@@ -3084,8 +3185,13 @@ install_paqet() {
             previous_binary="${BIN_DIR}/paqet.bak-$(date +%Y%m%d-%H%M%S)"
             cp "$BIN_DIR/paqet" "$previous_binary" 2>/dev/null || true
         fi
-        cp "$binary_file" "$BIN_DIR/paqet"
-        chmod +x "$BIN_DIR/paqet"
+        if ! atomic_install_binary "$binary_file" "$BIN_DIR/paqet"; then
+            print_error "Failed to install binary to $BIN_DIR/paqet (is a paqet process wedged?)"
+            print_info "Stop the services (menu → service management) and re-run the install."
+            rm -f "/tmp/paqet.tar.gz"
+            pause
+            return 1
+        fi
         
         print_success "Paqet installed to $BIN_DIR/paqet"
         
@@ -4567,45 +4673,39 @@ apply_connection_protection() {
             fi
             
         elif [ "$role" = "client" ]; then
-            # Client: extract server addr
-            local server=$(grep -A2 "server:" "$config" | grep "addr:" | \
-                           awk '{print $2}' | tr -d '"' | head -1)
-            
-            if [[ -z "$server" || ! "$server" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+            # Client: protect the primary server.addr AND every server.addrs[]
+            # failover peer, so switching to a backup does not lose protection.
+            local peers=()
+            local addr sip sport
+            while IFS= read -r addr; do
+                [ -z "$addr" ] && continue
+                sip="${addr%:*}"
+                sport="${addr##*:}"
+                validate_ip "$sip" 2>/dev/null && validate_port "$sport" 2>/dev/null && peers+=("$sip:$sport")
+            done < <(extract_client_server_addrs "$config")
+
+            if [ ${#peers[@]} -eq 0 ]; then
                 echo -e "${YELLOW}⚠ Invalid or missing server address${NC}"
                 continue
             fi
-            
-            local sip=$(echo "$server" | cut -d: -f1)
-            local sport=$(echo "$server" | cut -d: -f2)
-            
-            if ! validate_ip "$sip" || ! validate_port "$sport"; then
-                echo -e "${YELLOW}⚠ Invalid server address: $server${NC}"
-                continue
-            fi
-            
-            # Apply client-side protection
+
             local added=0
-            
-            iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || {
-                iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
-                ((added++))
-            }
-            iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || {
-                iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
-                ((added++))
-            }
-            iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
-                ((added++))
-            }
-            iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP
-                ((added++))
-            }
-            
+            local peer
+            for peer in "${peers[@]}"; do
+                sip="${peer%:*}"
+                sport="${peer##*:}"
+                iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || {
+                    iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK; ((added++)); }
+                iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || {
+                    iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK; ((added++)); }
+                iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                    iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP; ((added++)); }
+                iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
+                    iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP; ((added++)); }
+            done
+
             if [ $added -gt 0 ]; then
-                echo -e "${GREEN}✓ Protected (server $sip:$sport, $added new rules)${NC}"
+                echo -e "${GREEN}✓ Protected (${#peers[@]} peer(s), $added new rules)${NC}"
                 ((rules_added += added))
                 ((client_protected++))
             else

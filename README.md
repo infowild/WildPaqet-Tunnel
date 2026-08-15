@@ -149,7 +149,7 @@ wildpaqet
 
 ---
 
-## Wire hardening (8.5-v2)
+## Wire hardening (8.6-v2)
 
 The tunnel leg between Iran and Kharej used to be easy to single out on the wire. Preset `default` now makes it behave like an ordinary TCP connection:
 
@@ -157,7 +157,10 @@ The tunnel leg between Iran and Kharej used to be easy to single out on the wire
 |--------|-----|
 | A lone SYN with no answer, then data — worse than no handshake at all | Real three-way handshake: the server replies `SYN-ACK`, the client completes with `ACK` |
 | SEQ/ACK were pseudo-random and unrelated to the bytes sent | SEQ counts bytes sent, ACK follows bytes received, timestamps echo the peer |
+| A random ACK / fabricated timestamp echo was sent before the peer was ever seen | No ACK or `TSecr` is advertised until the peer's sequence space is actually observed |
 | Every packet marked DSCP 46 (`TOS 184`), the expedited-forwarding class used by VoIP | No DSCP mark (`TOS 0`), like normal traffic |
+| `IP.id` fixed at 0 on every DF packet — a bulk-tunnel giveaway | Moving `IP.id` (IPv4) / flow label (IPv6), like a real stack |
+| Flows just went silent mid-stream | Best-effort `FIN,ACK` teardown on close |
 
 Update **both ends** — the handshake only completes when Iran and Kharej run this build. A new client against an old server still connects; it just logs that no `SYN-ACK` arrived.
 
@@ -209,7 +212,7 @@ Does **not** remove distro packages (curl, iptables-persistent, golang, …). Ex
 
 ### Safe/Auto Network Optimizer (menu 7)
 
-WildPaqet **8.5-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian and RHEL-family hosts:
+WildPaqet **8.6-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian and RHEL-family hosts:
 
 - Uses **`fq_codel`** only — never `fq` (which caps each kernel flow at ~100 packets and collapses raw-packet Paqet tunnels under load).
 - Preserves **`mq`** multi-queue roots; only retargets `fq` leaves under `mq`, or replaces a single-queue `fq` root.

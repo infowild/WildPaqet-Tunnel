@@ -35,6 +35,8 @@ type tcpF struct {
 type flowState struct {
 	seq, ack, isn uint32
 	peerTS        uint32
+	dstIP         net.IP
+	dstPort       uint16
 	inited        bool
 	rcvInit       bool
 	peerTSSet     bool
@@ -64,6 +66,7 @@ type SendHandle struct {
 	srcPort     uint16
 	time        uint32
 	tsCounter   atomic.Uint32
+	ipID        atomic.Uint32
 	tcpF        tcpF
 	ePool       sync.Pool
 
@@ -113,6 +116,7 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 			},
 		},
 	}
+	sh.ipID.Store(rand.Uint32())
 	if cfg.IPv4.Addr != nil {
 		sh.srcIPv4 = cfg.IPv4.Addr.IP
 		sh.srcIPv4RHWA = cfg.IPv4.Router
@@ -125,10 +129,13 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 }
 
 func (h *SendHandle) buildIPv4Header(e *encoder, dstIP net.IP) {
+	// A fixed IP.id of 0 on every DF packet is a bulk-tunnel signature; real
+	// Linux stacks emit a moving value. Start random per handle, then increment.
 	e.ip4 = layers.IPv4{
 		Version:  4,
 		IHL:      5,
 		TOS:      h.tos,
+		Id:       uint16(h.ipID.Add(1)),
 		TTL:      h.ttl,
 		Flags:    layers.IPv4DontFragment,
 		Protocol: layers.IPProtocolTCP,
@@ -141,6 +148,7 @@ func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
 	e.ip6 = layers.IPv6{
 		Version:      6,
 		TrafficClass: h.tos,
+		FlowLabel:    h.ipID.Add(1) & 0xFFFFF,
 		HopLimit:     h.ttl,
 		NextHeader:   layers.IPProtocolTCP,
 		SrcIP:        h.srcIPv6,
@@ -161,6 +169,9 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f 
 
 	var tsEcr uint32
 	if h.trackSeq {
+		// In tracked mode tsEcr is the peer's real TSval, or 0 until we have
+		// heard from the peer — a real stack does not echo a timestamp it
+		// never received, so we do not fabricate one here.
 		tsEcr = h.applyTrackedSeq(e, dstIP, dstPort, f, payloadLen)
 	} else if f.SYN {
 		e.tcp.Seq = 1 + (counter & 0x7)
@@ -168,12 +179,11 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f 
 		if f.ACK {
 			e.tcp.Ack = e.tcp.Seq + 1
 		}
+		tsEcr = tsVal - (counter%200 + 50)
 	} else {
 		seq := h.time + (counter << 7)
 		e.tcp.Seq = seq
 		e.tcp.Ack = seq - (counter & 0x3FF) + 1400
-	}
-	if tsEcr == 0 {
 		tsEcr = tsVal - (counter%200 + 50)
 	}
 
@@ -210,6 +220,10 @@ func (h *SendHandle) applyTrackedSeq(e *encoder, dstIP net.IP, dstPort uint16, f
 	defer h.flowMu.Unlock()
 
 	flow := h.flow(flowKey(dstIP, dstPort))
+	if flow.dstIP == nil {
+		flow.dstIP = append(net.IP(nil), dstIP...)
+		flow.dstPort = dstPort
+	}
 
 	if f.SYN {
 		// A SYN or SYN-ACK carries no data but consumes one sequence number.
@@ -250,9 +264,11 @@ func (h *SendHandle) flow(key uint64) *flowState {
 	if !flow.inited {
 		flow.isn = h.newISN()
 		flow.seq = flow.isn
-		// Plausible placeholder until the peer's real sequence space is seen,
-		// so we never advertise ACK 0 on a data segment.
-		flow.ack = h.newISN()
+		// Leave ack at 0 until the peer's sequence space is actually seen; a
+		// random placeholder would advertise an ACK that matches no peer byte,
+		// which stateful DPI can flag. In the normal (both-hardened) path the
+		// SYN-ACK is processed before any data, so ack is set before it matters.
+		flow.ack = 0
 		flow.inited = true
 	}
 	return flow
@@ -277,6 +293,10 @@ func (h *SendHandle) noteRecv(pkt *Packet) {
 	defer h.flowMu.Unlock()
 
 	flow := h.flow(flowKey(pkt.Addr.IP, uint16(pkt.Addr.Port)))
+	if flow.dstIP == nil {
+		flow.dstIP = append(net.IP(nil), pkt.Addr.IP...)
+		flow.dstPort = uint16(pkt.Addr.Port)
+	}
 
 	next := pkt.Seq + uint32(len(pkt.Payload))
 	if pkt.SYN || pkt.FIN {
@@ -299,16 +319,23 @@ func (h *SendHandle) noteRecv(pkt *Packet) {
 
 // syncSynAck records the peer's ISN from a SYN-ACK and moves our own sequence
 // past the SYN we already sent, so the first data segment continues the flow.
-func (h *SendHandle) syncSynAck(pkt *Packet) {
+// It returns false when the segment does not acknowledge the SYN we sent, so a
+// spoofed or stale SYN-ACK cannot desync the flow.
+func (h *SendHandle) syncSynAck(pkt *Packet) bool {
 	if !h.trackSeq {
-		return
+		return true
 	}
 	h.flowMu.Lock()
 	flow := h.flow(flowKey(pkt.Addr.IP, uint16(pkt.Addr.Port)))
+	if pkt.Ack != flow.isn+1 {
+		h.flowMu.Unlock()
+		return false
+	}
 	flow.seq = flow.isn + 1
 	h.flowMu.Unlock()
 
 	h.noteRecv(pkt)
+	return true
 }
 
 func (h *SendHandle) deleteFlow(ip net.IP, port uint16) {
@@ -368,7 +395,7 @@ func (h *SendHandle) write(payload []byte, addr *net.UDPAddr, f conf.TCPF) error
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
 	h.tcpF.mu.RLock()
 	defer h.tcpF.mu.RUnlock()
-	if ff := h.tcpF.clientTCPF[hash.IPAddr(dstIP, dstPort)]; ff != nil {
+	if ff := h.tcpF.clientTCPF[flowKey(dstIP, dstPort)]; ff != nil {
 		return ff.Next()
 	}
 	return h.tcpF.tcpF.Next()
@@ -380,7 +407,7 @@ func (h *SendHandle) setClientTCPF(addr net.Addr, f []conf.TCPF) {
 		return
 	}
 	h.tcpF.mu.Lock()
-	h.tcpF.clientTCPF[hash.IPAddr(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
+	h.tcpF.clientTCPF[flowKey(a.IP, uint16(a.Port))] = &iterator.Iterator[conf.TCPF]{Items: f}
 	h.tcpF.mu.Unlock()
 }
 
@@ -390,13 +417,39 @@ func (h *SendHandle) deleteClientTCPF(addr net.Addr) {
 		return
 	}
 	h.tcpF.mu.Lock()
-	delete(h.tcpF.clientTCPF, hash.IPAddr(a.IP, uint16(a.Port)))
+	delete(h.tcpF.clientTCPF, flowKey(a.IP, uint16(a.Port)))
 	h.tcpF.mu.Unlock()
 
 	h.deleteFlow(a.IP, uint16(a.Port))
 }
 
+// teardown sends a best-effort FIN,ACK to every peer we actually exchanged data
+// with, so flows end the way a real TCP connection does instead of going silent
+// mid-stream — a lingering half-open flow is a cheap signature for a tunnel.
+func (h *SendHandle) teardown() {
+	if !h.trackSeq {
+		return
+	}
+	type peer struct {
+		ip   net.IP
+		port uint16
+	}
+	var peers []peer
+	h.flowMu.Lock()
+	for _, f := range h.flows {
+		if f.rcvInit && f.dstIP != nil {
+			peers = append(peers, peer{ip: f.dstIP, port: f.dstPort})
+		}
+	}
+	h.flowMu.Unlock()
+
+	for _, p := range peers {
+		_ = h.WriteControl(&net.UDPAddr{IP: p.ip, Port: int(p.port)}, conf.TCPF{FIN: true, ACK: true})
+	}
+}
+
 func (h *SendHandle) Close() {
+	h.teardown()
 	if h.handle != nil {
 		h.handle.Close()
 	}

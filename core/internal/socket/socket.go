@@ -180,7 +180,11 @@ func (c *PacketConn) MimicHandshake(addr *net.UDPAddr) error {
 			continue
 		}
 
-		c.sendHandle.syncSynAck(&pkt)
+		// Ignore a SYN-ACK that does not acknowledge the SYN we just sent; it is
+		// either stale or spoofed and must not resynchronise the flow.
+		if !c.sendHandle.syncSynAck(&pkt) {
+			continue
+		}
 		return c.sendHandle.WriteControl(addr, conf.TCPF{ACK: true})
 	}
 
