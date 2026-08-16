@@ -79,10 +79,10 @@ func (k *KCP) setDefaults(role string) {
 	}
 
 	if k.Smuxkalive_ == 0 {
-		k.Smuxkalive_ = 2
+		k.Smuxkalive_ = 15
 	}
 	if k.Smuxktimeout_ == 0 {
-		k.Smuxktimeout_ = 8
+		k.Smuxktimeout_ = 60
 	}
 }
 

@@ -24,6 +24,26 @@ import (
 // strand our ACK in the far future.
 const maxAckAdvance = 1 << 24
 
+const (
+	retransmitTick = 50 * time.Millisecond
+	initialRTO     = 200 * time.Millisecond
+	maxRTO         = 3 * time.Second
+	maxRetransmits = 5
+	maxOutstanding = 2048
+)
+
+type txSegment struct {
+	payload []byte
+	seq     uint32
+	last    time.Time
+	retries int
+}
+
+type seqRange struct {
+	start uint32
+	end   uint32
+}
+
 type tcpF struct {
 	tcpF       iterator.Iterator[conf.TCPF]
 	clientTCPF map[uint64]*iterator.Iterator[conf.TCPF]
@@ -40,6 +60,10 @@ type flowState struct {
 	inited        bool
 	rcvInit       bool
 	peerTSSet     bool
+	peerAck       uint32
+	peerAckSet    bool
+	tx            map[uint32]*txSegment
+	received      []seqRange
 }
 
 type encoder struct {
@@ -66,6 +90,8 @@ type SendHandle struct {
 	srcPort     uint16
 	time        uint32
 	tsCounter   atomic.Uint32
+	tsStarted   time.Time
+	now         func() time.Time
 	ipID        atomic.Uint32
 	tcpF        tcpF
 	ePool       sync.Pool
@@ -76,6 +102,9 @@ type SendHandle struct {
 	trackSeq bool
 	flows    map[uint64]*flowState
 	flowMu   sync.Mutex
+	stop     chan struct{}
+	done     chan struct{}
+	close    sync.Once
 }
 
 func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
@@ -95,16 +124,21 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		return nil, fmt.Errorf("failed to set BPF filter: %w", err)
 	}
 
+	now := time.Now()
 	sh := &SendHandle{
-		handle:   handle,
-		srcPort:  uint16(cfg.Port),
-		tcpF:     tcpF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
-		time:     uint32(time.Now().UnixNano() / int64(time.Millisecond)),
-		tos:      cfg.TCP.TOS,
-		ttl:      cfg.TCP.TTL,
-		window:   cfg.TCP.Window,
-		trackSeq: cfg.TCP.TrackSeq,
-		flows:    make(map[uint64]*flowState),
+		handle:    handle,
+		srcPort:   uint16(cfg.Port),
+		tcpF:      tcpF{tcpF: iterator.Iterator[conf.TCPF]{Items: cfg.TCP.LF}, clientTCPF: make(map[uint64]*iterator.Iterator[conf.TCPF])},
+		time:      uint32(now.UnixMilli()),
+		tsStarted: now,
+		now:       time.Now,
+		tos:       cfg.TCP.TOS,
+		ttl:       cfg.TCP.TTL,
+		window:    cfg.TCP.Window,
+		trackSeq:  cfg.TCP.TrackSeq,
+		flows:     make(map[uint64]*flowState),
+		stop:      make(chan struct{}),
+		done:      make(chan struct{}),
 		ePool: sync.Pool{
 			New: func() any {
 				return &encoder{
@@ -125,6 +159,7 @@ func NewSendHandle(cfg *conf.Network) (*SendHandle, error) {
 		sh.srcIPv6 = cfg.IPv6.Addr.IP
 		sh.srcIPv6RHWA = cfg.IPv6.Router
 	}
+	go sh.retransmitLoop()
 	return sh, nil
 }
 
@@ -156,7 +191,11 @@ func (h *SendHandle) buildIPv6Header(e *encoder, dstIP net.IP) {
 	}
 }
 
-func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f conf.TCPF, payloadLen int) {
+func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f conf.TCPF, payload []byte) {
+	h.buildTCPHeaderAtSeq(e, dstIP, dstPort, f, payload, nil)
+}
+
+func (h *SendHandle) buildTCPHeaderAtSeq(e *encoder, dstIP net.IP, dstPort uint16, f conf.TCPF, payload []byte, seqOverride *uint32) {
 	e.tcp = layers.TCP{
 		SrcPort: layers.TCPPort(h.srcPort),
 		DstPort: layers.TCPPort(dstPort),
@@ -165,14 +204,14 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f 
 	}
 
 	counter := h.tsCounter.Add(1)
-	tsVal := h.time + (counter >> 3)
+	tsVal := h.timestamp()
 
 	var tsEcr uint32
 	if h.trackSeq {
 		// In tracked mode tsEcr is the peer's real TSval, or 0 until we have
 		// heard from the peer — a real stack does not echo a timestamp it
 		// never received, so we do not fabricate one here.
-		tsEcr = h.applyTrackedSeq(e, dstIP, dstPort, f, payloadLen)
+		tsEcr = h.applyTrackedSeq(e, dstIP, dstPort, f, payload, seqOverride)
 	} else if f.SYN {
 		e.tcp.Seq = 1 + (counter & 0x7)
 		e.tcp.Ack = 0
@@ -213,9 +252,22 @@ func (h *SendHandle) buildTCPHeader(e *encoder, dstIP net.IP, dstPort uint16, f 
 	e.tcp.Options = opts
 }
 
+// timestamp advances with elapsed monotonic time rather than packet count. It
+// therefore continues to reflect idle periods and cannot speed up with bursts.
+func (h *SendHandle) timestamp() uint32 {
+	if h.now == nil || h.tsStarted.IsZero() {
+		return h.time
+	}
+	elapsed := h.now().Sub(h.tsStarted)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	return h.time + uint32(elapsed/time.Millisecond)
+}
+
 // applyTrackedSeq stamps a coherent SEQ/ACK pair on the segment and returns the
 // timestamp value to echo, or 0 when the peer has not advertised one yet.
-func (h *SendHandle) applyTrackedSeq(e *encoder, dstIP net.IP, dstPort uint16, f conf.TCPF, payloadLen int) uint32 {
+func (h *SendHandle) applyTrackedSeq(e *encoder, dstIP net.IP, dstPort uint16, f conf.TCPF, payload []byte, seqOverride *uint32) uint32 {
 	h.flowMu.Lock()
 	defer h.flowMu.Unlock()
 
@@ -236,7 +288,11 @@ func (h *SendHandle) applyTrackedSeq(e *encoder, dstIP net.IP, dstPort uint16, f
 	} else {
 		e.tcp.Seq = flow.seq
 		e.tcp.Ack = flow.ack
-		flow.seq += uint32(payloadLen)
+		if seqOverride != nil {
+			e.tcp.Seq = *seqOverride
+		} else {
+			flow.seq += uint32(len(payload))
+		}
 	}
 
 	if flow.peerTSSet {
@@ -302,19 +358,73 @@ func (h *SendHandle) noteRecv(pkt *Packet) {
 	if pkt.SYN || pkt.FIN {
 		next++
 	}
-	if !flow.rcvInit {
-		flow.ack = next
-		flow.rcvInit = true
-	} else if d := int32(next - flow.ack); d > 0 && d < maxAckAdvance {
-		// Retransmits and reordering must not rewind the ACK we advertise, and
-		// an injected segment must not drag it far past the real data either.
-		flow.ack = next
+	h.noteReceived(flow, pkt.Seq, next)
+	if pkt.ACK && seqLessOrEqual(pkt.Ack, flow.seq) {
+		if !flow.peerAckSet || seqLessOrEqual(flow.peerAck, pkt.Ack) {
+			flow.peerAck = pkt.Ack
+			flow.peerAckSet = true
+		}
+		for seq, segment := range flow.tx {
+			end := seq + uint32(len(segment.payload))
+			if seqLessOrEqual(end, pkt.Ack) {
+				delete(flow.tx, seq)
+			}
+		}
 	}
 
 	if pkt.TSOK {
 		flow.peerTS = pkt.TSVal
 		flow.peerTSSet = true
 	}
+}
+
+// noteReceived maintains a cumulative TCP ACK. Out-of-order data is retained
+// as a bounded range but cannot acknowledge across a gap.
+func (h *SendHandle) noteReceived(flow *flowState, start, end uint32) {
+	if !flow.rcvInit {
+		flow.ack = end
+		flow.rcvInit = true
+		return
+	}
+	if seqLessOrEqual(end, flow.ack) {
+		return
+	}
+	if seqLessOrEqual(start, flow.ack) {
+		flow.ack = end
+		h.consumeReceivedRanges(flow)
+		return
+	}
+	if d := int32(start - flow.ack); d <= 0 || d >= maxAckAdvance || len(flow.received) >= 128 {
+		return
+	}
+	flow.received = append(flow.received, seqRange{start: start, end: end})
+}
+
+func (h *SendHandle) consumeReceivedRanges(flow *flowState) {
+	for {
+		advanced := false
+		for i := 0; i < len(flow.received); {
+			r := flow.received[i]
+			if seqLessOrEqual(r.end, flow.ack) {
+				flow.received = append(flow.received[:i], flow.received[i+1:]...)
+				continue
+			}
+			if seqLessOrEqual(r.start, flow.ack) {
+				flow.ack = r.end
+				flow.received = append(flow.received[:i], flow.received[i+1:]...)
+				advanced = true
+				continue
+			}
+			i++
+		}
+		if !advanced {
+			return
+		}
+	}
+}
+
+func seqLessOrEqual(a, b uint32) bool {
+	return int32(a-b) <= 0
 }
 
 // syncSynAck records the peer's ISN from a SYN-ACK and moves our own sequence
@@ -354,6 +464,10 @@ func (h *SendHandle) WriteControl(addr *net.UDPAddr, f conf.TCPF) error {
 }
 
 func (h *SendHandle) write(payload []byte, addr *net.UDPAddr, f conf.TCPF) error {
+	return h.writeAtSeq(payload, addr, f, nil, true)
+}
+
+func (h *SendHandle) writeAtSeq(payload []byte, addr *net.UDPAddr, f conf.TCPF, seqOverride *uint32, remember bool) error {
 	e := h.ePool.Get().(*encoder)
 	defer func() {
 		e.buf.Clear()
@@ -363,7 +477,7 @@ func (h *SendHandle) write(payload []byte, addr *net.UDPAddr, f conf.TCPF) error
 	dstIP := addr.IP
 	dstPort := uint16(addr.Port)
 
-	h.buildTCPHeader(e, dstIP, dstPort, f, len(payload))
+	h.buildTCPHeaderAtSeq(e, dstIP, dstPort, f, payload, seqOverride)
 
 	var ipLayer gopacket.SerializableLayer
 	if dstIP.To4() != nil {
@@ -389,7 +503,96 @@ func (h *SendHandle) write(payload []byte, addr *net.UDPAddr, f conf.TCPF) error
 	h.writeMu.Lock()
 	err := h.handle.WritePacketData(e.buf.Bytes())
 	h.writeMu.Unlock()
+	if err == nil && remember && h.trackSeq && len(payload) != 0 {
+		h.rememberSent(dstIP, dstPort, e.tcp.Seq, payload)
+	}
 	return err
+}
+
+func (h *SendHandle) rememberSent(dstIP net.IP, dstPort uint16, seq uint32, payload []byte) {
+	h.flowMu.Lock()
+	defer h.flowMu.Unlock()
+	flow := h.flow(flowKey(dstIP, dstPort))
+	if flow.tx == nil {
+		flow.tx = make(map[uint32]*txSegment)
+	}
+	if flow.peerAckSet && seqLessOrEqual(seq+uint32(len(payload)), flow.peerAck) {
+		return
+	}
+	if len(flow.tx) >= maxOutstanding {
+		var oldestSeq uint32
+		var oldest time.Time
+		for candidate, segment := range flow.tx {
+			if oldest.IsZero() || segment.last.Before(oldest) {
+				oldestSeq, oldest = candidate, segment.last
+			}
+		}
+		delete(flow.tx, oldestSeq)
+	}
+	flow.tx[seq] = &txSegment{payload: append([]byte(nil), payload...), seq: seq, last: h.clockNow()}
+}
+
+func (h *SendHandle) clockNow() time.Time {
+	if h.now != nil {
+		return h.now()
+	}
+	return time.Now()
+}
+
+func retransmitTimeout(retries int) time.Duration {
+	rto := initialRTO << retries
+	if rto > maxRTO {
+		return maxRTO
+	}
+	return rto
+}
+
+type retransmission struct {
+	addr    net.UDPAddr
+	payload []byte
+	seq     uint32
+}
+
+func (h *SendHandle) dueRetransmissions(now time.Time) []retransmission {
+	h.flowMu.Lock()
+	defer h.flowMu.Unlock()
+	var due []retransmission
+	for _, flow := range h.flows {
+		for seq, segment := range flow.tx {
+			if segment.retries >= maxRetransmits {
+				delete(flow.tx, seq)
+				continue
+			}
+			if now.Sub(segment.last) < retransmitTimeout(segment.retries) {
+				continue
+			}
+			segment.last = now
+			segment.retries++
+			due = append(due, retransmission{
+				addr:    net.UDPAddr{IP: append(net.IP(nil), flow.dstIP...), Port: int(flow.dstPort)},
+				payload: append([]byte(nil), segment.payload...),
+				seq:     segment.seq,
+			})
+		}
+	}
+	return due
+}
+
+func (h *SendHandle) retransmitLoop() {
+	defer close(h.done)
+	ticker := time.NewTicker(retransmitTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stop:
+			return
+		case now := <-ticker.C:
+			for _, segment := range h.dueRetransmissions(now) {
+				seq := segment.seq
+				_ = h.writeAtSeq(segment.payload, &segment.addr, conf.TCPF{PSH: true, ACK: true}, &seq, false)
+			}
+		}
+	}
 }
 
 func (h *SendHandle) getClientTCPF(dstIP net.IP, dstPort uint16) conf.TCPF {
@@ -449,8 +652,14 @@ func (h *SendHandle) teardown() {
 }
 
 func (h *SendHandle) Close() {
-	h.teardown()
-	if h.handle != nil {
-		h.handle.Close()
-	}
+	h.close.Do(func() {
+		if h.stop != nil {
+			close(h.stop)
+			<-h.done
+		}
+		h.teardown()
+		if h.handle != nil {
+			h.handle.Close()
+		}
+	})
 }

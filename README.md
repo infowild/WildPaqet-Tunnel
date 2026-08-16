@@ -140,8 +140,8 @@ wildpaqet
 
 | Setting | Server | Client |
 |--------|--------|--------|
-| KCP mode | `fast` | `fast` |
-| Connections | `4` | `1` |
+| KCP mode | `normal` | `normal` |
+| Connections | `1` | `1` |
 | MTU | `1350` | `1350` |
 | TCP preset | `default` | `default` |
 | Encryption | `aes-128-gcm` | `aes-128-gcm` |
@@ -149,20 +149,22 @@ wildpaqet
 
 ---
 
-## Wire hardening (8.6-v2)
+## Wire hardening (8.7-v2)
 
 The tunnel leg between Iran and Kharej used to be easy to single out on the wire. Preset `default` now makes it behave like an ordinary TCP connection:
 
 | Before | Now |
 |--------|-----|
-| A lone SYN with no answer, then data — worse than no handshake at all | Real three-way handshake: the server replies `SYN-ACK`, the client completes with `ACK` |
+| A lone SYN with no answer, then data — worse than no handshake at all | Fail-closed three-way handshake: SYN retries use backoff and no tunnel data is sent without a valid `SYN-ACK` |
 | SEQ/ACK were pseudo-random and unrelated to the bytes sent | SEQ counts bytes sent, ACK follows bytes received, timestamps echo the peer |
 | A random ACK / fabricated timestamp echo was sent before the peer was ever seen | No ACK or `TSecr` is advertised until the peer's sequence space is actually observed |
 | Every packet marked DSCP 46 (`TOS 184`), the expedited-forwarding class used by VoIP | No DSCP mark (`TOS 0`), like normal traffic |
 | `IP.id` fixed at 0 on every DF packet — a bulk-tunnel giveaway | Moving `IP.id` (IPv4) / flow label (IPv6), like a real stack |
 | Flows just went silent mid-stream | Best-effort `FIN,ACK` teardown on close |
+| Packet-count timestamps and no outer loss recovery | Monotonic timestamps plus cumulative ACK and bounded outer TCP retransmission with the original SEQ |
+| Tight reconnect loops and a fixed two-second keepalive | Exponential retry jitter and conservative `15s/60s` SMUX keepalive/timeout |
 
-Update **both ends** — the handshake only completes when Iran and Kharej run this build. A new client against an old server still connects; it just logs that no `SYN-ACK` arrived.
+Update **both ends** — the handshake and outer ACK/retransmission behaviour require Iran and Kharej to run the same build. A missing or invalid `SYN-ACK` now fails closed instead of sending data on an unestablished flow.
 
 Set `network.tcp.preset: "legacy"` on both sides to restore the old wire behaviour if you need to compare.
 

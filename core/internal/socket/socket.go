@@ -15,9 +15,7 @@ import (
 	"paqet/internal/flog"
 )
 
-// How long a dial waits for the peer's SYN-ACK before giving up on the
-// handshake and starting to send data anyway.
-const synAckTimeout = 2 * time.Second
+var synRetryDelays = [...]time.Duration{time.Second, 2 * time.Second, 4 * time.Second}
 
 type PacketConn struct {
 	cfg           *conf.Network
@@ -83,8 +81,14 @@ func (c *PacketConn) ReadFrom(data []byte) (n int, addr net.Addr, err error) {
 		if len(pkt.Payload) == 0 {
 			continue
 		}
+		peer := &net.UDPAddr{IP: pkt.Addr.IP, Port: pkt.Addr.Port}
+		if c.mimic() {
+			if err := c.sendHandle.WriteControl(peer, conf.TCPF{ACK: true}); err != nil {
+				flog.Debugf("socket: failed to ACK data from %s: %v", peer, err)
+			}
+		}
 
-		return copy(data, pkt.Payload), &net.UDPAddr{IP: pkt.Addr.IP, Port: pkt.Addr.Port}, nil
+		return copy(data, pkt.Payload), peer, nil
 	}
 }
 
@@ -158,36 +162,48 @@ func (c *PacketConn) mimic() bool {
 }
 
 // MimicHandshake performs the client half of a three-way handshake before any
-// tunnel data is sent, so the flow starts the way an ordinary TCP connection
-// does. A server that never answers (older build, or handshake disabled) is not
-// treated as fatal: the dial continues with a consistent sequence space.
+// tunnel data is sent. Every SYN retransmission uses the original sequence
+// number and failure is closed: tunnel data is never emitted on a flow that did
+// not receive a valid SYN-ACK.
 func (c *PacketConn) MimicHandshake(addr *net.UDPAddr) error {
-	if err := c.sendHandle.WriteControl(addr, conf.TCPF{SYN: true}); err != nil {
-		return err
+	err := runMimicHandshake(
+		addr,
+		synRetryDelays[:],
+		func(f conf.TCPF) error { return c.sendHandle.WriteControl(addr, f) },
+		c.recvHandle.Read,
+		c.sendHandle.syncSynAck,
+	)
+	if err != nil {
+		c.sendHandle.deleteFlow(addr.IP, uint16(addr.Port))
 	}
+	return err
+}
 
+func runMimicHandshake(addr *net.UDPAddr, delays []time.Duration, write func(conf.TCPF) error, read func(*Packet) error, syncSynAck func(*Packet) bool) error {
 	var pkt Packet
-	deadline := time.Now().Add(synAckTimeout)
-	for time.Now().Before(deadline) {
-		if err := c.recvHandle.Read(&pkt); err != nil {
-			if errors.Is(err, pcap.NextErrorTimeoutExpired) || errors.Is(err, errNoPayload) {
+	for attempt, wait := range delays {
+		if err := write(conf.TCPF{SYN: true}); err != nil {
+			return fmt.Errorf("send SYN attempt %d: %w", attempt+1, err)
+		}
+		deadline := time.Now().Add(wait)
+		for time.Now().Before(deadline) {
+			if err := read(&pkt); err != nil {
+				if errors.Is(err, pcap.NextErrorTimeoutExpired) || errors.Is(err, errNoPayload) {
+					continue
+				}
+				return err
+			}
+
+			if !pkt.SYN || !pkt.ACK || pkt.Addr.Port != addr.Port || !pkt.Addr.IP.Equal(addr.IP) {
 				continue
 			}
-			return err
-		}
 
-		if !pkt.SYN || !pkt.ACK || pkt.Addr.Port != addr.Port || !pkt.Addr.IP.Equal(addr.IP) {
-			continue
+			if !syncSynAck(&pkt) {
+				continue
+			}
+			return write(conf.TCPF{ACK: true})
 		}
-
-		// Ignore a SYN-ACK that does not acknowledge the SYN we just sent; it is
-		// either stale or spoofed and must not resynchronise the flow.
-		if !c.sendHandle.syncSynAck(&pkt) {
-			continue
-		}
-		return c.sendHandle.WriteControl(addr, conf.TCPF{ACK: true})
 	}
 
-	flog.Debugf("socket: no SYN-ACK from %s within %s, continuing without it", addr, synAckTimeout)
-	return nil
+	return fmt.Errorf("handshake with %s failed after %d SYN attempts", addr, len(delays))
 }

@@ -12,10 +12,10 @@ func aplConf(conn *kcp.UDPSession, cfg *conf.KCP) {
 	var wDelay, ackNoDelay bool
 	switch cfg.Mode {
 	case "normal":
-		noDelay, interval, resend, noCongestion = 0, 40, 2, 1
+		noDelay, interval, resend, noCongestion = 0, 40, 2, 0
 		wDelay, ackNoDelay = true, false
 	case "fast":
-		noDelay, interval, resend, noCongestion = 0, 30, 2, 1
+		noDelay, interval, resend, noCongestion = 0, 30, 2, 0
 		wDelay, ackNoDelay = true, false
 	case "fast2":
 		noDelay, interval, resend, noCongestion = 1, 20, 2, 1

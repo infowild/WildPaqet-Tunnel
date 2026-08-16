@@ -28,10 +28,19 @@ func New(cfg *conf.Conf) (*Client, error) {
 
 func (c *Client) Start(ctx context.Context) error {
 	for i := range c.cfg.Transport.Conn {
-		tc, err := newTimedConn(c.cfg)
-		if err != nil {
-			flog.Errorf("failed to create connection %d: %v", i+1, err)
-			return err
+		attempt := 0
+		var tc *timedConn
+		for {
+			var err error
+			tc, err = newTimedConn(c.cfg)
+			if err == nil {
+				break
+			}
+			flog.Warnf("failed to create connection %d, retrying with backoff: %v", i+1, err)
+			if err := waitRetry(ctx, attempt); err != nil {
+				return err
+			}
+			attempt++
 		}
 		flog.Debugf("client connection %d created successfully", i+1)
 		c.iter.Items = append(c.iter.Items, tc)

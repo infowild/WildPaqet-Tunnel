@@ -1,8 +1,8 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.6-v2
-# Branch: wild-paqet-v2 (real 3-way handshake + tracked SEQ/ACK + no DSCP mark + moving IP.id + FIN teardown)
+# Version: 8.7-v2
+# Branch: wild-paqet-v2 (fail-closed handshake + retry backoff + TCP-like ACK/retransmission/timestamps)
 # Raw packet-level tunneling for bypassing network restrictions
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.6-v2"
+readonly SCRIPT_VERSION="8.7-v2"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -61,11 +61,13 @@ readonly NETOPT_QDISC_SCRIPT="/usr/local/lib/wildpaqet/fix-qdisc.sh"
 
 # Default Values
 readonly DEFAULT_LISTEN_PORT="8888"
-readonly DEFAULT_KCP_MODE="fast"
+readonly DEFAULT_KCP_MODE="normal"
 readonly DEFAULT_ENCRYPTION="aes-128-gcm"
-readonly DEFAULT_CONNECTIONS="4"
+readonly DEFAULT_CONNECTIONS="1"
 readonly DEFAULT_CONNECTIONS_CLIENT="1"
 readonly DEFAULT_MTU="1350"
+readonly DEFAULT_SMUX_KEEPALIVE="15"
+readonly DEFAULT_SMUX_KEEPALIVE_TIMEOUT="60"
 readonly DEFAULT_PCAP_SOCKBUF_SERVER="8388608"
 readonly DEFAULT_PCAP_SOCKBUF_CLIENT="4194304"
 readonly DEFAULT_TRANSPORT_TCPBUF="8192"
@@ -1236,14 +1238,10 @@ get_manual_kcp_settings() {
     
     local nocongestion=""
     while true; do
-        read -p "[4] nocongestion [0/1, default 1, 0=skip]: " input
+        read -p "[4] nocongestion [0=enabled, 1=disabled, default 0]: " input
         if [ -z "$input" ]; then
-            nocongestion="1"
-            echo -e "  ${GREEN}→ Using default: 1${NC}" >&2
-            break
-        elif [ "$input" = "0" ]; then
-            nocongestion=""
-            echo -e "  ${YELLOW}→ Skipped${NC}" >&2
+            nocongestion="0"
+            echo -e "  ${GREEN}→ Using default: 0 (congestion control enabled)${NC}" >&2
             break
         elif [[ "$input" =~ ^[01]$ ]]; then
             nocongestion="$input"
@@ -1499,8 +1497,8 @@ configure_server() {
         echo ""
 
         local mode_choice
-        read -p "[4/12] Choose KCP mode [0-4] (default 1): " mode_choice
-        mode_choice="${mode_choice:-1}"
+        read -p "[4/12] Choose KCP mode [0-4] (default 0 - normal): " mode_choice
+        mode_choice="${mode_choice:-0}"
 
         local mode_name
         local kcp_fragment=""
@@ -1516,7 +1514,7 @@ configure_server() {
                 echo -e "────────────────────────────────────────────────────────────────"
                 kcp_fragment=$(get_manual_kcp_settings)
                 ;;
-            *) mode_name="fast" ;;
+            *) mode_name="$DEFAULT_KCP_MODE" ;;
         esac
         echo -e "[4/12] KCP Mode : ${CYAN}$mode_name${NC}"
         
@@ -1654,7 +1652,11 @@ configure_server() {
             echo "    router_mac: \"$GATEWAY_MAC\""
             echo "  tcp:"
             echo "    local_flag: [\"PA\"]"
+            echo "    remote_flag: [\"PA\"]"
             echo "    preset: \"${DEFAULT_TCP_PRESET}\""
+            echo "    handshake: \"mimic\""
+            echo "    track_seq: true"
+            echo "    ipv4_tos: 0"
             
             if [[ -n "$pcap_sockbuf" ]]; then
                 echo "  pcap:"
@@ -1688,6 +1690,8 @@ configure_server() {
                 echo "    block: \"$block\""
                 [[ -n "$mtu" ]] && echo "    mtu: $mtu"
             fi
+            echo "    smuxkalive: $DEFAULT_SMUX_KEEPALIVE"
+            echo "    smuxktimeout: $DEFAULT_SMUX_KEEPALIVE_TIMEOUT"
         } > "$CONFIG_DIR/${config_name}.yaml"
         
         echo -e "[+] Configuration saved : ${CYAN}$CONFIG_DIR/${config_name}.yaml${NC}"
@@ -1845,8 +1849,8 @@ configure_client() {
         echo ""
 
         local mode_choice
-        read -p "[5/15] Choose KCP mode [0-4] (default 1): " mode_choice
-        mode_choice="${mode_choice:-1}"
+        read -p "[5/15] Choose KCP mode [0-4] (default 0 - normal): " mode_choice
+        mode_choice="${mode_choice:-0}"
 
         local mode_name
         local kcp_fragment=""
@@ -1862,7 +1866,7 @@ configure_client() {
                 echo -e "────────────────────────────────────────────────────────────────"
                 kcp_fragment=$(get_manual_kcp_settings)
                 ;;
-            *) mode_name="fast" ;;
+            *) mode_name="$DEFAULT_KCP_MODE" ;;
         esac
         echo -e "[5/15] KCP Mode : ${CYAN}$mode_name${NC}"
         
@@ -2145,6 +2149,9 @@ configure_client() {
             echo "    local_flag: [\"PA\"]"
             echo "    remote_flag: [\"PA\"]"
             echo "    preset: \"${DEFAULT_TCP_PRESET}\""
+            echo "    handshake: \"mimic\""
+            echo "    track_seq: true"
+            echo "    ipv4_tos: 0"
             
             if [[ -n "$pcap_sockbuf" ]]; then
                 echo "  pcap:"
@@ -2183,6 +2190,8 @@ configure_client() {
                 echo "    block: \"$block\""
                 [[ -n "$mtu" ]] && echo "    mtu: $mtu"
             fi
+            echo "    smuxkalive: $DEFAULT_SMUX_KEEPALIVE"
+            echo "    smuxktimeout: $DEFAULT_SMUX_KEEPALIVE_TIMEOUT"
         } > "$CONFIG_DIR/${config_name}.yaml"
         
         echo -e "[+] Configuration saved : ${CYAN}$CONFIG_DIR/${config_name}.yaml${NC}"
