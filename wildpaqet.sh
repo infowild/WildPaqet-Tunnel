@@ -1,9 +1,9 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 8.7-v2
-# Branch: wild-paqet-v2 (fail-closed handshake + retry backoff + TCP-like ACK/retransmission/timestamps)
-# Raw packet-level tunneling for bypassing network restrictions
+# Version: 9.0-v3
+# Branch: wild-paqet-v3 (direct TLS 1.3 + authenticated multiplexing + endpoint circuit breaker)
+# Direct TLS transport with legacy raw KCP available as an explicit fallback
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
 # Forked from: https://github.com/behzadea12/Paqet-Tunnel-Manager
@@ -26,11 +26,11 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.7-v2"
+readonly SCRIPT_VERSION="9.0-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
-readonly MANAGER_BRANCH="wild-paqet-v2"
+readonly MANAGER_BRANCH="wild-paqet-v3"
 
 # Paths
 readonly CONFIG_DIR="/etc/paqet"
@@ -148,8 +148,9 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
+	["v3"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh"
     ["v2"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh"
-    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh"
+    ["latest"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh"
     ["main-7.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh"
     ["6.0"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager6-0.sh"
     ["5.1"]="https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/paqet-manager5-1.sh"
@@ -770,6 +771,19 @@ extract_client_server_addrs() {
             else if ($1 == "-") { v=$2; gsub(/"/,"",v); print v }
         }
     ' "$config"
+}
+
+# Return the protocol under the top-level transport section without confusing
+# it with forward[].protocol entries.
+config_transport_protocol() {
+    local config="$1"
+    awk '
+        /^transport:/ { in_transport=1; next }
+        /^[^[:space:]]/ { if (in_transport) exit }
+        in_transport && $1 == "protocol:" {
+            value=$2; gsub(/"/, "", value); print value; exit
+        }
+    ' "$config" 2>/dev/null
 }
 
 # Install a binary onto a possibly-running path without hitting ETXTBSY.
@@ -1418,8 +1432,341 @@ get_manual_kcp_settings() {
 # CONFIGURATION MENUS
 # ================================================
 
+# Open a normal kernel TCP listener. Do not apply the raw-pcap NOTRACK or RST
+# suppression rules here; those rules break a real TCP/TLS transport.
+configure_tls_firewall() {
+    local port="$1"
+    print_step "Opening TCP/$port for the v3 TLS listener..."
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        ufw allow "$port/tcp" >/dev/null 2>&1 || return 1
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || return 1
+        firewall-cmd --reload >/dev/null 2>&1 || return 1
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -A INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+        save_iptables
+    else
+        print_warning "No supported firewall manager found; open TCP/$port manually"
+    fi
+    print_success "TLS firewall rule ready on TCP/$port"
+}
+
+generate_v3_tls_certificate() {
+    local config_name="$1"
+    local identity="$2"
+    local tls_dir="$CONFIG_DIR/tls/$config_name"
+    local cert_file="$tls_dir/server.crt"
+    local key_file="$tls_dir/server.key"
+	local san_type="DNS"
+	validate_ip "$identity" 2>/dev/null && san_type="IP"
+
+    command -v openssl >/dev/null 2>&1 || {
+        print_error "OpenSSL is required to generate the v3 certificate"
+        return 1
+    }
+    mkdir -p "$tls_dir"
+    chmod 700 "$tls_dir"
+    if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -sha256 -days 825 -nodes -keyout "$key_file" -out "$cert_file" \
+        -subj "/CN=$identity" -addext "subjectAltName=$san_type:$identity" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,digitalSignature,keyCertSign" \
+        -addext "extendedKeyUsage=serverAuth" >/dev/null 2>&1; then
+        print_error "Could not generate the TLS certificate"
+        return 1
+    fi
+    chmod 600 "$key_file" "$cert_file"
+    printf '%s\n%s\n' "$cert_file" "$key_file"
+}
+
+ensure_v3_core() {
+    local version=""
+    if [ -x "$BIN_DIR/paqet" ]; then
+        version=$("$BIN_DIR/paqet" version 2>/dev/null | awk -F: '/^Version:/{gsub(/^[[:space:]]+/,"",$2); print $2; exit}')
+    fi
+    if [[ "$version" == v3.*-wildpaqet ]]; then
+        return 0
+    fi
+
+    if [ -n "$version" ]; then
+        print_warning "Installed core is $version and does not support the v3 TLS config"
+    else
+        print_warning "WildPaqet Core v3 is not installed"
+    fi
+    local answer
+    read -p "Build Core v3 from branch ${MANAGER_BRANCH} now? (Y/n): " answer
+    [[ "$answer" =~ ^[Nn]$ ]] && return 1
+    local arch
+    arch=$(detect_arch) || return 1
+    build_wildpaqet_core_from_source "$arch"
+}
+
+configure_v3_tls_server() {
+    clear
+    show_banner
+    echo -e "${GREEN}Configure v3 Direct TLS Server (Kharej)${NC}\n"
+
+    local config_name port secret_key answer identity cert_file key_file svc public_ip
+	public_ip=$(get_public_ip)
+    read -p "Service name [server-v3]: " config_name
+    config_name=$(clean_config_name "${config_name:-server-v3}")
+    if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
+        read -p "Config exists. Overwrite? (y/N): " answer
+        [[ ! "$answer" =~ ^[Yy]$ ]] && return 0
+    fi
+
+    read -p "TLS listen port [443]: " port
+    port="${port:-443}"
+    validate_port "$port" || { print_error "Invalid port"; pause; return 1; }
+    check_port_conflict "$port" || { pause; return 1; }
+
+    secret_key=$(generate_secret_key)
+    read -p "Shared secret [Enter = generated]: " answer
+    [ -n "$answer" ] && secret_key="$answer"
+    if [ ${#secret_key} -lt 32 ]; then
+        print_error "The v3 shared secret must be at least 32 characters"
+        pause
+        return 1
+    fi
+
+    read -p "Certificate name/IP [$public_ip]: " identity
+    identity="${identity:-$public_ip}"
+    if [[ ! "$identity" =~ ^[A-Za-z0-9.-]+$ ]]; then
+        print_error "Certificate name may only contain letters, numbers, dot and hyphen"
+        pause
+        return 1
+    fi
+
+    echo "Certificate source:"
+    echo " 1. Generate a self-signed certificate (recommended for a private tunnel)"
+    echo " 2. Use existing certificate and key"
+    read -p "Choose [1]: " answer
+    answer="${answer:-1}"
+    mkdir -p "$CONFIG_DIR"
+    if [ "$answer" = "2" ]; then
+        read -p "Certificate path: " cert_file
+        read -p "Private key path: " key_file
+        [ -f "$cert_file" ] && [ -f "$key_file" ] || {
+            print_error "Certificate or key file does not exist"
+            pause
+            return 1
+        }
+    else
+        local cert_paths
+        cert_paths=$(generate_v3_tls_certificate "$config_name" "$identity") || { pause; return 1; }
+        cert_file=$(printf '%s\n' "$cert_paths" | sed -n '1p')
+        key_file=$(printf '%s\n' "$cert_paths" | sed -n '2p')
+    fi
+
+    ensure_v3_core || return 1
+    configure_tls_firewall "$port" || { print_error "Firewall configuration failed"; pause; return 1; }
+
+    {
+        echo "# WildPaqet v3 direct TLS server"
+        echo 'role: "server"'
+        echo 'log:'
+        echo '  level: "info"'
+        echo 'listen:'
+        echo "  addr: \":$port\""
+        echo 'transport:'
+        echo '  protocol: "tls"'
+        echo '  conn: 1'
+        echo '  tls:'
+        echo "    cert_file: \"$cert_file\""
+        echo "    key_file: \"$key_file\""
+        echo "    secret: \"$secret_key\""
+        echo '    alpn: "h2"'
+        echo '    connect_timeout: 10'
+        echo '    handshake_timeout: 10'
+        echo '    keepalive: 15'
+        echo '    keepalive_timeout: 60'
+        echo '    breaker_failures: 3'
+        echo '    breaker_cooldown: 30'
+        echo '    breaker_max_cooldown: 300'
+    } > "$CONFIG_DIR/${config_name}.yaml"
+    chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+
+    create_systemd_service "$config_name"
+    svc="paqet-${config_name}"
+    systemctl enable "$svc" --now >/dev/null 2>&1
+    if ! systemctl is-active --quiet "$svc"; then
+        print_error "TLS server failed to start"
+        systemctl status "$svc" --no-pager -l
+        pause
+        return 1
+    fi
+
+    print_success "v3 TLS server started on TCP/$port"
+    echo -e "${YELLOW}Copy this certificate to the Iran server:${NC} $cert_file"
+    echo -e "${YELLOW}Certificate name:${NC} $identity"
+    echo -e "${YELLOW}Shared secret:${NC} $secret_key"
+    echo "For four Kharej servers, concatenate all four server.crt files into one CA bundle on Iran."
+    pause
+}
+
+configure_v3_tls_client() {
+    clear
+    show_banner
+    echo -e "${GREEN}Configure v3 Direct TLS Client (Iran)${NC}\n"
+
+    local config_name endpoints_raw secret_key server_name send_server_name ca_file traffic_type svc
+    local -a endpoints forward_entries socks5_entries
+    read -p "Service name [iran-v3]: " config_name
+    config_name=$(clean_config_name "${config_name:-iran-v3}")
+    if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
+        read -p "Config exists. Overwrite? (y/N): " endpoints_raw
+        [[ ! "$endpoints_raw" =~ ^[Yy]$ ]] && return 0
+    fi
+
+    echo "Enter all Kharej endpoints. Four endpoints are recommended for your topology."
+    read -p "Endpoints (comma-separated IP:port): " endpoints_raw
+    IFS=',' read -ra endpoints <<< "$endpoints_raw"
+    local -a clean_endpoints=()
+    local endpoint host port
+    for endpoint in "${endpoints[@]}"; do
+        endpoint=$(echo "$endpoint" | xargs)
+        host="${endpoint%:*}"
+        port="${endpoint##*:}"
+        if [ -n "$host" ] && validate_port "$port"; then
+            clean_endpoints+=("$endpoint")
+        else
+            print_error "Invalid endpoint: $endpoint"
+            pause
+            return 1
+        fi
+    done
+    endpoints=("${clean_endpoints[@]}")
+    [ ${#endpoints[@]} -gt 0 ] || { print_error "At least one endpoint is required"; pause; return 1; }
+
+    read -p "CA bundle path (Enter = system trust store): " ca_file
+    if [ -n "$ca_file" ] && [ ! -f "$ca_file" ]; then
+        print_error "CA bundle does not exist: $ca_file"
+        pause
+        return 1
+    fi
+	read -p "Certificate server name (Enter = CA-bundle verification only): " server_name
+	send_server_name="false"
+	if [ -z "$ca_file" ] && [ -z "$server_name" ]; then
+		print_error "A certificate server name is required with the system trust store"
+		pause
+		return 1
+	fi
+	if [ -n "$server_name" ]; then
+		local send_sni_answer
+		read -p "Send this name as TLS SNI? (y/N): " send_sni_answer
+		[[ "$send_sni_answer" =~ ^[Yy]$ ]] && send_server_name="true"
+	fi
+    read -p "Shared secret from Kharej: " secret_key
+    if [ ${#secret_key} -lt 32 ]; then
+        print_error "The v3 shared secret must be at least 32 characters"
+        pause
+        return 1
+    fi
+
+    echo "Traffic mode:"
+    echo " 1. TCP port forwarding"
+    echo " 2. SOCKS5 proxy"
+    read -p "Choose [1]: " traffic_type
+    traffic_type="${traffic_type:-1}"
+    forward_entries=()
+    socks5_entries=()
+    if [ "$traffic_type" = "2" ]; then
+        local socks_port socks_user socks_pass
+        read -p "SOCKS5 port [1080]: " socks_port
+        socks_port="${socks_port:-1080}"
+        validate_port "$socks_port" || { print_error "Invalid SOCKS5 port"; pause; return 1; }
+        read -p "SOCKS5 username (Enter = none): " socks_user
+        if [ -n "$socks_user" ]; then
+            read -s -p "SOCKS5 password: " socks_pass; echo
+            [ -n "$socks_pass" ] || { print_error "Password is required"; pause; return 1; }
+            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"\n    username: \"$socks_user\"\n    password: \"$socks_pass\"")
+        else
+            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"")
+        fi
+        configure_tls_firewall "$socks_port" || true
+    else
+        local forward_ports p
+        read -p "TCP forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
+        forward_ports=$(clean_port_list "${forward_ports:-$DEFAULT_V2RAY_PORTS}")
+        [ -n "$forward_ports" ] || { print_error "No valid forward port"; pause; return 1; }
+        IFS=',' read -ra _v3_ports <<< "$forward_ports"
+        for p in "${_v3_ports[@]}"; do
+            forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
+            configure_tls_firewall "$p" || true
+        done
+    fi
+
+    ensure_v3_core || return 1
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# WildPaqet v3 direct TLS client"
+        echo 'role: "client"'
+        echo 'log:'
+        echo '  level: "info"'
+        if [ ${#forward_entries[@]} -gt 0 ]; then
+            echo 'forward:'
+            printf '%b\n' "${forward_entries[@]}"
+        fi
+        if [ ${#socks5_entries[@]} -gt 0 ]; then
+            echo 'socks5:'
+            printf '%b\n' "${socks5_entries[@]}"
+        fi
+        echo 'server:'
+        echo "  addr: \"${endpoints[0]}\""
+        if [ ${#endpoints[@]} -gt 1 ]; then
+            echo '  addrs:'
+            for endpoint in "${endpoints[@]:1}"; do
+                echo "    - \"$endpoint\""
+            done
+        fi
+        echo 'transport:'
+        echo '  protocol: "tls"'
+        echo "  conn: ${#endpoints[@]}"
+        echo '  tls:'
+        [ -n "$server_name" ] && echo "    server_name: \"$server_name\""
+		[ "$send_server_name" = "true" ] && echo '    send_server_name: true'
+        [ -n "$ca_file" ] && echo "    ca_file: \"$ca_file\""
+        echo "    secret: \"$secret_key\""
+        echo '    alpn: "h2"'
+        echo '    connect_timeout: 10'
+        echo '    handshake_timeout: 10'
+        echo '    keepalive: 15'
+        echo '    keepalive_timeout: 60'
+        echo '    breaker_failures: 3'
+        echo '    breaker_cooldown: 30'
+        echo '    breaker_max_cooldown: 300'
+    } > "$CONFIG_DIR/${config_name}.yaml"
+    chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+
+    create_systemd_service "$config_name"
+    svc="paqet-${config_name}"
+    systemctl enable "$svc" --now >/dev/null 2>&1
+    if ! systemctl is-active --quiet "$svc"; then
+        print_error "TLS client failed to start"
+        systemctl status "$svc" --no-pager -l
+        pause
+        return 1
+    fi
+    print_success "v3 TLS client started with ${#endpoints[@]} distributed outer connection(s)"
+    pause
+}
+
 # Configure as Server
 configure_server() {
+    echo -e "${CYAN}Transport:${NC}"
+    echo " 1. v3 direct TLS (recommended, no WebSocket)"
+    echo " 2. Legacy raw KCP/pcap"
+    echo " 0. Back"
+    local transport_choice
+    read -p "Choose [1]: " transport_choice
+    case "${transport_choice:-1}" in
+        1) configure_v3_tls_server; return ;;
+        2) ;;
+        0) return ;;
+        *) print_error "Invalid transport"; pause; return ;;
+    esac
     while true; do
         clear
         show_banner
@@ -1770,6 +2117,18 @@ configure_server() {
 
 # Configure as Client
 configure_client() {
+    echo -e "${CYAN}Transport:${NC}"
+    echo " 1. v3 direct TLS (recommended, no WebSocket)"
+    echo " 2. Legacy raw KCP/pcap"
+    echo " 0. Back"
+    local transport_choice
+    read -p "Choose [1]: " transport_choice
+    case "${transport_choice:-1}" in
+        1) configure_v3_tls_client; return ;;
+        2) ;;
+        0) return ;;
+        *) print_error "Invalid transport"; pause; return ;;
+    esac
     while true; do
         clear
         show_banner
@@ -2802,10 +3161,10 @@ build_deps_present() {
     return 0
 }
 
-# Build WildPaqet Core v2 from the wild-paqet-v2 branch (./core)
+# Build WildPaqet Core v3 from the selected manager branch (./core)
 build_wildpaqet_core_from_source() {
     local arch_name="${1:-amd64}"
-    print_step "Building WildPaqet Core v2 from source (branch ${MANAGER_BRANCH})..."
+    print_step "Building WildPaqet Core v3 from source (branch ${MANAGER_BRANCH})..."
 
     local os_id
     os_id=$(detect_os)
@@ -2940,7 +3299,7 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 go build -trimpath -ldflags "-s -w \
-            -X 'paqet/cmd/version.Version=v2.0.0-wildpaqet' \
+            -X 'paqet/cmd/version.Version=v3.0.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
@@ -2969,7 +3328,7 @@ build_wildpaqet_core_from_source() {
     fi
     ln -sf "$BIN_DIR/paqet" "$INSTALL_DIR/paqet" 2>/dev/null || true
 
-    print_success "WildPaqet Core v2 installed to $BIN_DIR/paqet"
+    print_success "WildPaqet Core v3 installed to $BIN_DIR/paqet"
     "$BIN_DIR/paqet" version 2>/dev/null || true
     echo ""
     echo -e "${YELLOW}Tip:${NC} New configs use ${CYAN}network.tcp.preset: ${DEFAULT_TCP_PRESET}${NC}"
@@ -3023,13 +3382,13 @@ install_paqet() {
     echo -e "${YELLOW}Download URL:${NC} ${CYAN}$download_url${NC}\n"
     
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN} WildPaqet Core v2 / paqet${NC}"
+    echo -e "${GREEN} WildPaqet Core v3 / paqet${NC}"
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
     echo -e "${YELLOW}Installation Options (core):${NC}"
     echo -e " 1) ${GREEN}Download/Update from GitHub (latest: $latest_version)${NC}"
     echo -e " 2) ${CYAN}Use local file from /root/paqet/${NC}"
     echo -e " 3) ${PURPLE}Download from custom URL${NC}"
-    echo -e " 8) ${ORANGE}Build WildPaqet Core v2 from source (branch ${MANAGER_BRANCH})${NC}"
+    echo -e " 8) ${ORANGE}Build WildPaqet Core v3 from source (branch ${MANAGER_BRANCH})${NC}"
     echo -e ""
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN} WildPaqet manager${NC}"
@@ -3053,7 +3412,7 @@ install_paqet() {
                 echo -e "\n${YELLOW}Please check:${NC}"
                 echo -e " 1. Internet connection"
                 echo -e " 2. GitHub repository access / release exists"
-                echo -e " 3. Or use option ${ORANGE}8${NC} to build Core v2 from source"
+                echo -e " 3. Or use option ${ORANGE}8${NC} to build Core v3 from source"
                 echo -e "\n${YELLOW}You can also:${NC}"
                 echo -e " - Download manually from: $download_url"
                 echo -e " - Save to: /root/paqet/$expected_file"
@@ -4701,8 +5060,15 @@ apply_connection_protection() {
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
         local role=$(grep "^role:" "$config" | awk '{print $2}' | tr -d '"' 2>/dev/null)
+		local transport_protocol
+		transport_protocol=$(config_transport_protocol "$config")
         
         echo -n "  Processing $config_name (${role:-unknown})... "
+
+		if [ "$transport_protocol" = "tls" ]; then
+			echo -e "${CYAN}skipped (normal kernel TCP; raw protection is unsafe)${NC}"
+			continue
+		fi
         
         if [[ "$role" != "server" && "$role" != "client" ]]; then
             echo -e "${YELLOW}skipped (unknown role)${NC}"
@@ -4922,6 +5288,10 @@ set_global_mtu() {
     local modified=0
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
+		if [ "$(config_transport_protocol "$config")" != "kcp" ]; then
+			echo -e " ${CYAN}i${NC} Skipped $config_name (not KCP)"
+			continue
+		fi
         
         if grep -qE '^[[:space:]]*mtu:' "$config"; then
             # Update existing mtu (preserve indentation)
@@ -4933,13 +5303,6 @@ set_global_mtu() {
                 # Find kcp section and add mtu after it with proper indentation
                 sed -i "/kcp:/a\    mtu: $new_mtu" "$config"
                 echo -e " ${GREEN}✓${NC} Added mtu to $config_name"
-            else
-                # No kcp section? Add it at the end
-                echo "" >> "$config"
-                echo "transport:" >> "$config"
-                echo "  kcp:" >> "$config"
-                echo "    mtu: $new_mtu" >> "$config"
-                echo -e " ${YELLOW}⚠${NC} Created kcp section in $config_name"
             fi
         fi
         ((modified++))

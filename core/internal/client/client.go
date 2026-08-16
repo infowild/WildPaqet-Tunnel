@@ -3,7 +3,6 @@ package client
 import (
 	"context"
 	"strings"
-	"sync"
 
 	"paqet/internal/conf"
 	"paqet/internal/flog"
@@ -11,10 +10,10 @@ import (
 )
 
 type Client struct {
-	cfg     *conf.Conf
-	iter    *iterator.Iterator[*timedConn]
-	udpPool *udpPool
-	mu      sync.Mutex
+	cfg       *conf.Conf
+	iter      *iterator.Iterator[*timedConn]
+	udpPool   *udpPool
+	endpoints *endpointPool
 }
 
 func New(cfg *conf.Conf) (*Client, error) {
@@ -22,6 +21,9 @@ func New(cfg *conf.Conf) (*Client, error) {
 		cfg:     cfg,
 		iter:    &iterator.Iterator[*timedConn]{},
 		udpPool: newUDPPool(),
+	}
+	if cfg.Transport.Protocol == "tls" && cfg.Transport.TLS != nil {
+		c.endpoints = newEndpointPool(cfg.Transport.TLS)
 	}
 	return c, nil
 }
@@ -32,7 +34,7 @@ func (c *Client) Start(ctx context.Context) error {
 		var tc *timedConn
 		for {
 			var err error
-			tc, err = newTimedConn(c.cfg)
+			tc, err = newTimedConn(ctx, c.cfg, c.endpoints, i)
 			if err == nil {
 				break
 			}
@@ -67,6 +69,9 @@ func (c *Client) Start(ctx context.Context) error {
 }
 
 func formatServerAddrs(s conf.Server) string {
+	if len(s.Endpoints) > 0 {
+		return strings.Join(s.Endpoints, ", ")
+	}
 	if len(s.Addrs) == 0 {
 		if s.Addr != nil {
 			return s.Addr.String()

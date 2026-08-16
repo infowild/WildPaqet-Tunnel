@@ -57,7 +57,12 @@ func (c *Conf) setDefaults() {
 	}
 	c.Network.setDefaults(c.Role)
 	c.Server.setDefaults()
-	c.Transport.setDefaults(c.Role)
+	endpointCount := 0
+	if c.Server.Addr_ != "" {
+		endpointCount++
+	}
+	endpointCount += len(c.Server.Addrs_)
+	c.Transport.setDefaults(c.Role, endpointCount)
 }
 
 func (c *Conf) validate() error {
@@ -81,12 +86,22 @@ func (c *Conf) validate() error {
 		}
 	}
 
-	allErrors = append(allErrors, c.Network.validate()...)
-	allErrors = append(allErrors, c.Transport.validate()...)
+	if c.Transport.Protocol == "kcp" {
+		allErrors = append(allErrors, c.Network.validate()...)
+	}
+	allErrors = append(allErrors, c.Transport.validate(c.Role)...)
 	if c.Role == "server" {
-		allErrors = append(allErrors, c.Listen.validate()...)
+		if c.Transport.Protocol == "tls" {
+			allErrors = append(allErrors, c.Listen.validateTLS()...)
+		} else {
+			allErrors = append(allErrors, c.Listen.validate()...)
+		}
 	} else {
-		allErrors = append(allErrors, c.Server.validate()...)
+		if c.Transport.Protocol == "tls" {
+			allErrors = append(allErrors, c.Server.validateTLS()...)
+		} else {
+			allErrors = append(allErrors, c.Server.validate()...)
+		}
 		for _, addr := range c.Server.Addrs {
 			if addr == nil {
 				continue
@@ -99,7 +114,7 @@ func (c *Conf) validate() error {
 				allErrors = append(allErrors, fmt.Errorf("server address %s is %s, but the %s interface is not configured", addr, family, family))
 			}
 		}
-		if c.Transport.Conn > 1 && c.Network.Port != 0 {
+		if c.Transport.Protocol == "kcp" && c.Transport.Conn > 1 && c.Network.Port != 0 {
 			allErrors = append(allErrors, fmt.Errorf("only one connection is allowed when a client port is explicitly set"))
 		}
 	}

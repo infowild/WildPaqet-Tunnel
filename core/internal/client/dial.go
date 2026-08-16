@@ -37,19 +37,17 @@ func waitRetry(ctx context.Context, attempt int) error {
 	}
 }
 
-func (c *Client) newConn() (tnet.Conn, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+func (c *Client) newConn(ctx context.Context) (tnet.Conn, error) {
 	autoExpire := 300
 	tc := c.iter.Next()
-	go tc.sendTCPF(tc.conn)
-	err := tc.conn.Ping(false)
-	if err != nil {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.conn == nil || tc.conn.IsClosed() {
 		flog.Infof("connection lost, retrying....")
 		if tc.conn != nil {
-			tc.conn.Close()
+			_ = tc.conn.Close()
 		}
-		conn, err := tc.createConn()
+		conn, err := tc.createConn(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -65,7 +63,7 @@ func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		conn, err := c.newConn()
+		conn, err := c.newConn(ctx)
 		if err != nil {
 			flog.Debugf("failed to open conn, retrying: %v", err)
 			if err := waitRetry(ctx, attempt); err != nil {

@@ -1,0 +1,25 @@
+# WildPaqet v3 direct TLS server (Kharej)
+role: "server"
+
+log:
+  level: "info"
+
+listen:
+  addr: ":443"
+
+transport:
+  protocol: "tls"
+  conn: 1
+  tls:
+    cert_file: "/etc/paqet/tls/server-v3/server.crt"
+    key_file: "/etc/paqet/tls/server-v3/server.key"
+    secret: "replace-with-at-least-32-random-characters"
+    # h2 is intentionally non-unique in the visible ClientHello.
+    alpn: "h2"
+    connect_timeout: 10
+    handshake_timeout: 10
+    keepalive: 15
+    keepalive_timeout: 60
+    breaker_failures: 3
+    breaker_cooldown: 30
+    breaker_max_cooldown: 300

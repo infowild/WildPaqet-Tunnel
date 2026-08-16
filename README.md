@@ -2,14 +2,14 @@
 
 # WildPaqet Tunnel
 
-**Raw-packet KCP tunnel manager for restricted networks**
+**Direct TLS 1.3 tunnel with a hardened raw-KCP fallback**
 
-[![Version](https://img.shields.io/badge/version-8.5--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-9.0--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
-[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
+[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 
-[فارسی](README.fa.md) · [Repository](https://github.com/infowild/WildPaqet-Tunnel) · [Core tree](./core) · [v2 install](docs/V2-INSTALL.md)
+[فارسی](README.fa.md) · [Repository](https://github.com/infowild/WildPaqet-Tunnel) · [Core tree](./core) · [v3 install](docs/V3-INSTALL.md)
 
 <br/>
 
@@ -19,10 +19,10 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
-### WildPaqet v2 (this branch — recommended for testing)
+### WildPaqet v3 (this branch)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 ```
 
 Then:
@@ -31,14 +31,14 @@ Then:
 wildpaqet
 ```
 
-> After first run, menu **0 → 8** builds **WildPaqet Core v2** from source (wire realism + mimic handshake + multi-addr). See [docs/V2-INSTALL.md](docs/V2-INSTALL.md).
+> After first run, menu **0 → 8** builds **WildPaqet Core v3** from source. See [docs/V3-INSTALL.md](docs/V3-INSTALL.md).
 </div>
 
 ---
 
 ## Why WildPaqet?
 
-WildPaqet is a production-oriented manager for the [paqet](https://github.com/hanselime/paqet) core: a **raw socket + KCP** tunnel built for Kharej ↔ Iran deployments.
+WildPaqet is a production-oriented tunnel manager for Kharej ↔ Iran deployments. v3 defaults to **direct TLS 1.3 + smux** over normal kernel TCP; the hardened raw socket + KCP transport remains an explicit legacy fallback.
 
 | | |
 |---|---|
@@ -57,15 +57,17 @@ Forked and maintained from [Paqet-Tunnel-Manager](https://github.com/behzadea12/
 ```mermaid
 flowchart LR
   U[Users / Panels] --> IR[Iran VPS<br/>wildpaqet client]
-  IR -->|KCP raw tunnel| KH1[Kharej A]
-  IR -->|KCP raw tunnel| KH2[Kharej B]
+  IR -->|TLS 1.3 + smux| KH1[Kharej A]
+  IR -->|TLS 1.3 + smux| KH2[Kharej B]
+  IR -->|TLS 1.3 + smux| KH3[Kharej C]
+  IR -->|TLS 1.3 + smux| KH4[Kharej D]
   KH1 --> NET[Internet / Origin services]
   KH2 --> NET
 ```
 
 - **Kharej**: listens for the tunnel (`role: server`)
 - **Iran**: terminates locally and **forwards ports** or exposes **SOCKS5**
-- Same **secret key** + same **core version** on both sides
+- Same **32+ character secret** and **core version** on both sides; Iran trusts each Kharej certificate
 
 ---
 
@@ -74,25 +76,25 @@ flowchart LR
 ### 1) Launch (root)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 ```
 
 On first run the manager **auto-installs** the `wildpaqet` system command from this branch.
 
-Then: **0 → 8** to build WildPaqet Core v2 (or **0 → 1** after a `core-v*` release).
+Then: **0 → 8** to build WildPaqet Core v3 from this branch.
 
 ### 2) Kharej
 
-1. Option **2** → Server  
-2. Name, listen port, secret key  
-3. KCP `fast`, conn `4`, MTU `1350`, encryption `aes-128-gcm`
+1. Option **2** → **v3 direct TLS**
+2. Use the same shared secret on all Kharej servers
+3. Copy each generated `server.crt` to Iran and concatenate a CA bundle
 
 ### 3) Iran
 
-1. Option **3** → Client  
-2. Kharej IP + port + secret  
-3. conn `1`, MTU `1350`  
-4. Port Forward (`443,8443,...`) or SOCKS5
+1. Option **3** → **v3 direct TLS**
+2. Enter the four Kharej `IP:port` endpoints
+3. Select the CA bundle and shared secret
+4. Choose Port Forward or SOCKS5
 
 ### 4) Daily use
 
@@ -149,7 +151,15 @@ wildpaqet
 
 ---
 
-## Wire hardening (8.7-v2)
+## Direct TLS transport (9.0-v3)
+
+The `tls` transport is direct TLS — there is no HTTP or WebSocket layer. It uses TLS 1.3, certificate verification, the common visible ALPN value `h2`, and a fail-closed post-TLS HMAC challenge with a timestamp and nonce. A replayed nonce or a timestamp outside the two-minute window is rejected before smux starts. Private CA-bundle deployments do not send SNI by default.
+
+For multiple Kharej endpoints, the default is one outer connection per endpoint. Streams are distributed round-robin. Three consecutive failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
+
+See [the v3 install guide](docs/V3-INSTALL.md) and the [client](core/example/client-tls.yaml.example) / [server](core/example/server-tls.yaml.example) examples.
+
+## Legacy raw wire hardening (8.7-v2)
 
 The tunnel leg between Iran and Kharej used to be easy to single out on the wire. Preset `default` now makes it behave like an ordinary TCP connection:
 

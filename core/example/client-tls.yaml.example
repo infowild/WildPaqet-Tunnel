@@ -1,0 +1,37 @@
+# WildPaqet v3 direct TLS client (Iran)
+role: "client"
+
+log:
+  level: "info"
+
+forward:
+  - listen: "0.0.0.0:9090"
+    target: "127.0.0.1:9090"
+    protocol: "tcp"
+
+server:
+  addr: "203.0.113.10:443"
+  addrs:
+    - "203.0.113.11:443"
+    - "203.0.113.12:443"
+    - "203.0.113.13:443"
+
+transport:
+  protocol: "tls"
+  # One outer connection per endpoint. If omitted, this is derived automatically.
+  conn: 4
+  tls:
+    # Concatenate the four self-signed server.crt files into this bundle.
+    ca_file: "/etc/paqet/tls/kharej-ca-bundle.crt"
+    # SNI is off by default. For a public certificate, set both fields below.
+    # server_name: "tunnel.example.com"
+    # send_server_name: true
+    secret: "replace-with-the-same-32-character-secret"
+    alpn: "h2"
+    connect_timeout: 10
+    handshake_timeout: 10
+    keepalive: 15
+    keepalive_timeout: 60
+    breaker_failures: 3
+    breaker_cooldown: 30
+    breaker_max_cooldown: 300

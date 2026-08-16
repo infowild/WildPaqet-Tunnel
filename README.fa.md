@@ -2,13 +2,13 @@
 
 # WildPaqet Tunnel
 
-**منیجر تونل Raw-Packet + KCP برای شبکه‌های محدود**
+**تونل مستقیم TLS 1.3 با fallback سخت‌سازی‌شدهٔ Raw-KCP**
 
-[![Version](https://img.shields.io/badge/version-8.5--v2-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v2)
+[![Version](https://img.shields.io/badge/version-9.0--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
-[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v2/wildpaqet.sh)
+[![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
-[English](README.md) · [مخزن](https://github.com/infowild/WildPaqet-Tunnel) · [هسته v2](./core) · [نصب v2](docs/V2-INSTALL.md)
+[English](README.md) · [مخزن](https://github.com/infowild/WildPaqet-Tunnel) · [هسته v3](./core) · [نصب v3](docs/V3-INSTALL.md)
 
 <br/>
 
@@ -18,10 +18,10 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
 ```
 
-### WildPaqet v2 (برنچ تست — پیشنهاد فعلی)
+### WildPaqet v3 (این برنچ)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 ```
 
 بعد از اولین اجرا:
@@ -30,7 +30,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wi
 wildpaqet
 ```
 
-> منو **0 → 8** هستهٔ **WildPaqet Core v2** را از سورس می‌سازد. راهنما: [docs/V2-INSTALL.md](docs/V2-INSTALL.md).
+> منو **0 → 8** هستهٔ **WildPaqet Core v3** را از سورس می‌سازد. راهنما: [docs/V3-INSTALL.md](docs/V3-INSTALL.md).
 </div>
 
 ---
@@ -56,8 +56,10 @@ wildpaqet
 ```mermaid
 flowchart LR
   U[کاربر / پنل] --> IR[سرور ایران<br/>کلاینت wildpaqet]
-  IR -->|تونل KCP| KH1[خارج A]
-  IR -->|تونل KCP| KH2[خارج B]
+  IR -->|TLS 1.3 + smux| KH1[خارج A]
+  IR -->|TLS 1.3 + smux| KH2[خارج B]
+  IR -->|TLS 1.3 + smux| KH3[خارج C]
+  IR -->|TLS 1.3 + smux| KH4[خارج D]
   KH1 --> NET[اینترنت / سرویس اصلی]
   KH2 --> NET
 ```
@@ -73,7 +75,7 @@ flowchart LR
 ### ۱) اجرا با root
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v2/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 ```
 
 در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود. سپس برای هستهٔ v2: منو **0 → 8**.
@@ -108,7 +110,15 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ---
 
-## سخت‌سازی ترافیک روی سیم (8.6-v2)
+## ترنسپورت مستقیم TLS در v3
+
+ترنسپورت `tls` مستقیماً از TLS 1.3 استفاده می‌کند و هیچ لایهٔ HTTP یا WebSocket ندارد. گواهی سرور بررسی می‌شود، ALPN قابل‌مشاهده مقدار رایج `h2` دارد، و پیش از شروع smux یک احراز هویت HMAC شامل timestamp و nonce اجرا می‌شود. nonce تکراری یا اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شود. در حالت CA bundle خصوصی، SNI به‌صورت پیش‌فرض ارسال نمی‌شود.
+
+برای چهار سرور خارج، کلاینت به‌طور پیش‌فرض برای هر endpoint یک اتصال بیرونی می‌سازد و streamها را round-robin پخش می‌کند. پس از سه خطای متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود؛ زمان توقف حداکثر تا پنج دقیقه رشد می‌کند و فقط یک probe نیمه‌باز اجازه دارد.
+
+راهنمای نصب: [docs/V3-INSTALL.md](docs/V3-INSTALL.md). نمونه کانفیگ‌ها: [ایران](core/example/client-tls.yaml.example) و [خارج](core/example/server-tls.yaml.example).
+
+## سخت‌سازی ترافیک Raw قدیمی (8.7-v2)
 
 مسیر تونل بین ایران و خارج قبلاً روی سیم خیلی راحت قابل تشخیص بود. پریست `default` حالا کاری می‌کند که این مسیر مثل یک کانکشن عادی TCP رفتار کند:
 
@@ -121,7 +131,7 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 | `IP.id` ثابت صفر روی هر پکت DF — امضای واضح تونل حجیم | `IP.id` متحرک (IPv4) و flow label (IPv6) مثل یک استک واقعی |
 | فلو وسط کار بی‌صدا قطع می‌شد | هنگام بستن، `FIN,ACK` تلاش‌محور فرستاده می‌شود |
 
-**هر دو طرف** باید آپدیت شوند؛ هندشیک فقط وقتی کامل می‌شود که ایران و خارج هر دو این نسخه را داشته باشند. کلاینت جدید با سرور قدیمی هم وصل می‌شود، فقط در لاگ می‌نویسد که `SYN-ACK` نیامد.
+**هر دو طرف** باید آپدیت شوند؛ هندشیک فقط وقتی کامل می‌شود که ایران و خارج هر دو این نسخه را داشته باشند. اگر `SYN-ACK` معتبر نیاید، کلاینت fail-closed هیچ دیتای تونلی ارسال نمی‌کند.
 
 اگر خواستی رفتار قدیمی را برگردانی، روی هر دو طرف `network.tcp.preset: "legacy"` بگذار.
 

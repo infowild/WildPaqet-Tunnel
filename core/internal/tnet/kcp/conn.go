@@ -58,6 +58,10 @@ func (c *Conn) Ping(wait bool) error {
 	return nil
 }
 
+func (c *Conn) IsClosed() bool {
+	return c.Session == nil || c.Session.IsClosed()
+}
+
 func (c *Conn) Close() error {
 	var err error
 	if c.Session != nil {
