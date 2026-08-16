@@ -78,7 +78,11 @@ flowchart LR
 bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 ```
 
-در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود. سپس برای هستهٔ v2: منو **0 → 8**.
+در اولین اجرا دستور سیستمی `wildpaqet` **خودکار نصب** می‌شود. سپس برای ساخت هستهٔ v3: منو **0 → 8**.
+
+اگر Go توزیع از نسخهٔ موردنیاز `core/go.mod` قدیمی‌تر باشد، نصب‌کننده از
+تعویض خودکار toolchain استفاده می‌کند یا نسخهٔ رسمی Go را با بررسی checksum در
+`/opt/wildpaqet-go` قرار می‌دهد؛ Go سیستمی جایگزین نمی‌شود.
 
 ### ۲) خارج → گزینه ۲  
 ### ۳) ایران → گزینه ۳  
@@ -98,12 +102,12 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ---
 
-## پیش‌فرض‌های v7.1
+## پیش‌فرض‌های Raw-KCP قدیمی (منیجر v3)
 
 | مورد | سرور | کلاینت |
 |------|------|--------|
-| Mode | `fast` | `fast` |
-| Conn | `4` | `1` |
+| Mode | `normal` | `normal` |
+| Conn | `1` | `1` |
 | MTU | `1350` | `1350` |
 | TCP preset | `default` | `default` |
 | Encryption | `aes-128-gcm` | `aes-128-gcm` |
@@ -166,7 +170,7 @@ wildpaqet
 # گزینه 8 → تایپ YES
 ```
 
-سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، کلون سورس Core v2، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین iptables محافظتی، کش `/root/paqet`، بکاپ‌ها و فایل‌های موقت `/tmp/paqet*` پاک می‌شوند. Flush جدول NAT اختیاری است.
+سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، سورس Core v3، ابزار Go ایزوله، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین iptables محافظتی، کش `/root/paqet`، بکاپ‌ها و فایل‌های موقت `/tmp/paqet*` پاک می‌شوند. Flush جدول NAT اختیاری است.
 
 پاکسازی بهینه‌ساز شبکه هنگام حذف کامل **snapshot-aware** است: آخرین `/var/lib/wildpaqet/netopt/snap-*` بازگردانی می‌شود (تا مقادیر sysctl توزیع/کاربر برگردند)، سپس drop-inهای sysctl/limits متعلق به WildPaqet و یونیت بوت `wildpaqet-qdisc.service` حذف و خودِ snapshot پاک می‌شود. هرگز به‌صورت کور `cubic`/`pfifo_fast` تحمیل نمی‌شود؛ اگر `fq` زندهٔ باقی‌مانده باشد به `fq_codel` امن مهاجرت داده می‌شود.
 

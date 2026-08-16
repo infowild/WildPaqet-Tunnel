@@ -39,6 +39,7 @@ readonly BIN_DIR="/usr/local/bin"
 readonly INSTALL_DIR="/opt/paqet"
 readonly BACKUP_DIR="/root/paqet-backups"
 readonly CORE_SRC_DIR="/opt/wildpaqet-core-src"
+readonly GO_TOOLCHAIN_DIR="/opt/wildpaqet-go"
 
 # Repositories
 # Upstream binary fallback (hanselime). WildPaqet v2 core builds publish on MANAGER repo.
@@ -3161,6 +3162,137 @@ build_deps_present() {
     return 0
 }
 
+version_at_least() {
+    local have="$1"
+    local need="$2"
+    [ -n "$have" ] && [ "$(printf '%s\n%s\n' "$have" "$need" | sort -V | tail -1)" = "$have" ]
+}
+
+# Select a Go compiler that satisfies core/go.mod. Go 1.21+ can fetch a newer
+# toolchain itself. Older distro Go versions cannot, so install an isolated,
+# checksum-verified official toolchain without replacing /usr/bin/go.
+prepare_build_go_toolchain() {
+    local need_go="$1"
+    local arch_name="$2"
+    local have_go=""
+    local resolved_go=""
+    BUILD_GO_BIN=""
+
+    [[ "$need_go" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || {
+        print_error "Invalid Go version in core/go.mod: $need_go"
+        return 1
+    }
+
+    if command -v go >/dev/null 2>&1; then
+        have_go=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        if version_at_least "$have_go" "$need_go"; then
+            BUILD_GO_BIN=$(command -v go)
+            print_success "Using installed Go ${have_go}"
+            return 0
+        fi
+
+        if version_at_least "$have_go" "1.21.0"; then
+            print_warning "Installed Go is ${have_go}; source needs ${need_go}"
+            if run_with_progress 420 "Fetching Go ${need_go} toolchain" \
+                env GOTOOLCHAIN="go${need_go}" \
+                    GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
+                    GOSUMDB="${GOSUMDB:-sum.golang.google.cn}" \
+                    go version; then
+                resolved_go=$(env GOTOOLCHAIN="go${need_go}" go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+                if version_at_least "$resolved_go" "$need_go"; then
+                    export GOTOOLCHAIN="go${need_go}"
+                    BUILD_GO_BIN=$(command -v go)
+                    print_success "Go ${resolved_go} toolchain ready"
+                    return 0
+                fi
+            fi
+            print_warning "Automatic Go toolchain fetch did not produce ${need_go}; using official archive"
+        else
+            print_warning "Distro Go ${have_go:-unknown} is too old for automatic toolchain switching"
+        fi
+    else
+        print_warning "No system Go found; using an isolated official toolchain"
+    fi
+
+    local go_arch=""
+    case "$arch_name" in
+        amd64) go_arch="amd64" ;;
+        arm64) go_arch="arm64" ;;
+        arm32|armv7) go_arch="armv6l" ;;
+        386) go_arch="386" ;;
+        *) print_error "No official Go archive mapping for architecture: $arch_name"; return 1 ;;
+    esac
+
+    local toolchain_dir="$GO_TOOLCHAIN_DIR/${need_go}"
+    local toolchain_bin="$toolchain_dir/bin/go"
+    if [ -x "$toolchain_bin" ]; then
+        resolved_go=$("$toolchain_bin" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+        if version_at_least "$resolved_go" "$need_go"; then
+            BUILD_GO_BIN="$toolchain_bin"
+            print_success "Using cached isolated Go ${resolved_go}"
+            return 0
+        fi
+    fi
+
+    local archive="/tmp/wildpaqet-go-${need_go}-linux-${go_arch}.tar.gz"
+    local checksum_file="${archive}.sha256"
+    local filename="go${need_go}.linux-${go_arch}.tar.gz"
+    local checksum_url="https://dl.google.com/go/${filename}.sha256"
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        print_error "sha256sum (coreutils) is required to verify the Go toolchain"
+        return 1
+    fi
+    local urls=(
+        "https://dl.google.com/go/${filename}"
+        "https://go.dev/dl/${filename}"
+        "https://golang.google.cn/dl/${filename}"
+    )
+    local downloaded=0
+    local url expected
+    rm -f "$archive" "$checksum_file"
+    for url in "${urls[@]}"; do
+        if run_with_progress 480 "Downloading official Go ${need_go} (${go_arch})" \
+            curl -fL --connect-timeout 15 --max-time 420 "$url" -o "$archive" \
+            && curl -fsSL --connect-timeout 15 --max-time 60 "$checksum_url" -o "$checksum_file"; then
+            expected=$(awk 'NR==1 {print $1}' "$checksum_file" 2>/dev/null)
+            if [[ "$expected" =~ ^[0-9a-fA-F]{64}$ ]] \
+                && printf '%s  %s\n' "$expected" "$archive" | sha256sum -c - >/dev/null 2>&1; then
+                downloaded=1
+                break
+            fi
+            print_warning "Checksum verification failed for $url"
+        fi
+        rm -f "$archive" "$checksum_file"
+    done
+    rm -f "$checksum_file"
+    if [ "$downloaded" -ne 1 ]; then
+        print_error "Could not securely download Go ${need_go}"
+        return 1
+    fi
+
+    local temp_dir="$GO_TOOLCHAIN_DIR/.${need_go}.tmp.$$"
+    mkdir -p "$GO_TOOLCHAIN_DIR"
+    rm -rf "$temp_dir"
+    mkdir -p "$temp_dir"
+    if ! tar -xzf "$archive" -C "$temp_dir" --strip-components=1; then
+        rm -rf "$temp_dir"
+        rm -f "$archive"
+        print_error "Could not extract Go ${need_go}"
+        return 1
+    fi
+    rm -f "$archive"
+    rm -rf "$toolchain_dir"
+    mv "$temp_dir" "$toolchain_dir"
+
+    resolved_go=$("$toolchain_bin" version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
+    if ! version_at_least "$resolved_go" "$need_go"; then
+        print_error "Installed isolated Go is ${resolved_go:-unknown}; expected ${need_go}"
+        return 1
+    fi
+    BUILD_GO_BIN="$toolchain_bin"
+    print_success "Installed isolated Go ${resolved_go} at $toolchain_dir"
+}
+
 # Build WildPaqet Core v3 from the selected manager branch (./core)
 build_wildpaqet_core_from_source() {
     local arch_name="${1:-amd64}"
@@ -3203,12 +3335,22 @@ build_wildpaqet_core_from_source() {
         esac
     fi
 
-    if ! command -v go >/dev/null 2>&1; then
-        print_error "Go toolchain not found. Install Go 1.22+ and retry."
+    command -v gcc >/dev/null 2>&1 || {
+        print_error "GCC is required to build the CGO/libpcap core"
+        pause
+        return 1
+    }
+    if ! command -v curl >/dev/null 2>&1 || ! command -v tar >/dev/null 2>&1; then
+        print_error "curl and tar are required to fetch the source/toolchain"
         pause
         return 1
     fi
-    print_success "Build dependencies ready ($(go version 2>/dev/null | awk '{print $3}'))"
+    if [ ! -f /usr/include/pcap.h ] && [ ! -f /usr/include/pcap/pcap.h ]; then
+        print_error "libpcap development headers are required"
+        pause
+        return 1
+    fi
+    print_success "Native build dependencies ready"
 
     rm -rf "$CORE_SRC_DIR"
     mkdir -p "$CORE_SRC_DIR"
@@ -3259,35 +3401,18 @@ build_wildpaqet_core_from_source() {
         return 1
     fi
 
-    # Building needs the Go version go.mod asks for. If the installed Go is older,
-    # `go build` silently downloads a toolchain, which is what stalls behind
-    # restricted networks - so warn before spending 20 minutes on it.
-    local need_go have_go
+    # Resolve a compatible compiler explicitly. This also handles fresh
+    # Ubuntu/Debian releases whose packaged Go predates toolchain switching.
+    local need_go
     need_go=$(awk '/^go /{print $2; exit}' "$CORE_SRC_DIR/core/go.mod" 2>/dev/null)
-    have_go=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
-    if [ -n "$need_go" ] && [ -n "$have_go" ] && [ "$need_go" != "$have_go" ]; then
-        local newest
-        newest=$(printf '%s\n%s\n' "$need_go" "$have_go" | sort -V | tail -1)
-        if [ "$newest" = "$need_go" ]; then
-            print_warning "Installed Go is ${have_go}, source needs ${need_go}"
-            # Left to `go build`, this download retries silently for up to half
-            # an hour on a filtered link. Do it here, bounded and visible, so a
-            # blocked toolchain fails in minutes with usable instructions.
-            if ! run_with_progress 420 "Fetching Go ${need_go} toolchain" \
-                env GOTOOLCHAIN="go${need_go}" \
-                    GOPROXY="${GOPROXY:-https://goproxy.cn,direct}" \
-                    GOSUMDB="${GOSUMDB:-sum.golang.google.cn}" \
-                    go version; then
-                print_error "Could not fetch the Go ${need_go} toolchain (network blocked?)"
-                echo ""
-                print_info "Build on a Kharej server instead, then copy the binary here:"
-                echo -e "  ${CYAN}Kharej:${NC} cd $BIN_DIR && python3 -m http.server 8899"
-                echo -e "  ${CYAN}Here:${NC}   curl -fsSL http://<KHAREJ_IP>:8899/paqet -o /tmp/paqet.new \\"
-                echo -e "           && chmod +x /tmp/paqet.new && mv -f /tmp/paqet.new $BIN_DIR/paqet"
-                pause
-                return 1
-            fi
-        fi
+    if ! prepare_build_go_toolchain "$need_go" "$arch_name"; then
+        echo ""
+        print_info "Build on a Kharej server instead, then copy the binary here:"
+        echo -e "  ${CYAN}Kharej:${NC} cd $BIN_DIR && python3 -m http.server 8899"
+        echo -e "  ${CYAN}Here:${NC}   curl -fsSL http://<KHAREJ_IP>:8899/paqet -o /tmp/paqet.new \\"
+        echo -e "           && chmod +x /tmp/paqet.new && mv -f /tmp/paqet.new $BIN_DIR/paqet"
+        pause
+        return 1
     fi
 
     local build_out="/tmp/paqet_linux_${arch_name}"
@@ -3298,7 +3423,7 @@ build_wildpaqet_core_from_source() {
         # Iran-friendly module/toolchain mirrors (override if already set)
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
-        timeout 1800 go build -trimpath -ldflags "-s -w \
+        timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
             -X 'paqet/cmd/version.Version=v3.0.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
@@ -6166,6 +6291,7 @@ uninstall_paqet() {
     echo -e "  • Core binary: ${CYAN}$BIN_DIR/paqet${NC} (+ all .bak backups)"
     echo -e "  • Install tree: ${CYAN}$INSTALL_DIR${NC}"
     echo -e "  • Core source clone: ${CYAN}$CORE_SRC_DIR${NC}"
+    echo -e "  • Isolated Go toolchain: ${CYAN}$GO_TOOLCHAIN_DIR${NC}"
     echo -e "  • Configs: ${CYAN}$CONFIG_DIR${NC}"
     echo -e "  • Manager: ${CYAN}wildpaqet${NC} (+ legacy paqet-manager links)"
     echo -e "  • Telegram bot service/files/logs"
@@ -6259,7 +6385,8 @@ uninstall_paqet() {
     rm -rf "$CONFIG_DIR" 2>/dev/null || true
     rm -rf "$INSTALL_DIR" 2>/dev/null || true
     rm -rf "$CORE_SRC_DIR" 2>/dev/null || true
-    print_success "Core, configs, and $CORE_SRC_DIR removed"
+    rm -rf "$GO_TOOLCHAIN_DIR" 2>/dev/null || true
+    print_success "Core, configs, source, and isolated Go toolchain removed"
 
     # --- 7) Manager command + legacy names ---
     print_step "Removing WildPaqet manager command..."
@@ -6279,6 +6406,7 @@ uninstall_paqet() {
     rm -rf /tmp/paqet-extract.* 2>/dev/null || true
     rm -f /tmp/paqet_linux_* 2>/dev/null || true
     rm -f /tmp/paqet-linux-* 2>/dev/null || true
+    rm -f /tmp/wildpaqet-go-* 2>/dev/null || true
     # orphaned mktemp dirs if glob failed on some shells
     find /tmp -maxdepth 1 -type d -name 'paqet-extract.*' -exec rm -rf {} + 2>/dev/null || true
     print_success "Removed /root/paqet, $BACKUP_DIR, and /tmp/paqet* leftovers"

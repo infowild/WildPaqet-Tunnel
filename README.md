@@ -83,6 +83,10 @@ On first run the manager **auto-installs** the `wildpaqet` system command from t
 
 Then: **0 → 8** to build WildPaqet Core v3 from this branch.
 
+If the distro Go compiler is older than `core/go.mod`, the installer uses Go
+toolchain switching or downloads a checksum-verified official compiler under
+`/opt/wildpaqet-go`; it does not replace the system Go installation.
+
 ### 2) Kharej
 
 1. Option **2** → **v3 direct TLS**
@@ -126,7 +130,7 @@ wildpaqet
 <td width="50%">
 
 ### Ops & safety
-- Connection protection (Anti-RST / NOTRACK)
+- Connection protection (Anti-RST / NOTRACK, raw transport only)
 - NAT helpers
 - MTU / bulk config tools
 - Telegram status bot
@@ -138,7 +142,7 @@ wildpaqet
 
 ---
 
-## Defaults (v7.1)
+## Legacy raw-KCP defaults (v3 manager)
 
 | Setting | Server | Client |
 |--------|--------|--------|
@@ -216,7 +220,7 @@ wildpaqet
 # option 8 → type YES
 ```
 
-Removes **all** script/tunnel artifacts: services, cron, core + backups, `$INSTALL_DIR`, Core v2 source clone, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, Paqet iptables protection, `/root/paqet`, `/root/paqet-backups`, and `/tmp/paqet*`. Optionally flushes the NAT table.
+Removes **all** script/tunnel artifacts: services, cron, core + backups, `$INSTALL_DIR`, the Core v3 source tree, the isolated Go toolchain, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, Paqet iptables protection, `/root/paqet`, `/root/paqet-backups`, and `/tmp/paqet*`. Optionally flushes the NAT table.
 
 Network optimizer cleanup during uninstall is **snapshot-aware**: it restores the last `/var/lib/wildpaqet/netopt/snap-*` (so distro/user sysctl values come back), removes the WildPaqet sysctl/limits drop-ins and the `wildpaqet-qdisc.service` boot unit, then deletes the snapshot store. It never forces a blind `cubic`/`pfifo_fast` reset — if live `fq` is still present it is migrated to tunnel-safe `fq_codel`.
 
@@ -244,7 +248,7 @@ Menu: **7 → 1** Apply · **2** Status · **3** Rollback · **4** Reset owned d
 <summary><b>wildpaqet: command not found</b></summary>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)
 # or
 ls -l /usr/local/bin/wildpaqet
 /usr/local/bin/wildpaqet
@@ -276,8 +280,10 @@ lsof -i :8443
 <details>
 <summary><b>Core install fails</b></summary>
 
-Put the archive in `/root/paqet/` and use option **0 → 2** (local file).  
-Releases: https://github.com/hanselime/paqet/releases
+Retry option **0 → 8** after checking DNS and outbound HTTPS. If downloads are
+blocked in Iran, build with **0 → 8** on a Kharej server and copy that v3 binary
+to Iran as described in the error message. Do not use an upstream Paqet release
+with a `protocol: tls` configuration.
 </details>
 
 ---
@@ -306,6 +312,6 @@ MIT — aligned with upstream projects.
 
 **WildPaqet** · by [InfoWild](https://github.com/infowild)
 
-`bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/main/wildpaqet.sh)`
+`bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)`
 
 </div>

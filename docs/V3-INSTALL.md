@@ -13,6 +13,12 @@ wildpaqet
 
 Do not use an older release binary with a `protocol: tls` configuration.
 
+The source installer checks the Go version required by `core/go.mod`. If the
+distro compiler is too old, it first tries Go's toolchain switching and then
+falls back to a checksum-verified official Go archive under
+`/opt/wildpaqet-go`. It does not replace the system Go installation, and the
+manager's full uninstall option removes this isolated toolchain.
+
 ## Four Kharej servers
 
 On each Kharej host:
