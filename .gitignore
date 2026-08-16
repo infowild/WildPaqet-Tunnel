@@ -8,6 +8,10 @@ rules_and_progress.md
 tests/
 *_test.go
 
+# Published manager regression tests used by GitHub Actions.
+!.github/tests/
+!.github/tests/pairing-code.sh
+
 # Security-critical v3 transport tests are part of the published source.
 !core/internal/client/endpoint_pool_test.go
 !core/internal/conf/tls_test.go

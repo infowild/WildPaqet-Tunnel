@@ -4,7 +4,7 @@
 
 **تونل مستقیم TLS 1.3 با fallback سخت‌سازی‌شدهٔ Raw-KCP**
 
-[![Version](https://img.shields.io/badge/version-9.0--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.1--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
@@ -84,8 +84,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wi
 تعویض خودکار toolchain استفاده می‌کند یا نسخهٔ رسمی Go را با بررسی checksum در
 `/opt/wildpaqet-go` قرار می‌دهد؛ Go سیستمی جایگزین نمی‌شود.
 
-### ۲) خارج → گزینه ۲  
-### ۳) ایران → گزینه ۳  
+### ۲) خارج → گزینه ۲
+
+روی هر خارج، کد یک‌خطی `WPQ3` را که ویزارد نمایش می‌دهد کپی کن. Secret یکسان را جداگانه نگه دار.
+
+### ۳) ایران → گزینه ۳
+
+حالت پیش‌فرض **Paste pairing code(s)** را انتخاب کن، کدهای چهار خارج را یکی‌یکی paste کن و در پایان Enter خالی بزن. endpointها، بررسی certificate و CA bundle خودکار انجام می‌شوند؛ فقط Secret را یک‌بار وارد می‌کنی.
+
 ### ۴) استفاده روزانه
 
 ```bash
@@ -117,6 +123,8 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 ## ترنسپورت مستقیم TLS در v3
 
 ترنسپورت `tls` مستقیماً از TLS 1.3 استفاده می‌کند و هیچ لایهٔ HTTP یا WebSocket ندارد. گواهی سرور بررسی می‌شود، ALPN قابل‌مشاهده مقدار رایج `h2` دارد، و پیش از شروع smux یک احراز هویت HMAC شامل timestamp و nonce اجرا می‌شود. nonce تکراری یا اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شود. در حالت CA bundle خصوصی، SNI به‌صورت پیش‌فرض ارسال نمی‌شود.
+
+منیجر v9.1 با کد یک‌خطی `WPQ3`، certificate عمومی و endpoint را وارد می‌کند و روی ایران CA bundle را خودکار می‌سازد. این کد نه Shared Secret دارد و نه private key.
 
 برای چهار سرور خارج، کلاینت به‌طور پیش‌فرض برای هر endpoint یک اتصال بیرونی می‌سازد و streamها را round-robin پخش می‌کند. پس از سه خطای متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود؛ زمان توقف حداکثر تا پنج دقیقه رشد می‌کند و فقط یک probe نیمه‌باز اجازه دارد.
 

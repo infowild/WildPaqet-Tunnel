@@ -36,6 +36,9 @@ jobs:
       - name: Verify manager syntax
         run: bash -n wildpaqet.sh
 
+      - name: Test manager pairing code
+        run: bash .github/tests/pairing-code.sh
+
       - name: Test core
         working-directory: core
         run: go test -count=1 ./...

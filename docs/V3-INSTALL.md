@@ -28,21 +28,30 @@ On each Kharej host:
 3. For a private self-signed certificate, use that server's public IP as its certificate name.
 4. Use the same 32+ character shared secret on all four servers.
 5. Keep each generated private key on its own server.
+6. Copy the single-line `WPQ3` pairing code printed by the wizard. It is also saved beside the certificate as `pairing-code.txt`.
 
-Copy each generated `server.crt` to the Iran server and build a trust bundle:
+For a server configured before manager v9.1, update the manager and choose
+`2 → Export pairing code for an existing v3 server`. The pairing code contains
+only the public endpoint, certificate name and public certificate; it never
+contains the shared secret or `server.key`.
+
+On Iran:
+
+1. Choose `3 → v3 direct TLS`.
+2. Select `Paste pairing code(s)` (the default).
+3. Paste one code from each Kharej server, then submit an empty line.
+4. Enter the shared secret once and choose Port Forward or SOCKS5.
+
+The Iran wizard validates each certificate name, expiry and SHA-256
+fingerprint, imports the endpoints, and creates the protected CA bundle
+automatically. Manual certificate transfer remains available through the
+`Use an existing CA bundle` option:
 
 ```bash
 install -d -m 700 /etc/paqet/tls
 cat kharej-1.crt kharej-2.crt kharej-3.crt kharej-4.crt > /etc/paqet/tls/kharej-ca-bundle.crt
 chmod 600 /etc/paqet/tls/kharej-ca-bundle.crt
 ```
-
-On Iran:
-
-1. Choose `3 → v3 direct TLS`.
-2. Enter all four `IP:port` endpoints in one comma-separated line.
-3. Enter the CA bundle path. Leave server name/SNI empty for the generated private certificates.
-4. Enter the same shared secret.
 
 The client creates one outer connection per endpoint by default and distributes new streams round-robin. After three consecutive failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
 
@@ -54,6 +63,7 @@ The client creates one outer connection per endpoint by default and distributes 
 - A post-TLS HMAC authentication frame uses a timestamp and random nonce.
 - Timestamps outside a two-minute window and reused nonces are rejected before smux starts.
 - Authentication and ALPN negotiation fail closed.
+- Pairing codes contain no shared secret or private key. The shared secret is entered separately on Iran.
 
 Keep the Iran and Kharej clocks synchronized with systemd-timesyncd, chrony, or another NTP client. Do not expose the shared secret in tickets or screenshots.
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.0-v3
+# Version: 9.1-v3
 # Branch: wild-paqet-v3 (direct TLS 1.3 + authenticated multiplexing + endpoint circuit breaker)
 # Direct TLS transport with legacy raw KCP available as an explicit fallback
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.0-v3"
+readonly SCRIPT_VERSION="9.1-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1482,6 +1482,145 @@ generate_v3_tls_certificate() {
     printf '%s\n%s\n' "$cert_file" "$key_file"
 }
 
+# Pairing codes move only public bootstrap data (endpoint, certificate name and
+# server.crt). The shared secret and private key are deliberately excluded.
+v3_validate_endpoint() {
+    local endpoint="$1"
+    local host port
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
+    validate_port "$port" || return 1
+    [[ "$host" =~ ^[A-Za-z0-9.-]+$ || "$host" =~ ^\[[0-9A-Fa-f:]+\]$ ]]
+}
+
+v3_b64_encode() {
+    base64 | tr -d '\r\n'
+}
+
+v3_verify_pairing_certificate() {
+    local cert_file="$1"
+    local identity="$2"
+    local -a verify_name_arg
+    openssl x509 -in "$cert_file" -noout -checkend 0 >/dev/null 2>&1 || return 1
+    if validate_ip "$identity" 2>/dev/null; then
+        verify_name_arg=(-verify_ip "$identity")
+    else
+        verify_name_arg=(-verify_hostname "$identity")
+    fi
+    openssl verify -CAfile "$cert_file" "${verify_name_arg[@]}" "$cert_file" >/dev/null 2>&1
+}
+
+v3_create_pairing_code() {
+    local cert_file="$1"
+    local endpoint="$2"
+    local identity="$3"
+
+    command -v base64 >/dev/null 2>&1 || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    [ -f "$cert_file" ] || return 1
+    v3_validate_endpoint "$endpoint" || return 1
+    [[ "$identity" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    v3_verify_pairing_certificate "$cert_file" "$identity" || return 1
+
+    local endpoint_b64 identity_b64 cert_b64
+    endpoint_b64=$(printf '%s' "$endpoint" | v3_b64_encode) || return 1
+    identity_b64=$(printf '%s' "$identity" | v3_b64_encode) || return 1
+    cert_b64=$(v3_b64_encode < "$cert_file") || return 1
+    printf 'WPQ3|%s|%s|%s\n' "$endpoint_b64" "$identity_b64" "$cert_b64"
+}
+
+# Decode and validate one pairing code. Results are returned in the two globals
+# below and the verified public certificate is written to the requested path.
+V3_PAIR_ENDPOINT=""
+V3_PAIR_IDENTITY=""
+v3_decode_pairing_code() {
+    local code="$1"
+    local cert_out="$2"
+    local prefix endpoint_b64 identity_b64 cert_b64 extra
+    V3_PAIR_ENDPOINT=""
+    V3_PAIR_IDENTITY=""
+
+    [ ${#code} -le 32768 ] || return 1
+    IFS='|' read -r prefix endpoint_b64 identity_b64 cert_b64 extra <<< "$code"
+    [ "$prefix" = "WPQ3" ] && [ -n "$endpoint_b64" ] \
+        && [ -n "$identity_b64" ] && [ -n "$cert_b64" ] && [ -z "$extra" ] || return 1
+
+    V3_PAIR_ENDPOINT=$(printf '%s' "$endpoint_b64" | base64 -d 2>/dev/null) || return 1
+    V3_PAIR_IDENTITY=$(printf '%s' "$identity_b64" | base64 -d 2>/dev/null) || return 1
+    v3_validate_endpoint "$V3_PAIR_ENDPOINT" || return 1
+    [[ "$V3_PAIR_IDENTITY" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    if ! printf '%s' "$cert_b64" | base64 -d > "$cert_out" 2>/dev/null; then
+        rm -f "$cert_out"
+        return 1
+    fi
+    if ! v3_verify_pairing_certificate "$cert_out" "$V3_PAIR_IDENTITY"; then
+        rm -f "$cert_out"
+        return 1
+    fi
+    return 0
+}
+
+v3_certificate_identity() {
+    local cert_file="$1"
+    openssl x509 -in "$cert_file" -noout -subject -nameopt RFC2253 2>/dev/null \
+        | sed -n 's/^subject=.*CN=\([^,]*\).*$/\1/p' | head -1
+}
+
+show_v3_pairing_code() {
+    clear
+    show_banner
+    echo -e "${GREEN}Export v3 pairing code (Kharej)${NC}\n"
+
+    local config_name config_file protocol cert_file listen_addr listen_port
+    local identity public_ip endpoint default_endpoint code pair_file answer
+    read -r -p "Existing v3 service name [server-v3]: " config_name
+    config_name=$(clean_config_name "${config_name:-server-v3}")
+    config_file="$CONFIG_DIR/${config_name}.yaml"
+    [ -f "$config_file" ] || { print_error "Config not found: $config_file"; pause; return 1; }
+    protocol=$(config_transport_protocol "$config_file")
+    [ "$protocol" = "tls" ] || { print_error "Service is not a v3 TLS server"; pause; return 1; }
+    grep -q '^role:[[:space:]]*"server"' "$config_file" 2>/dev/null \
+        || { print_error "Service is not a server"; pause; return 1; }
+
+    cert_file=$(awk '$1 == "cert_file:" { value=$2; gsub(/"/, "", value); print value; exit }' "$config_file")
+    listen_addr=$(awk '
+        /^listen:/ { in_listen=1; next }
+        /^[^[:space:]]/ { if (in_listen) exit }
+        in_listen && $1 == "addr:" { value=$2; gsub(/"/, "", value); print value; exit }
+    ' "$config_file")
+    listen_port="${listen_addr##*:}"
+    if [ ! -f "$cert_file" ] || ! validate_port "$listen_port"; then
+        print_error "Certificate or TLS listen port is missing from the config"
+        pause
+        return 1
+    fi
+
+    identity=$(v3_certificate_identity "$cert_file")
+    read -r -p "Certificate name/IP [${identity}]: " answer
+    identity="${answer:-$identity}"
+    public_ip=$(get_public_ip)
+    default_endpoint="${public_ip}:${listen_port}"
+    [[ "$public_ip" == *:* ]] && default_endpoint="[${public_ip}]:${listen_port}"
+    read -r -p "Public endpoint for Iran [${default_endpoint}]: " endpoint
+    endpoint="${endpoint:-$default_endpoint}"
+    if ! code=$(v3_create_pairing_code "$cert_file" "$endpoint" "$identity"); then
+        print_error "Could not create pairing code; check the endpoint, certificate name and certificate validity"
+        pause
+        return 1
+    fi
+
+    pair_file="$CONFIG_DIR/tls/$config_name/pairing-code.txt"
+    mkdir -p "$(dirname "$pair_file")"
+    chmod 700 "$(dirname "$pair_file")"
+    printf '%s\n' "$code" > "$pair_file"
+    chmod 600 "$pair_file"
+    print_success "Pairing code ready (contains no secret or private key)"
+    echo -e "${YELLOW}Paste this one line into the Iran v3 wizard:${NC}"
+    printf '%s\n' "$code"
+    echo -e "${CYAN}Saved at:${NC} $pair_file"
+    pause
+}
+
 ensure_v3_core() {
     local version=""
     if [ -x "$BIN_DIR/paqet" ]; then
@@ -1497,7 +1636,7 @@ ensure_v3_core() {
         print_warning "WildPaqet Core v3 is not installed"
     fi
     local answer
-    read -p "Build Core v3 from branch ${MANAGER_BRANCH} now? (Y/n): " answer
+    read -r -p "Build Core v3 from branch ${MANAGER_BRANCH} now? (Y/n): " answer
     [[ "$answer" =~ ^[Nn]$ ]] && return 1
     local arch
     arch=$(detect_arch) || return 1
@@ -1509,22 +1648,30 @@ configure_v3_tls_server() {
     show_banner
     echo -e "${GREEN}Configure v3 Direct TLS Server (Kharej)${NC}\n"
 
-    local config_name port secret_key answer identity cert_file key_file svc public_ip
+    local config_name port secret_key answer identity cert_file key_file svc public_ip public_endpoint default_endpoint
 	public_ip=$(get_public_ip)
-    read -p "Service name [server-v3]: " config_name
+    read -r -p "Service name [server-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-server-v3}")
     if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
-        read -p "Config exists. Overwrite? (y/N): " answer
+        read -r -p "Config exists. Overwrite? (y/N): " answer
         [[ ! "$answer" =~ ^[Yy]$ ]] && return 0
     fi
 
-    read -p "TLS listen port [443]: " port
+    read -r -p "TLS listen port [443]: " port
     port="${port:-443}"
     validate_port "$port" || { print_error "Invalid port"; pause; return 1; }
     check_port_conflict "$port" || { pause; return 1; }
 
+    default_endpoint="${public_ip}:${port}"
+    [[ "$public_ip" == *:* ]] && default_endpoint="[${public_ip}]:${port}"
+    read -r -p "Public endpoint for Iran [${default_endpoint}]: " public_endpoint
+    public_endpoint="${public_endpoint:-$default_endpoint}"
+    v3_validate_endpoint "$public_endpoint" \
+        || { print_error "Invalid public endpoint (expected host:port)"; pause; return 1; }
+
     secret_key=$(generate_secret_key)
-    read -p "Shared secret [Enter = generated]: " answer
+    read -r -s -p "Shared secret [Enter = generated]: " answer
+    echo
     [ -n "$answer" ] && secret_key="$answer"
     if [ ${#secret_key} -lt 32 ]; then
         print_error "The v3 shared secret must be at least 32 characters"
@@ -1532,7 +1679,7 @@ configure_v3_tls_server() {
         return 1
     fi
 
-    read -p "Certificate name/IP [$public_ip]: " identity
+    read -r -p "Certificate name/IP [$public_ip]: " identity
     identity="${identity:-$public_ip}"
     if [[ ! "$identity" =~ ^[A-Za-z0-9.-]+$ ]]; then
         print_error "Certificate name may only contain letters, numbers, dot and hyphen"
@@ -1543,12 +1690,12 @@ configure_v3_tls_server() {
     echo "Certificate source:"
     echo " 1. Generate a self-signed certificate (recommended for a private tunnel)"
     echo " 2. Use existing certificate and key"
-    read -p "Choose [1]: " answer
+    read -r -p "Choose [1]: " answer
     answer="${answer:-1}"
     mkdir -p "$CONFIG_DIR"
     if [ "$answer" = "2" ]; then
-        read -p "Certificate path: " cert_file
-        read -p "Private key path: " key_file
+        read -r -p "Certificate path: " cert_file
+        read -r -p "Private key path: " key_file
         [ -f "$cert_file" ] && [ -f "$key_file" ] || {
             print_error "Certificate or key file does not exist"
             pause
@@ -1600,10 +1747,21 @@ configure_v3_tls_server() {
     fi
 
     print_success "v3 TLS server started on TCP/$port"
-    echo -e "${YELLOW}Copy this certificate to the Iran server:${NC} $cert_file"
-    echo -e "${YELLOW}Certificate name:${NC} $identity"
-    echo -e "${YELLOW}Shared secret:${NC} $secret_key"
-    echo "For four Kharej servers, concatenate all four server.crt files into one CA bundle on Iran."
+    local pairing_code pair_file
+    if pairing_code=$(v3_create_pairing_code "$cert_file" "$public_endpoint" "$identity"); then
+        pair_file="$CONFIG_DIR/tls/$config_name/pairing-code.txt"
+        mkdir -p "$(dirname "$pair_file")"
+        chmod 700 "$(dirname "$pair_file")"
+        printf '%s\n' "$pairing_code" > "$pair_file"
+        chmod 600 "$pair_file"
+        echo -e "${YELLOW}Pairing code for the Iran wizard (public data only):${NC}"
+        printf '%s\n' "$pairing_code"
+        echo -e "${CYAN}Saved at:${NC} $pair_file"
+    else
+        print_warning "Could not create a pairing code; use the certificate manually: $cert_file"
+    fi
+    echo -e "${YELLOW}Shared secret (enter separately on Iran):${NC} $secret_key"
+    echo "For four Kharej servers, paste one pairing code from each server into the Iran wizard."
     pause
 }
 
@@ -1613,53 +1771,139 @@ configure_v3_tls_client() {
     echo -e "${GREEN}Configure v3 Direct TLS Client (Iran)${NC}\n"
 
     local config_name endpoints_raw secret_key server_name send_server_name ca_file traffic_type svc
+    local trust_choice endpoint send_sni_answer
+    local bundle_dir bundle_tmp pair_code cert_tmp pair_count fingerprint duplicate imported_endpoint
     local -a endpoints forward_entries socks5_entries
-    read -p "Service name [iran-v3]: " config_name
+    read -r -p "Service name [iran-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-iran-v3}")
     if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
-        read -p "Config exists. Overwrite? (y/N): " endpoints_raw
+        read -r -p "Config exists. Overwrite? (y/N): " endpoints_raw
         [[ ! "$endpoints_raw" =~ ^[Yy]$ ]] && return 0
     fi
 
-    echo "Enter all Kharej endpoints. Four endpoints are recommended for your topology."
-    read -p "Endpoints (comma-separated IP:port): " endpoints_raw
-    IFS=',' read -ra endpoints <<< "$endpoints_raw"
-    local -a clean_endpoints=()
-    local endpoint host port
-    for endpoint in "${endpoints[@]}"; do
-        endpoint=$(echo "$endpoint" | xargs)
-        host="${endpoint%:*}"
-        port="${endpoint##*:}"
-        if [ -n "$host" ] && validate_port "$port"; then
-            clean_endpoints+=("$endpoint")
-        else
-            print_error "Invalid endpoint: $endpoint"
+    endpoints=()
+    ca_file=""
+    server_name=""
+    send_server_name="false"
+    echo "Kharej certificate setup:"
+    echo " 1. Paste pairing code(s) from Kharej (recommended, automatic bundle)"
+    echo " 2. Use an existing CA bundle"
+    echo " 3. Use the system trust store (public certificate)"
+    read -r -p "Choose [1]: " trust_choice
+    trust_choice="${trust_choice:-1}"
+
+    if [ "$trust_choice" = "1" ]; then
+        if ! command -v base64 >/dev/null 2>&1 || ! command -v openssl >/dev/null 2>&1; then
+            print_error "base64 and OpenSSL are required to import pairing codes"
             pause
             return 1
         fi
-    done
-    endpoints=("${clean_endpoints[@]}")
-    [ ${#endpoints[@]} -gt 0 ] || { print_error "At least one endpoint is required"; pause; return 1; }
+        bundle_dir="$CONFIG_DIR/tls/$config_name"
+        mkdir -p "$bundle_dir"
+        chmod 700 "$bundle_dir"
+        bundle_tmp="$bundle_dir/.kharej-ca-bundle.$$"
+        : > "$bundle_tmp"
+        chmod 600 "$bundle_tmp"
+        pair_count=0
+        echo "Paste one WPQ3 pairing code from each Kharej server."
+        echo "Press Enter on an empty line when all codes are imported."
+        while true; do
+            read -r -p "Pairing code #$((pair_count + 1)): " pair_code
+            if [ -z "$pair_code" ]; then
+                [ "$pair_count" -gt 0 ] && break
+                print_warning "At least one pairing code is required"
+                continue
+            fi
+            [ "$pair_count" -lt 16 ] || {
+                print_error "A maximum of 16 Kharej endpoints is supported by the wizard"
+                rm -f "$bundle_tmp"
+                pause
+                return 1
+            }
+            cert_tmp="$bundle_dir/.pair-cert-${pair_count}.$$"
+            if ! v3_decode_pairing_code "$pair_code" "$cert_tmp"; then
+                rm -f "$cert_tmp"
+                print_warning "Invalid/expired pairing code or certificate-name mismatch; try again"
+                continue
+            fi
+            imported_endpoint="$V3_PAIR_ENDPOINT"
+            duplicate=0
+            for endpoint in "${endpoints[@]}"; do
+                [ "$endpoint" = "$imported_endpoint" ] && duplicate=1
+            done
+            if [ "$duplicate" -eq 1 ]; then
+                rm -f "$cert_tmp"
+                print_warning "Endpoint already imported: $imported_endpoint"
+                continue
+            fi
+            cat "$cert_tmp" >> "$bundle_tmp"
+            printf '\n' >> "$bundle_tmp"
+            fingerprint=$(openssl x509 -in "$cert_tmp" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')
+            rm -f "$cert_tmp"
+            endpoints+=("$imported_endpoint")
+            pair_count=$((pair_count + 1))
+            print_success "Imported $imported_endpoint ($V3_PAIR_IDENTITY)"
+            echo -e "  ${CYAN}SHA-256:${NC} $fingerprint"
+        done
+        # Use a versioned bundle so an aborted overwrite cannot break the
+        # currently running service, which may still reference an older file.
+        ca_file="$bundle_dir/kharej-ca-bundle-$(date +%Y%m%d%H%M%S)-$$.crt"
+        if ! mv -f "$bundle_tmp" "$ca_file"; then
+            rm -f "$bundle_tmp"
+            print_error "Could not install the generated CA bundle"
+            pause
+            return 1
+        fi
+        chmod 600 "$ca_file"
+        print_success "CA bundle built automatically: $ca_file"
+    elif [ "$trust_choice" = "2" ] || [ "$trust_choice" = "3" ]; then
+        echo "Enter all Kharej endpoints. Four endpoints are recommended for your topology."
+        read -r -p "Endpoints (comma-separated IP:port): " endpoints_raw
+        IFS=',' read -ra endpoints <<< "$endpoints_raw"
+        local -a clean_endpoints=()
+        for endpoint in "${endpoints[@]}"; do
+            endpoint=$(echo "$endpoint" | xargs)
+            if v3_validate_endpoint "$endpoint"; then
+                clean_endpoints+=("$endpoint")
+            else
+                print_error "Invalid endpoint: $endpoint"
+                pause
+                return 1
+            fi
+        done
+        endpoints=("${clean_endpoints[@]}")
+        [ ${#endpoints[@]} -gt 0 ] || { print_error "At least one endpoint is required"; pause; return 1; }
 
-    read -p "CA bundle path (Enter = system trust store): " ca_file
-    if [ -n "$ca_file" ] && [ ! -f "$ca_file" ]; then
-        print_error "CA bundle does not exist: $ca_file"
+        if [ "$trust_choice" = "2" ]; then
+            read -r -p "Existing CA bundle path: " ca_file
+            if [ -z "$ca_file" ] || [ ! -f "$ca_file" ]; then
+                print_error "CA bundle does not exist: $ca_file"
+                pause
+                return 1
+            fi
+            read -r -p "Certificate server name (Enter = CA-bundle verification only): " server_name
+            if [ -n "$server_name" ]; then
+                read -r -p "Send this name as TLS SNI? (y/N): " send_sni_answer
+                [[ "$send_sni_answer" =~ ^[Yy]$ ]] && send_server_name="true"
+            fi
+        else
+            read -r -p "Certificate server name (required): " server_name
+            [ -n "$server_name" ] || {
+                print_error "A certificate server name is required with the system trust store"
+                pause
+                return 1
+            }
+            read -r -p "Send this name as TLS SNI? (Y/n): " send_sni_answer
+            [[ ! "$send_sni_answer" =~ ^[Nn]$ ]] && send_server_name="true"
+        fi
+    else
+        print_error "Invalid certificate setup choice"
         pause
         return 1
     fi
-	read -p "Certificate server name (Enter = CA-bundle verification only): " server_name
-	send_server_name="false"
-	if [ -z "$ca_file" ] && [ -z "$server_name" ]; then
-		print_error "A certificate server name is required with the system trust store"
-		pause
-		return 1
-	fi
-	if [ -n "$server_name" ]; then
-		local send_sni_answer
-		read -p "Send this name as TLS SNI? (y/N): " send_sni_answer
-		[[ "$send_sni_answer" =~ ^[Yy]$ ]] && send_server_name="true"
-	fi
-    read -p "Shared secret from Kharej: " secret_key
+
+    read -r -s -p "Shared secret from Kharej: " secret_key
+    echo
     if [ ${#secret_key} -lt 32 ]; then
         print_error "The v3 shared secret must be at least 32 characters"
         pause
@@ -1669,18 +1913,18 @@ configure_v3_tls_client() {
     echo "Traffic mode:"
     echo " 1. TCP port forwarding"
     echo " 2. SOCKS5 proxy"
-    read -p "Choose [1]: " traffic_type
+    read -r -p "Choose [1]: " traffic_type
     traffic_type="${traffic_type:-1}"
     forward_entries=()
     socks5_entries=()
     if [ "$traffic_type" = "2" ]; then
         local socks_port socks_user socks_pass
-        read -p "SOCKS5 port [1080]: " socks_port
+        read -r -p "SOCKS5 port [1080]: " socks_port
         socks_port="${socks_port:-1080}"
         validate_port "$socks_port" || { print_error "Invalid SOCKS5 port"; pause; return 1; }
-        read -p "SOCKS5 username (Enter = none): " socks_user
+        read -r -p "SOCKS5 username (Enter = none): " socks_user
         if [ -n "$socks_user" ]; then
-            read -s -p "SOCKS5 password: " socks_pass; echo
+            read -r -s -p "SOCKS5 password: " socks_pass; echo
             [ -n "$socks_pass" ] || { print_error "Password is required"; pause; return 1; }
             socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"\n    username: \"$socks_user\"\n    password: \"$socks_pass\"")
         else
@@ -1689,7 +1933,7 @@ configure_v3_tls_client() {
         configure_tls_firewall "$socks_port" || true
     else
         local forward_ports p
-        read -p "TCP forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
+        read -r -p "TCP forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
         forward_ports=$(clean_port_list "${forward_ports:-$DEFAULT_V2RAY_PORTS}")
         [ -n "$forward_ports" ] || { print_error "No valid forward port"; pause; return 1; }
         IFS=',' read -ra _v3_ports <<< "$forward_ports"
@@ -1759,12 +2003,14 @@ configure_server() {
     echo -e "${CYAN}Transport:${NC}"
     echo " 1. v3 direct TLS (recommended, no WebSocket)"
     echo " 2. Legacy raw KCP/pcap"
+    echo " 3. Export pairing code for an existing v3 server"
     echo " 0. Back"
     local transport_choice
     read -p "Choose [1]: " transport_choice
     case "${transport_choice:-1}" in
         1) configure_v3_tls_server; return ;;
         2) ;;
+        3) show_v3_pairing_code; return ;;
         0) return ;;
         *) print_error "Invalid transport"; pause; return ;;
     esac
@@ -2996,7 +3242,7 @@ check_dependencies() {
     local os
     os=$(detect_os)
     
-    local common_deps=("curl" "wget" "iptables" "lsof")
+    local common_deps=("curl" "wget" "iptables" "lsof" "openssl" "base64")
     
     case $os in
         ubuntu|debian)
@@ -3038,7 +3284,7 @@ install_dependencies() {
             apt update -qq >/dev/null 2>&1 || true
             
             print_info "Installing base packages..."
-            apt install -y curl wget libpcap-dev iptables lsof iproute2 cron dnsutils >/dev/null 2>&1 || {
+            apt install -y curl wget openssl coreutils libpcap-dev iptables lsof iproute2 cron dnsutils >/dev/null 2>&1 || {
                 print_warning "Some base packages may have failed to install"
             }
             
@@ -3048,7 +3294,7 @@ install_dependencies() {
             
         centos|rhel|fedora|rocky|almalinux)
             print_info "Installing base packages..."
-            yum install -y curl wget libpcap-devel iptables lsof iproute cronie bind-utils >/dev/null 2>&1 || {
+            yum install -y curl wget openssl coreutils libpcap-devel iptables lsof iproute cronie bind-utils >/dev/null 2>&1 || {
                 print_warning "Some base packages may have failed to install"
             }
             
