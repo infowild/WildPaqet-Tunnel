@@ -25,7 +25,7 @@ On each Kharej host:
 
 1. Choose `2 → v3 HTTP/2-covered TLS`.
 2. Use TCP port `443` when it is free.
-3. Use a publicly trusted certificate and a DNS name that resolves to the server. A self-signed certificate is retained for testing but is visible to an active probe. The wizard lists the certificate/key pairs it finds under Certbot, acme.sh and the common panel directories, verifies that each key belongs to its certificate, and offers to adopt the certificate's own name when it does not cover the name you entered; manual paths remain available as option `0`.
+3. Use a publicly trusted certificate and a DNS name that resolves to the server. A self-signed certificate is retained for testing but is visible to an active probe. The wizard lists the certificate/key pairs it finds under Certbot, acme.sh and the common panel directories, verifies that each key belongs to its certificate, and automatically uses the pair that covers the certificate/SNI domain you entered; a picker appears only when that domain is not installed.
 4. Use the same certificate name and 32+ character shared secret on all four servers. The wizard then derives the same opaque HTTP/2 cover path automatically. The path is pairing metadata, not an authentication secret.
 5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a built-in page is served.
 6. Keep each private key on its own server.

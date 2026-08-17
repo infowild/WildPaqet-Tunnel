@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.7-v3
+# Version: 9.8-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.7-v3"
+readonly SCRIPT_VERSION="9.8-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1972,29 +1972,70 @@ v3_certificate_covers_name() {
 	return 1
 }
 
+# Lower is better. Exact SAN/CN beats a wildcard, and a fullchain file from
+# Certbot or /root/cert beats a duplicate acme.sh copy of the same leaf.
+v3_certificate_pair_score() {
+	local cert_file="$1"
+	local names_csv="$2"
+	local identity="${3,,}"
+	local score=100 name
+	while IFS= read -r name; do
+		name="${name,,}"
+		[ "$name" = "$identity" ] && score=$((score - 50)) && break
+	done < <(printf '%s\n' "$names_csv" | tr ',' '\n')
+	case "$cert_file" in
+		*/letsencrypt/live/*/fullchain.pem) score=$((score - 30)) ;;
+		*/fullchain.pem) score=$((score - 20)) ;;
+		*/fullchain.cer) score=$((score - 10)) ;;
+	esac
+	printf '%s\n' "$score"
+}
+
+# Pick the best cert/key pair that already covers the domain the operator named.
+v3_select_certificate_for_identity() {
+	local identity="$1"
+	local pair_line cert_file key_file names expiry score best_score=9999 best_line=""
+	[ -n "$identity" ] || return 1
+	while IFS= read -r pair_line; do
+		[ -n "$pair_line" ] || continue
+		IFS='|' read -r cert_file key_file names expiry <<< "$pair_line"
+		v3_certificate_covers_name "$names" "$identity" || continue
+		score=$(v3_certificate_pair_score "$cert_file" "$names" "$identity")
+		if [ "$score" -lt "$best_score" ]; then
+			best_score="$score"
+			best_line="$pair_line"
+		fi
+	done < <(v3_find_certificate_pairs)
+	[ -n "$best_line" ] || return 1
+	printf '%s\n' "$best_line"
+}
+
 # Emit "cert|key|names|expiry" for every usable pair found on this server.
 v3_find_certificate_pairs() {
 	command -v openssl >/dev/null 2>&1 || return 0
 	local pattern cert key names enddate
-	{
-		while IFS= read -r pattern; do
-			[ -n "$pattern" ] || continue
-			while IFS= read -r cert; do
-				[ -f "$cert" ] || continue
-				openssl x509 -in "$cert" -noout >/dev/null 2>&1 </dev/null || continue
-				while IFS= read -r key; do
-					[ -f "$key" ] || continue
-					v3_certificate_key_matches "$cert" "$key" || continue
-					names=$(v3_certificate_names "$cert" | tr '\n' ',' | sed 's/,$//')
-					enddate=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null </dev/null | cut -d= -f2)
-					printf '%s|%s|%s|%s\n' "$cert" "$key" "$names" "$enddate"
-					break
-				done < <(v3_certificate_key_candidates "$cert")
-			done < <(compgen -G "$pattern" 2>/dev/null || true)
-		done < <(v3_certificate_search_globs)
-	# A leaf and its fullchain share one key; keep only the first, which the
-	# glob order lists as the chain file.
-	} | awk -F'|' '!seen[$2]++'
+	local -a lines=()
+	while IFS= read -r pattern || [ -n "$pattern" ]; do
+		[ -n "$pattern" ] || continue
+		while IFS= read -r cert || [ -n "$cert" ]; do
+			[ -f "$cert" ] || continue
+			openssl x509 -in "$cert" -noout >/dev/null 2>&1 </dev/null || continue
+			while IFS= read -r key || [ -n "$key" ]; do
+				[ -f "$key" ] || continue
+				v3_certificate_key_matches "$cert" "$key" || continue
+				names=$(v3_certificate_names "$cert" | tr '\n' ',' | sed 's/,$//')
+				enddate=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null </dev/null | cut -d= -f2)
+				lines+=("$cert|$key|$names|$enddate")
+				break
+			done < <(v3_certificate_key_candidates "$cert")
+		done < <(compgen -G "$pattern" 2>/dev/null || true)
+	done < <(v3_certificate_search_globs)
+	if [ ${#lines[@]} -gt 0 ]; then
+		# A leaf and its fullchain share one key; keep only the first, which the
+		# glob order lists as the chain file.
+		printf '%s\n' "${lines[@]}" | awk -F'|' 'NF >= 3 && !seen[$2]++'
+	fi
+	return 0
 }
 
 configure_v3_tls_server() {
@@ -2034,7 +2075,7 @@ configure_v3_tls_server() {
         return 1
     fi
 
-    read -r -p "Certificate name/IP [$public_ip]: " identity
+    read -r -p "Certificate/SNI domain [$public_ip]: " identity
     identity="${identity:-$public_ip}"
     if [[ ! "$identity" =~ ^[A-Za-z0-9.-]+$ ]]; then
         print_error "Certificate name may only contain letters, numbers, dot and hyphen"
@@ -2074,36 +2115,38 @@ configure_v3_tls_server() {
 	if [ "$answer" = "1" ]; then
 		local -a found_pairs=()
 		local pair_line pair_cert pair_key pair_names pair_expiry
-		local cert_choice default_choice=0 index=1
+		local cert_choice index=1
 		local selected_names="" suggested_name=""
 		cert_file=""
 		key_file=""
-		print_step "Looking for existing certificates (Certbot, acme.sh, panels)..."
-		mapfile -t found_pairs < <(v3_find_certificate_pairs)
-
-		if [ ${#found_pairs[@]} -gt 0 ]; then
-			echo "Detected certificate/key pairs:"
-			for pair_line in "${found_pairs[@]}"; do
-				IFS='|' read -r pair_cert pair_key pair_names pair_expiry <<< "$pair_line"
-				printf ' %d. %s\n' "$index" "$pair_cert"
-				printf '    key: %s\n' "$pair_key"
-				printf '    names: %s | expires: %s\n' "${pair_names:-unknown}" "${pair_expiry:-unknown}"
-				if [ "$default_choice" -eq 0 ] && v3_certificate_covers_name "$pair_names" "$identity"; then
-					default_choice="$index"
-				fi
-				index=$((index + 1))
-			done
-			echo " 0. Enter the certificate and key paths manually"
-			[ "$default_choice" -eq 0 ] && default_choice=1
-			read -r -p "Choose [$default_choice]: " cert_choice
-			cert_choice="${cert_choice:-$default_choice}"
-			if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] \
-				&& [ "$cert_choice" -le ${#found_pairs[@]} ]; then
-				IFS='|' read -r cert_file key_file selected_names pair_expiry \
-					<<< "${found_pairs[$((cert_choice - 1))]}"
-			fi
+		print_step "Looking for a certificate that covers $identity..."
+		if pair_line=$(v3_select_certificate_for_identity "$identity"); then
+			IFS='|' read -r cert_file key_file selected_names pair_expiry <<< "$pair_line"
+			print_success "Matched $identity without asking for a path"
+			echo "  cert: $cert_file"
+			echo "  key:  $key_file"
+			echo "  expires: ${pair_expiry:-unknown}"
 		else
-			print_warning "No certificate/key pair was found in the usual Certbot, acme.sh or panel locations"
+			print_warning "No installed certificate covers '$identity'"
+			mapfile -t found_pairs < <(v3_find_certificate_pairs)
+			if [ ${#found_pairs[@]} -gt 0 ]; then
+				echo "Other certificate/key pairs on this server:"
+				for pair_line in "${found_pairs[@]}"; do
+					IFS='|' read -r pair_cert pair_key pair_names pair_expiry <<< "$pair_line"
+					printf ' %d. %s\n' "$index" "$pair_cert"
+					printf '    key: %s\n' "$pair_key"
+					printf '    names: %s | expires: %s\n' "${pair_names:-unknown}" "${pair_expiry:-unknown}"
+					index=$((index + 1))
+				done
+				echo " 0. Enter the certificate and key paths manually"
+				read -r -p "Choose [0]: " cert_choice
+				cert_choice="${cert_choice:-0}"
+				if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] \
+					&& [ "$cert_choice" -le ${#found_pairs[@]} ]; then
+					IFS='|' read -r cert_file key_file selected_names pair_expiry \
+						<<< "${found_pairs[$((cert_choice - 1))]}"
+				fi
+			fi
 		fi
 
 		if [ -z "$cert_file" ] || [ -z "$key_file" ]; then

@@ -77,4 +77,27 @@ if v3_certificate_covers_name 'pay.wilduser.org' 'other.example.com'; then
 	exit 1
 fi
 
+selected=$(v3_select_certificate_for_identity 'pay.wilduser.org')
+test "$(printf '%s' "$selected" | cut -d'|' -f1)" = "$test_dir/letsencrypt/live/pay.wilduser.org-0001/fullchain.pem"
+selected=$(v3_select_certificate_for_identity 'cdn.wilduser.org')
+test "$(printf '%s' "$selected" | cut -d'|' -f1)" = "$test_dir/acme/cdn.wilduser.org_ecc/fullchain.cer"
+if v3_select_certificate_for_identity 'missing.example.com' >/dev/null; then
+	echo 'a missing domain was matched' >&2
+	exit 1
+fi
+
+# Two copies of the same name: prefer the fullchain.pem layout over acme.sh.
+mkdir -p "$test_dir/rootcert/pay.wilduser.org"
+cp "$test_dir/letsencrypt/live/pay.wilduser.org-0001/fullchain.pem" \
+	"$test_dir/rootcert/pay.wilduser.org/fullchain.pem"
+cp "$test_dir/letsencrypt/live/pay.wilduser.org-0001/privkey.pem" \
+	"$test_dir/rootcert/pay.wilduser.org/privkey.pem"
+export WILDPAQET_CERT_GLOBS="$test_dir/acme/*/fullchain.cer:$test_dir/rootcert/*/fullchain.pem"
+selected=$(v3_select_certificate_for_identity 'pay.wilduser.org')
+test "$(printf '%s' "$selected" | cut -d'|' -f1)" = "$test_dir/rootcert/pay.wilduser.org/fullchain.pem"
+
+export WILDPAQET_CERT_GLOBS="$test_dir/letsencrypt/live/*/fullchain.pem:$test_dir/rootcert/*/fullchain.pem"
+selected=$(v3_select_certificate_for_identity 'pay.wilduser.org')
+test "$(printf '%s' "$selected" | cut -d'|' -f1)" = "$test_dir/letsencrypt/live/pay.wilduser.org-0001/fullchain.pem"
+
 echo 'certificate-discovery: PASS'
