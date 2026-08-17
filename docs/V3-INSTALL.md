@@ -29,7 +29,7 @@ On each Kharej host:
 4. Use the same certificate name and 32+ character shared secret on all four servers. The wizard then derives the same opaque HTTP/2 cover path automatically. The path is pairing metadata, not an authentication secret.
 5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a built-in page is served.
 6. Keep each private key on its own server.
-7. Copy the single-line `WPQ4` pairing code printed by the wizard. It is also saved beside the certificate as `pairing-code.txt`.
+7. Copy the `WPQ4` pairing code printed by the wizard. A code that carries a certificate chain is longer than a terminal can accept on one line, so it is printed as a block of 120-character lines that ends with `WPQEND`; copy the whole block. It is also saved beside the certificate as `pairing-code.txt`, which can be copied to Iran with `scp` instead.
 
 The core reloads certificate/key files when they change, so Certbot or another ACME client can renew them without a Paqet restart.
 
@@ -42,7 +42,7 @@ On Iran:
 
 1. Choose `3 → v3 HTTP/2-covered TLS`.
 2. Select `Paste pairing code(s)` (the default).
-3. Paste one code from each Kharej server, then submit an empty line.
+3. Paste one code from each Kharej server, then submit an empty line. A wrapped code is pasted as a whole block including its `WPQEND` line, and the path of a `pairing-code.txt` copied from Kharej is accepted in place of a paste.
 4. Choose the outer connections per Kharej. Four is the recommended default.
 5. Enter the shared secret once and choose Port Forward or SOCKS5.
 
@@ -57,7 +57,7 @@ cat kharej-1.crt kharej-2.crt kharej-3.crt kharej-4.crt > /etc/paqet/tls/kharej-
 chmod 600 /etc/paqet/tls/kharej-ca-bundle.crt
 ```
 
-Manager v9.3 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. HTTP/2 connections have jittered startup, keepalive and maximum age. Rotation installs the replacement first and drains existing streams from the old connection. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
+Manager v9.5 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. HTTP/2 connections have jittered startup, keepalive and maximum age. Rotation installs the replacement first and drains existing streams from the old connection. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
 
 Choose two connections per endpoint for low traffic, four for balanced traffic, or eight for high concurrency on a larger Iran VPS. More connections reduce the head-of-line impact of loss on one outer TCP flow, but they do not repair a poor route or create bandwidth. Size the Iran host by simultaneous throughput, not registered users; use a 1-vCPU/1-GB VPS only for testing and load-test production starting around 4 vCPU / 4 GB.
 

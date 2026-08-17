@@ -92,13 +92,13 @@ toolchain switching or downloads a checksum-verified official compiler under
 1. Option **2** → **v3 HTTP/2-covered TLS**
 2. Use the same public certificate name and shared secret on all Kharej servers
 3. Prefer a publicly trusted certificate; self-signed mode is for testing
-4. Copy the one-line `WPQ4` pairing code printed by each server
+4. Copy the `WPQ4` pairing code printed by each server; a code that carries a certificate chain is printed as a block of lines ending with `WPQEND`, and copying every line of it (or the saved `pairing-code.txt` file) keeps it intact
 
 ### 3) Iran
 
 1. Option **3** → **v3 HTTP/2-covered TLS**
 2. Choose the default **Paste pairing code(s)** option
-3. Paste the four codes and submit an empty line; endpoints and the CA bundle are created automatically
+3. Paste the four codes and submit an empty line; endpoints and the CA bundle are created automatically. A wrapped code may be pasted as a whole block, and a path to a `pairing-code.txt` copied with `scp` is accepted instead of a paste
 4. Keep the recommended four outer connections per Kharej (16 total for four endpoints)
 5. Enter the shared secret once, then choose Port Forward or SOCKS5
 
@@ -165,7 +165,7 @@ Unknown or unauthenticated HTTP requests receive a normal built-in page or an op
 
 Certificate and key files are checked on each new TLS handshake and reloaded after ACME/Certbot replaces them; routine certificate renewal therefore does not require a Paqet restart.
 
-Manager v9.3 uses one-line `WPQ4` pairing codes containing the endpoint, public certificate name, opaque cover path and public certificate. They contain neither the shared secret nor private key. The cover path is routing metadata, not an authentication secret. All endpoints in one pool must use the same certificate name, cover path and shared secret. The wizard derives the default path from the certificate name and shared secret, so matching Kharej nodes get the same path automatically. Legacy `WPQ3` / `mode: direct` configurations remain supported but do not provide the HTTP/2 cover.
+Manager v9.5 uses `WPQ4` pairing codes containing the endpoint, public certificate name, opaque cover path and public certificate. A code that carries a certificate chain does not fit on one terminal line, so it is printed as a block ending with `WPQEND` and reassembled on import; `pairing-code.txt` can be copied with `scp` instead. They contain neither the shared secret nor private key. The cover path is routing metadata, not an authentication secret. All endpoints in one pool must use the same certificate name, cover path and shared secret. The wizard derives the default path from the certificate name and shared secret, so matching Kharej nodes get the same path automatically. Legacy `WPQ3` / `mode: direct` configurations remain supported but do not provide the HTTP/2 cover.
 
 Four outer connections per Kharej endpoint distribute new streams round-robin. A background supervisor rebuilds closed slots. HTTP/2 connections rotate after a jittered lifetime; the replacement enters the pool first and the old connection drains existing streams before closing. Connection startup and smux keepalives are also jittered. Three consecutive dial failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
 

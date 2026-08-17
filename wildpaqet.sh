@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.4-v3
+# Version: 9.5-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.4-v3"
+readonly SCRIPT_VERSION="9.5-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1613,51 +1613,126 @@ v3_create_pairing_code() {
 	fi
 }
 
-# Decode and validate one pairing code. Results are returned in the two globals
+# A pasted code picks up terminal wrapping, CRLF from a Windows clipboard and
+# shell quotes. None of those characters belong to the base64 payload, so they
+# are removed before parsing instead of being reported as a broken code.
+v3_sanitize_pairing_code() {
+	local code="$1"
+	code="${code//[$' \t\r\n\v\f']/}"
+	code="${code//\"/}"
+	code="${code//\'/}"
+	printf '%s' "$code"
+}
+
+# Marks the end of a wrapped code so the Iran wizard knows the paste is whole
+# and never imports a chain that stopped at an intermediate certificate.
+V3_PAIR_BLOCK_END="WPQEND"
+
+# A terminal line editor discards everything past ~4095 characters, so a code
+# that carries a real certificate chain can never be pasted as one line.
+v3_print_pairing_code() {
+	local code="$1"
+	local offset
+	if [ ${#code} -lt 3000 ]; then
+		printf '%s\n' "$code"
+		return 0
+	fi
+	print_warning "This code is ${#code} characters and will be cut if pasted as a single line"
+	echo "Copy every line of the block below, including the last one, into the Iran wizard."
+	for ((offset = 0; offset < ${#code}; offset += 120)); do
+		printf '%s\n' "${code:offset:120}"
+	done
+	printf '%s\n' "$V3_PAIR_BLOCK_END"
+}
+
+v3_pairing_error_text() {
+	case "$1" in
+		incomplete) printf '%s' "the code is only partly pasted; the terminal cut the line" ;;
+		too-long)   printf '%s' "the code is larger than the supported maximum" ;;
+		version)    printf '%s' "this code was made by a different WildPaqet version; update Iran and Kharej to the same release" ;;
+		format)     printf '%s' "this is not a pairing code (it must start with WPQ4| or WPQ3|)" ;;
+		endpoint)   printf '%s' "the endpoint inside the code is not a valid host:port" ;;
+		identity)   printf '%s' "the certificate name inside the code is invalid" ;;
+		cover-path) printf '%s' "the HTTP/2 cover path inside the code is invalid" ;;
+		expired)    printf '%s' "the Kharej certificate has expired, or this server's clock is wrong" ;;
+		name)       printf '%s' "the certificate does not match its name, or its chain cannot be verified here" ;;
+		*)          printf '%s' "the pairing code could not be verified" ;;
+	esac
+}
+
+# Decode and validate one pairing code. Results are returned in the globals
 # below and the verified public certificate is written to the requested path.
+# V3_PAIR_ERROR reports why a decode failed; "incomplete" is the normal state
+# while a wrapped code is still being pasted line by line.
 V3_PAIR_ENDPOINT=""
 V3_PAIR_IDENTITY=""
 V3_PAIR_MODE=""
 V3_PAIR_COVER_PATH=""
+V3_PAIR_ERROR=""
 v3_decode_pairing_code() {
-    local code="$1"
-    local cert_out="$2"
+	local code cert_out
 	local prefix endpoint_b64 identity_b64 field3 field4 extra cert_b64 path_b64
+	code=$(v3_sanitize_pairing_code "$1")
+	cert_out="$2"
     V3_PAIR_ENDPOINT=""
     V3_PAIR_IDENTITY=""
 	V3_PAIR_MODE=""
 	V3_PAIR_COVER_PATH=""
+	V3_PAIR_ERROR="incomplete"
 
-    [ ${#code} -le 32768 ] || return 1
+	[ ${#code} -le 32768 ] || { V3_PAIR_ERROR="too-long"; return 1; }
 	IFS='|' read -r prefix endpoint_b64 identity_b64 field3 field4 extra <<< "$code"
-	if [ "$prefix" = "WPQ4" ]; then
-		path_b64="$field3"
-		cert_b64="$field4"
-		[ -n "$path_b64" ] && [ -n "$cert_b64" ] && [ -z "$extra" ] || return 1
-		V3_PAIR_COVER_PATH=$(printf '%s' "$path_b64" | base64 -d 2>/dev/null) || return 1
-		v3_validate_cover_path "$V3_PAIR_COVER_PATH" || return 1
-		V3_PAIR_MODE="h2"
-	elif [ "$prefix" = "WPQ3" ]; then
-		cert_b64="$field3"
-		[ -n "$cert_b64" ] && [ -z "$field4" ] && [ -z "$extra" ] || return 1
-		V3_PAIR_MODE="direct"
-	else
-		return 1
-	fi
+	case "$prefix" in
+		WPQ4)
+			path_b64="$field3"
+			cert_b64="$field4"
+			[ -n "$path_b64" ] && [ -n "$cert_b64" ] && [ -z "$extra" ] || return 1
+			V3_PAIR_COVER_PATH=$(printf '%s' "$path_b64" | base64 -d 2>/dev/null) || return 1
+			v3_validate_cover_path "$V3_PAIR_COVER_PATH" || { V3_PAIR_ERROR="cover-path"; return 1; }
+			V3_PAIR_MODE="h2"
+			;;
+		WPQ3)
+			cert_b64="$field3"
+			[ -n "$cert_b64" ] && [ -z "$field4" ] && [ -z "$extra" ] || return 1
+			V3_PAIR_MODE="direct"
+			;;
+		WPQ?*)
+			V3_PAIR_ERROR="version"
+			return 1
+			;;
+		*)
+			[ -z "$prefix" ] || V3_PAIR_ERROR="format"
+			return 1
+			;;
+	esac
 	[ -n "$endpoint_b64" ] && [ -n "$identity_b64" ] || return 1
 
     V3_PAIR_ENDPOINT=$(printf '%s' "$endpoint_b64" | base64 -d 2>/dev/null) || return 1
     V3_PAIR_IDENTITY=$(printf '%s' "$identity_b64" | base64 -d 2>/dev/null) || return 1
-    v3_validate_endpoint "$V3_PAIR_ENDPOINT" || return 1
-    [[ "$V3_PAIR_IDENTITY" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+	v3_validate_endpoint "$V3_PAIR_ENDPOINT" || { V3_PAIR_ERROR="endpoint"; return 1; }
+	[[ "$V3_PAIR_IDENTITY" =~ ^[A-Za-z0-9.-]+$ ]] || { V3_PAIR_ERROR="identity"; return 1; }
     if ! printf '%s' "$cert_b64" | base64 -d > "$cert_out" 2>/dev/null; then
         rm -f "$cert_out"
         return 1
     fi
+	# A half-pasted code still decodes to bytes, so a truncated certificate must
+	# stay "incomplete" and never be reported as an expired or mismatched one.
+	if ! openssl x509 -in "$cert_out" -noout >/dev/null 2>&1 \
+		|| ! tail -c 64 "$cert_out" | tr -d '\r\n' | grep -q -- '-----END CERTIFICATE-----'; then
+		rm -f "$cert_out"
+		return 1
+	fi
+	if ! openssl x509 -in "$cert_out" -noout -checkend 0 >/dev/null 2>&1; then
+		rm -f "$cert_out"
+		V3_PAIR_ERROR="expired"
+		return 1
+	fi
     if ! v3_verify_pairing_certificate "$cert_out" "$V3_PAIR_IDENTITY"; then
         rm -f "$cert_out"
+		V3_PAIR_ERROR="name"
         return 1
     fi
+	V3_PAIR_ERROR=""
     return 0
 }
 
@@ -1719,9 +1794,10 @@ show_v3_pairing_code() {
     printf '%s\n' "$code" > "$pair_file"
     chmod 600 "$pair_file"
     print_success "Pairing code ready (contains no secret or private key)"
-    echo -e "${YELLOW}Paste this one line into the Iran v3 wizard:${NC}"
-    printf '%s\n' "$code"
+    echo -e "${YELLOW}Paste this into the Iran v3 wizard:${NC}"
+	v3_print_pairing_code "$code"
     echo -e "${CYAN}Saved at:${NC} $pair_file"
+	echo "The Iran wizard also accepts this file directly if you copy it with scp."
     pause
 }
 
@@ -1912,8 +1988,9 @@ configure_v3_tls_server() {
         printf '%s\n' "$pairing_code" > "$pair_file"
         chmod 600 "$pair_file"
         echo -e "${YELLOW}Pairing code for the Iran wizard (public data only):${NC}"
-        printf '%s\n' "$pairing_code"
+		v3_print_pairing_code "$pairing_code"
         echo -e "${CYAN}Saved at:${NC} $pair_file"
+		echo "The Iran wizard also accepts this file directly if you copy it with scp."
     else
         print_warning "Could not create a pairing code; use the certificate manually: $cert_file"
     fi
@@ -1930,7 +2007,7 @@ configure_v3_tls_client() {
     local config_name endpoints_raw secret_key server_name send_server_name ca_file traffic_type svc
     local connections_per_endpoint total_connections
 	local trust_choice endpoint send_sni_answer cover_mode cover_path carrier_choice imported_identity imported_mode imported_path
-	local bundle_dir bundle_tmp pair_code cert_tmp pair_count fingerprint duplicate imported_endpoint
+	local bundle_dir bundle_tmp pair_code pair_input pair_buffer pair_complete cert_tmp pair_count fingerprint duplicate imported_endpoint
     local -a endpoints forward_entries socks5_entries
     read -r -p "Service name [iran-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-iran-v3}")
@@ -1965,12 +2042,60 @@ configure_v3_tls_client() {
         : > "$bundle_tmp"
         chmod 600 "$bundle_tmp"
         pair_count=0
+		pair_buffer=""
 		echo "Paste one WPQ4 (HTTP/2 cover) pairing code from each Kharej server."
 		echo "Legacy WPQ3 direct-TLS codes are still accepted for compatibility."
+		echo "A code that Kharej printed as a block of lines may be pasted as a whole block"
+		echo "(including its last ${V3_PAIR_BLOCK_END} line); a file path such as /root/pairing-code.txt"
+		echo "copied with scp is also accepted."
         echo "Press Enter on an empty line when all codes are imported."
         while true; do
-            read -r -p "Pairing code #$((pair_count + 1)): " pair_code
-            if [ -z "$pair_code" ]; then
+			if [ -n "$pair_buffer" ]; then
+				read -r -p "  rest of code #$((pair_count + 1)) (Enter = discard): " pair_input
+			else
+				read -r -p "Pairing code #$((pair_count + 1)): " pair_input
+			fi
+			pair_complete=0
+			# A file keeps a long code intact, because a terminal line editor
+			# drops everything past ~4095 characters of a pasted line.
+			if [ -z "$pair_buffer" ] && [ -n "$pair_input" ] && [ -f "$pair_input" ]; then
+				pair_code=$(v3_sanitize_pairing_code "$(cat "$pair_input" 2>/dev/null)")
+				if [ -z "$pair_code" ]; then
+					print_warning "File is empty: $pair_input"
+					continue
+				fi
+				pair_complete=1
+			else
+				pair_code=$(v3_sanitize_pairing_code "$pair_input")
+				if [ "$pair_code" = "$V3_PAIR_BLOCK_END" ]; then
+					pair_code=""
+					pair_complete=1
+				fi
+				# The remaining lines of a wrapped code are already in the
+				# terminal buffer, so the paste is drained before it is decoded
+				# and a chain is never cut at an intermediate certificate.
+				if [ -t 0 ]; then
+					while [ "$pair_complete" -eq 0 ]; do
+						pair_input=""
+						# A timed-out read still returns the start of a line that
+						# was pasted without a closing newline.
+						IFS= read -r -t 0.2 pair_input
+						pair_input=$(v3_sanitize_pairing_code "$pair_input")
+						[ -n "$pair_input" ] || break
+						if [ "$pair_input" = "$V3_PAIR_BLOCK_END" ]; then
+							pair_complete=1
+							break
+						fi
+						pair_code="${pair_code}${pair_input}"
+					done
+				fi
+			fi
+			if [ -z "$pair_code" ] && [ "$pair_complete" -eq 0 ]; then
+				if [ -n "$pair_buffer" ]; then
+					print_warning "Discarded an incomplete code: $(v3_pairing_error_text "$V3_PAIR_ERROR")"
+					pair_buffer=""
+					continue
+				fi
                 [ "$pair_count" -gt 0 ] && break
                 print_warning "At least one pairing code is required"
                 continue
@@ -1981,12 +2106,20 @@ configure_v3_tls_client() {
                 pause
                 return 1
             }
+			pair_buffer="${pair_buffer}${pair_code}"
+			[ -n "$pair_buffer" ] || continue
             cert_tmp="$bundle_dir/.pair-cert-${pair_count}.$$"
-            if ! v3_decode_pairing_code "$pair_code" "$cert_tmp"; then
+			if ! v3_decode_pairing_code "$pair_buffer" "$cert_tmp"; then
                 rm -f "$cert_tmp"
-                print_warning "Invalid/expired pairing code or certificate-name mismatch; try again"
+				if [ "$V3_PAIR_ERROR" = "incomplete" ] && [ "$pair_complete" -eq 0 ]; then
+					print_info "Code is not complete yet; paste the rest of it"
+				else
+					print_warning "Pairing code rejected: $(v3_pairing_error_text "$V3_PAIR_ERROR")"
+					pair_buffer=""
+				fi
                 continue
             fi
+			pair_buffer=""
             imported_endpoint="$V3_PAIR_ENDPOINT"
 			imported_identity="$V3_PAIR_IDENTITY"
 			imported_mode="$V3_PAIR_MODE"

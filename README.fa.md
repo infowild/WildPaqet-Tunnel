@@ -86,11 +86,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wi
 
 ### ۲) خارج → گزینه ۲
 
-روی هر خارج حالت پوششی HTTP/2 را انتخاب کن، ترجیحاً certificate عمومی معتبر بده و از نام certificate و Secret یکسان روی همهٔ خارج‌ها استفاده کن. سپس کد یک‌خطی `WPQ4` را کپی کن. حالت self-signed فقط برای تست است.
+روی هر خارج حالت پوششی HTTP/2 را انتخاب کن، ترجیحاً certificate عمومی معتبر بده و از نام certificate و Secret یکسان روی همهٔ خارج‌ها استفاده کن. سپس کد `WPQ4` را کپی کن؛ اگر کد یک زنجیرهٔ certificate را حمل کند بلندتر از ظرفیت یک خط ترمینال است و به صورت بلوکی از خط‌های ۱۲۰ کاراکتری چاپ می‌شود که با خط `WPQEND` تمام می‌شود، پس کل بلوک را کپی کن یا فایل `pairing-code.txt` را با scp ببر. حالت self-signed فقط برای تست است.
 
 ### ۳) ایران → گزینه ۳
 
-حالت پیش‌فرض **Paste pairing code(s)** را انتخاب کن، کدهای چهار خارج را یکی‌یکی paste کن و در پایان Enter خالی بزن. endpointها، بررسی certificate و CA bundle خودکار انجام می‌شوند. مقدار پیشنهادی چهار اتصال برای هر خارج را نگه دار (برای چهار خارج مجموعاً ۱۶ اتصال) و Secret را یک‌بار وارد کن.
+حالت پیش‌فرض **Paste pairing code(s)** را انتخاب کن، کدهای چهار خارج را یکی‌یکی paste کن و در پایان Enter خالی بزن. کد بلند را می‌توانی به صورت کل بلوک (همراه خط `WPQEND`) paste کنی یا به جای paste مسیر فایل `pairing-code.txt` را که با scp آورده‌ای بدهی. endpointها، بررسی certificate و CA bundle خودکار انجام می‌شوند. مقدار پیشنهادی چهار اتصال برای هر خارج را نگه دار (برای چهار خارج مجموعاً ۱۶ اتصال) و Secret را یک‌بار وارد کن.
 
 ### ۴) استفاده روزانه
 
@@ -128,7 +128,7 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 فایل‌های certificate و key هنگام handshake جدید بررسی می‌شوند و اگر Certbot/ACME آن‌ها را جایگزین کرده باشد خودکار reload می‌شوند؛ تمدید معمول certificate به restart کردن Paqet نیاز ندارد.
 
-منیجر v9.3 از pairing یک‌خطی `WPQ4` استفاده می‌کند که endpoint، نام عمومی certificate، cover path مبهم و certificate عمومی را دارد؛ Secret و private key در آن نیست و خود path کلید احراز هویت محسوب نمی‌شود. همهٔ خارج‌های یک pool باید نام certificate، cover path و Secret یکسان داشته باشند. مسیر پیش‌فرض از نام certificate و Secret مشتق می‌شود تا روی خارج‌های هماهنگ خودکار یکسان باشد. `WPQ3` و `mode: direct` قدیمی فقط برای سازگاری باقی مانده‌اند و پوشش HTTP/2 ندارند.
+منیجر v9.5 از pairing `WPQ4` استفاده می‌کند که endpoint، نام عمومی certificate، cover path مبهم و certificate عمومی را دارد؛ کد بلند به صورت بلوکی با خط پایانی `WPQEND` چاپ و هنگام import دوباره به هم چسبانده می‌شود و فایل `pairing-code.txt` هم مستقیم پذیرفته می‌شود؛ Secret و private key در آن نیست و خود path کلید احراز هویت محسوب نمی‌شود. همهٔ خارج‌های یک pool باید نام certificate، cover path و Secret یکسان داشته باشند. مسیر پیش‌فرض از نام certificate و Secret مشتق می‌شود تا روی خارج‌های هماهنگ خودکار یکسان باشد. `WPQ3` و `mode: direct` قدیمی فقط برای سازگاری باقی مانده‌اند و پوشش HTTP/2 ندارند.
 
 برای هر endpoint خارج چهار اتصال ساخته می‌شود و streamها round-robin پخش می‌شوند. supervisor اتصال بسته را بازسازی می‌کند. اتصال‌های HTTP/2 پس از عمر تصادفی‌شده تعویض می‌شوند؛ اتصال جایگزین ابتدا وارد pool می‌شود و اتصال قدیمی تا پایان streamهایش drain می‌شود. شروع اتصال و keepalive نیز jitter دارند. پس از سه خطای dial متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود و cooldown حداکثر تا پنج دقیقه رشد می‌کند.
 
