@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.9-v3
+# Version: 9.10-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.9-v3"
+readonly SCRIPT_VERSION="9.10-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -826,6 +826,33 @@ config_transport_protocol() {
     ' "$config" 2>/dev/null
 }
 
+config_tls_mode() {
+    local config="$1"
+    awk '
+        /^[[:space:]]*tls:/ { in_tls=1; next }
+        in_tls && /^[^[:space:]]/ { exit }
+        in_tls && $1 == "mode:" {
+            value=$2; gsub(/"/, "", value); print value; exit
+        }
+    ' "$config" 2>/dev/null
+}
+
+yaml_set_transport_conn() {
+    local config="$1"
+    local new_conn="$2"
+    [ -f "$config" ] || return 1
+    [[ "$new_conn" =~ ^[0-9]+$ ]] || return 1
+    if grep -qE '^[[:space:]]*conn:' "$config"; then
+        sed -i -E "s/^([[:space:]]*)conn:.*/\\1conn: $new_conn/" "$config"
+        return 0
+    fi
+    if grep -qE '^transport:' "$config"; then
+        sed -i "/^transport:/a\\  conn: $new_conn" "$config"
+        return 0
+    fi
+    return 1
+}
+
 # Install a binary onto a possibly-running path without hitting ETXTBSY.
 # Writing directly to a file that is currently executing fails with
 # "Text file busy"; renaming a sibling temp file swaps the directory entry
@@ -1044,34 +1071,118 @@ get_service_details() {
     local config_file="$CONFIG_DIR/$config_name.yaml"
     
     local type="unknown"
-    local mode="fast"
+    local mode="-"
     local mtu="-"
     local conn="-"
     local cron="No"
+    local protocol=""
     
     if [ -f "$config_file" ]; then
         type=$(grep "^role:" "$config_file" 2>/dev/null | awk '{print $2}' | tr -d '"' || echo "unknown")
-        
-        local mode_line
-        mode_line=$(grep "mode:" "$config_file" 2>/dev/null | head -1)
-        [ -n "$mode_line" ] && mode=$(echo "$mode_line" | awk '{print $2}' | tr -d '"')
-        
-        if grep -q "mtu:" "$config_file" 2>/dev/null; then
-            local mtu_line
-            mtu_line=$(grep "mtu:" "$config_file" 2>/dev/null | head -1)
-            [ -n "$mtu_line" ] && mtu=$(echo "$mtu_line" | awk '{print $2}' | tr -d '"')
+        protocol=$(config_transport_protocol "$config_file")
+        if grep -qE '^[[:space:]]*conn:' "$config_file" 2>/dev/null; then
+            conn=$(grep -E '^[[:space:]]*conn:' "$config_file" | head -1 | awk '{print $2}' | tr -d '"')
         fi
-        
-        if grep -q "conn:" "$config_file" 2>/dev/null; then
-            local conn_line
-            conn_line=$(grep "conn:" "$config_file" 2>/dev/null | head -1)
-            [ -n "$conn_line" ] && conn=$(echo "$conn_line" | awk '{print $2}' | tr -d '"')
+        if [ "$protocol" = "tls" ]; then
+            mode=$(config_tls_mode "$config_file")
+            [ -n "$mode" ] || mode="direct"
+            mtu="n/a"
+        else
+            local mode_line
+            mode_line=$(grep "mode:" "$config_file" 2>/dev/null | head -1)
+            [ -n "$mode_line" ] && mode=$(echo "$mode_line" | awk '{print $2}' | tr -d '"')
+            [ -n "$mode" ] || mode="$DEFAULT_KCP_MODE"
+            if grep -q "mtu:" "$config_file" 2>/dev/null; then
+                mtu=$(grep "mtu:" "$config_file" | head -1 | awk '{print $2}' | tr -d '"')
+            else
+                mtu="$DEFAULT_MTU"
+            fi
         fi
     fi
     
     crontab -l 2>/dev/null | grep -q "systemctl restart $service_name" && cron="Yes"
     
     echo "$type $mode $mtu $conn $cron"
+}
+
+edit_paqet_service_yaml() {
+    local cfg="$1"
+    local selected_service="$2"
+    echo -e "\n${YELLOW}Editing: $cfg${NC}"
+    local editor="nano"
+    command -v nano &>/dev/null || editor="vi"
+    $editor "$cfg"
+    read -r -p "Restart service to apply changes? (y/N): " restart_choice
+    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+        systemctl restart "$selected_service" >/dev/null 2>&1
+        if systemctl is-active --quiet "$selected_service"; then
+            print_success "Service restarted"
+        else
+            print_error "Service failed to start"
+            systemctl status "$selected_service" --no-pager -l
+        fi
+    fi
+}
+
+edit_v3_tls_service_config() {
+    local cfg="$1"
+    local selected_service="$2"
+    local current_conn choice new_conn
+    current_conn=$(grep -E '^[[:space:]]*conn:' "$cfg" | head -1 | awk '{print $2}' | tr -d '"')
+    while true; do
+        echo -e "\n${CYAN}v3 HTTP/2 uses kernel TCP. KCP speed (normal/fast) and KCP MTU do not apply.${NC}"
+        echo "The knob that changes capacity on this tunnel is outer connections."
+        echo " 1. Change outer connections (current: ${current_conn:-unset})"
+        echo " 2. Open YAML in editor"
+        echo " 0. Back"
+        read -r -p "Choose [0-2]: " choice
+        case "$choice" in
+            0) return ;;
+            1)
+                read -r -p "Outer connections [1-16, current ${current_conn:-4}]: " new_conn
+                new_conn="${new_conn:-$current_conn}"
+                if ! [[ "$new_conn" =~ ^[0-9]+$ ]] || [ "$new_conn" -lt 1 ] || [ "$new_conn" -gt 16 ]; then
+                    print_error "Connections must be between 1 and 16"
+                    continue
+                fi
+                yaml_set_transport_conn "$cfg" "$new_conn" || {
+                    print_error "Could not update conn in $cfg"
+                    continue
+                }
+                current_conn="$new_conn"
+                print_success "conn set to $new_conn"
+                read -r -p "Restart service now? (Y/n): " restart_choice
+                if [[ ! "$restart_choice" =~ ^[Nn]$ ]]; then
+                    systemctl restart "$selected_service" >/dev/null 2>&1
+                    if systemctl is-active --quiet "$selected_service"; then
+                        print_success "Service restarted"
+                    else
+                        print_error "Service failed to start"
+                        systemctl status "$selected_service" --no-pager -l
+                    fi
+                fi
+                ;;
+            2) edit_paqet_service_yaml "$cfg" "$selected_service" ;;
+            *) print_error "Invalid choice" ;;
+        esac
+    done
+}
+
+edit_paqet_service_config() {
+    local display_name="$1"
+    local selected_service="$2"
+    local cfg="$CONFIG_DIR/$display_name.yaml"
+    if [ ! -f "$cfg" ]; then
+        print_error "Config file not found"
+        pause
+        return 1
+    fi
+    if [ "$(config_transport_protocol "$cfg")" = "tls" ]; then
+        edit_v3_tls_service_config "$cfg" "$selected_service"
+    else
+        edit_paqet_service_yaml "$cfg" "$selected_service"
+    fi
+    pause
 }
 
 # Manage single service
@@ -1112,8 +1223,14 @@ manage_single_service() {
         echo -e "\n${CYAN}Details:${NC}"
         echo -e "${CYAN}┌──────────────────────────────────────────────┐${NC}"
         printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "Type" "${type:-unknown}"
-        printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "KCP Mode" "${mode:-fast}"
-        printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "MTU" "${mtu:--}"
+        local cfg="$CONFIG_DIR/$display_name.yaml"
+        if [ -f "$cfg" ] && [ "$(config_transport_protocol "$cfg")" = "tls" ]; then
+            printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "TLS carrier" "${mode:-h2}"
+            printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "MTU" "kernel TCP (not KCP)"
+        else
+            printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "KCP Mode" "${mode:-$DEFAULT_KCP_MODE}"
+            printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "MTU" "${mtu:--}"
+        fi
         printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "Connections" "${conn:--}"
         printf "${CYAN}│${NC} %-16s ${CYAN}:${NC} %-25s ${CYAN}│${NC}\n" "Auto-Restart" "${cron:-No}"
         echo -e "${CYAN}└──────────────────────────────────────────────┘${NC}"
@@ -1150,27 +1267,7 @@ manage_single_service() {
             5) echo ""
                journalctl -u "$selected_service" -n 25 --no-pager
                pause ;;
-            6) local cfg="$CONFIG_DIR/$display_name.yaml"
-               if [ -f "$cfg" ]; then
-                   echo -e "\n${YELLOW}Editing: $cfg${NC}"
-                   local editor="nano"
-                   command -v nano &>/dev/null || editor="vi"
-                   $editor "$cfg"
-                   
-                   read -p "Restart service to apply changes? (y/N): " restart_choice
-                   if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                       systemctl restart "$selected_service" >/dev/null 2>&1
-                       if systemctl is-active --quiet "$selected_service"; then
-                           print_success "Service restarted"
-                       else
-                           print_error "Service failed to start"
-                           systemctl status "$selected_service" --no-pager -l
-                       fi
-                   fi
-               else
-                   print_error "Config file not found"
-               fi
-               pause ;;
+            6) edit_paqet_service_config "$display_name" "$selected_service" ;;
             7) local cfg="$CONFIG_DIR/$display_name.yaml"
                if [ -f "$cfg" ]; then
                    echo -e "\n${CYAN}$cfg${NC}\n"
@@ -1249,11 +1346,12 @@ manage_services() {
                 fast2) mode_color="${ORANGE}" ;;
                 fast3) mode_color="${PURPLE}" ;;
                 manual) mode_color="${RED}" ;;
+                h2|direct) mode_color="${GREEN}" ;;
                 *) mode_color="${WHITE}" ;;
             esac
             
             printf "${CYAN}│${NC} %3d ${CYAN}│${NC} %-24s ${CYAN}│${NC} ${status_color}%-11s${NC} ${CYAN}│${NC} %-9s ${CYAN}│${NC} %-14s ${CYAN}│${NC} ${mode_color}%-10s${NC} ${CYAN}│${NC} %-8s ${CYAN}│${NC} %-6s ${CYAN}│${NC}\n" \
-                "$i" "${display_name:0:24}" "$status" "${type:-unknown}" "${cron:-No}" "${mode:-fast}" "${mtu:--}" "${conn:--}"
+                "$i" "${display_name:0:24}" "$status" "${type:-unknown}" "${cron:-No}" "${mode:--}" "${mtu:--}" "${conn:--}"
             ((i++))
         done
         
@@ -6028,6 +6126,10 @@ change_mode_all_services() {
     local modified=0
     for config in "${configs[@]}"; do
         local config_name=$(basename "$config" .yaml)
+        if [ "$(config_transport_protocol "$config")" = "tls" ]; then
+            echo -e " ${CYAN}i${NC} Skipped $config_name (v3 TLS; KCP mode does not apply)"
+            continue
+        fi
         
         if grep -qE '^[[:space:]]*mode:' "$config"; then
             sed -i -E "s/^([[:space:]]*)mode:.*/\\1mode: \"$new_mode\"/" "$config"

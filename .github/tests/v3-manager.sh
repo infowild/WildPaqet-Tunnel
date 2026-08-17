@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export WILDPAQET_LIB_ONLY=1
 source "$repo_root/wildpaqet.sh"
 
-test "$SCRIPT_VERSION" = "9.9-v3"
+test "$SCRIPT_VERSION" = "9.10-v3"
 v3_validate_cover_path '/api/v1/cover/events'
 if v3_validate_cover_path '/api/../admin'; then
 	echo "unsafe cover path was accepted" >&2
@@ -52,5 +52,22 @@ if printf '%s\n' "${systemctl_calls[@]}" | grep -qx 'restart paqet-new'; then
     echo "inactive service was restarted instead of started" >&2
     exit 1
 fi
+
+parse_dir=$(mktemp -d /tmp/wildpaqet-v3-parse.XXXXXX)
+cleanup_parse() { rm -rf -- "$parse_dir"; }
+trap cleanup_parse EXIT
+cat > "$parse_dir/germany.yaml" <<'EOF'
+role: "client"
+transport:
+  protocol: "tls"
+  conn: 4
+  tls:
+    mode: "h2"
+    server_name: "dl.wilduser.org"
+EOF
+test "$(config_transport_protocol "$parse_dir/germany.yaml")" = "tls"
+test "$(config_tls_mode "$parse_dir/germany.yaml")" = "h2"
+yaml_set_transport_conn "$parse_dir/germany.yaml" 2
+grep -qE '^[[:space:]]*conn: 2$' "$parse_dir/germany.yaml"
 
 echo 'v3-manager-pool-and-refresh: PASS'
