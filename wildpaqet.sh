@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.8-v3
+# Version: 9.9-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.8-v3"
+readonly SCRIPT_VERSION="9.9-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1988,6 +1988,9 @@ v3_certificate_pair_score() {
 		*/fullchain.pem) score=$((score - 20)) ;;
 		*/fullchain.cer) score=$((score - 10)) ;;
 	esac
+	if ! v3_certificate_is_self_signed "$cert_file"; then
+		score=$((score - 40))
+	fi
 	printf '%s\n' "$score"
 }
 
@@ -2007,7 +2010,159 @@ v3_select_certificate_for_identity() {
 		fi
 	done < <(v3_find_certificate_pairs)
 	[ -n "$best_line" ] || return 1
+	v3_apply_certificate_pair_line "$best_line" || return 1
 	printf '%s\n' "$best_line"
+}
+
+v3_apply_certificate_pair_line() {
+	local pair_line="$1"
+	V3_CERT_FILE=""
+	V3_CERT_KEY=""
+	V3_CERT_NAMES=""
+	V3_CERT_EXPIRY=""
+	[ -n "$pair_line" ] || return 1
+	IFS='|' read -r V3_CERT_FILE V3_CERT_KEY V3_CERT_NAMES V3_CERT_EXPIRY <<< "$pair_line"
+	[ -n "$V3_CERT_FILE" ] && [ -n "$V3_CERT_KEY" ]
+}
+
+v3_certificate_still_valid() {
+	local cert_file="$1"
+	[ -f "$cert_file" ] || return 1
+	openssl x509 -in "$cert_file" -noout -checkend 86400 >/dev/null 2>&1 </dev/null
+}
+
+v3_find_acme_sh() {
+	local candidate
+	for candidate in \
+		"${HOME:-/root}/.acme.sh/acme.sh" \
+		/root/.acme.sh/acme.sh \
+		/usr/local/bin/acme.sh
+	do
+		[ -x "$candidate" ] && printf '%s\n' "$candidate" && return 0
+	done
+	if command -v acme.sh >/dev/null 2>&1; then
+		command -v acme.sh
+		return 0
+	fi
+	return 1
+}
+
+v3_tcp_port_listening() {
+	local port="$1"
+	ss -tlnH 2>/dev/null | grep -qE ":${port}[[:space:]]"
+}
+
+v3_certificate_is_self_signed() {
+	local cert_file="$1"
+	local subject issuer
+	subject=$(openssl x509 -in "$cert_file" -noout -subject -nameopt RFC2253 2>/dev/null </dev/null) || return 0
+	issuer=$(openssl x509 -in "$cert_file" -noout -issuer -nameopt RFC2253 2>/dev/null </dev/null) || return 0
+	[ "$subject" = "$issuer" ]
+}
+
+v3_identity_is_dns_name() {
+	local identity="$1"
+	[[ "$identity" == *.* ]] || return 1
+	[[ "$identity" == *'*'* ]] && return 1
+	[[ "$identity" =~ [A-Za-z] ]] || return 1
+	[[ "$identity" =~ ^[A-Za-z0-9.-]+$ ]]
+}
+
+# Request a publicly trusted certificate for a domain the operator named on
+# this server. HTTP-01 needs TCP/80 reachable from the internet.
+v3_issue_public_certificate() {
+	local identity="$1"
+	local acme_bin=""
+	v3_identity_is_dns_name "$identity" || {
+		print_error "Let's Encrypt cannot issue a certificate for '$identity'; enter a DNS name whose A/AAAA record points here"
+		return 1
+	}
+	if [ -n "${WILDPAQET_LIB_ONLY:-}" ]; then
+		print_error "ACME issuance is disabled in library/test mode"
+		return 1
+	fi
+	if v3_tcp_port_listening 80; then
+		print_warning "TCP/80 is already in use, so the HTTP-01 challenge may fail"
+		print_info "Stop the process on port 80, or make sure it can serve /.well-known/acme-challenge/"
+	fi
+
+	if acme_bin=$(v3_find_acme_sh); then
+		print_step "Requesting Let's Encrypt certificate with acme.sh for $identity..."
+		if "$acme_bin" --issue -d "$identity" --standalone --httpport 80 --server letsencrypt; then
+			print_success "acme.sh issued a certificate for $identity"
+			return 0
+		fi
+		print_warning "acme.sh standalone issue failed; trying renew"
+		if "$acme_bin" --renew -d "$identity" --force; then
+			print_success "acme.sh renewed the certificate for $identity"
+			return 0
+		fi
+	fi
+
+	if ! command -v certbot >/dev/null 2>&1; then
+		print_step "Installing certbot to request a public certificate..."
+		optimizer_try_install_tools >/dev/null 2>&1 || true
+		if command -v apt-get >/dev/null 2>&1; then
+			export DEBIAN_FRONTEND=noninteractive
+			apt-get install -y -qq certbot >/dev/null 2>&1 || true
+		fi
+	fi
+	if command -v certbot >/dev/null 2>&1; then
+		print_step "Requesting Let's Encrypt certificate with certbot for $identity..."
+		if certbot certonly --standalone --non-interactive --agree-tos \
+			--register-unsafely-without-email --preferred-challenges http \
+			-d "$identity"; then
+			print_success "certbot issued a certificate for $identity"
+			return 0
+		fi
+	fi
+	print_error "Could not obtain a Let's Encrypt certificate for $identity"
+	print_info "The domain's A/AAAA record must point to this server and TCP/80 must be reachable"
+	return 1
+}
+
+# Reuse a still-valid public certificate for the named domain, otherwise issue one
+# and scan the usual Certbot/acme.sh locations for the new files.
+v3_ensure_public_certificate() {
+	local identity="$1"
+	local pair_line cert_file
+	V3_CERT_FILE=""
+	V3_CERT_KEY=""
+	V3_CERT_NAMES=""
+	V3_CERT_EXPIRY=""
+	pair_line=$(v3_select_certificate_for_identity "$identity" 2>/dev/null || true)
+	if [ -n "$pair_line" ]; then
+		cert_file="${pair_line%%|*}"
+		if v3_certificate_still_valid "$cert_file"; then
+			if ! v3_certificate_is_self_signed "$cert_file"; then
+				v3_apply_certificate_pair_line "$pair_line"
+				return 0
+			fi
+			if [ -n "${WILDPAQET_LIB_ONLY:-}" ]; then
+				v3_apply_certificate_pair_line "$pair_line"
+				return 0
+			fi
+			print_warning "Found a self-signed certificate for $identity; requesting a public one"
+		else
+			print_warning "The certificate for $identity expires within 24 hours; renewing"
+		fi
+	fi
+	if v3_issue_public_certificate "$identity"; then
+		pair_line=$(v3_select_certificate_for_identity "$identity") || return 1
+		v3_apply_certificate_pair_line "$pair_line"
+		return 0
+	fi
+	# A matching self-signed pair is better than aborting the wizard after ACME
+	# fails; the operator can still paste paths by hand if this is also empty.
+	if [ -n "$pair_line" ]; then
+		cert_file="${pair_line%%|*}"
+		if v3_certificate_still_valid "$cert_file"; then
+			print_warning "Using the existing certificate for $identity after Let's Encrypt failed"
+			v3_apply_certificate_pair_line "$pair_line"
+			return 0
+		fi
+	fi
+	return 1
 }
 
 # Emit "cert|key|names|expiry" for every usable pair found on this server.
@@ -2075,8 +2230,11 @@ configure_v3_tls_server() {
         return 1
     fi
 
-    read -r -p "Certificate/SNI domain [$public_ip]: " identity
-    identity="${identity:-$public_ip}"
+    read -r -p "Public TLS domain (A/AAAA must point to this server): " identity
+    if [ -z "$identity" ]; then
+        identity="$public_ip"
+        print_warning "No domain entered; Let's Encrypt needs a DNS name, so public issue will fail"
+    fi
     if [[ ! "$identity" =~ ^[A-Za-z0-9.-]+$ ]]; then
         print_error "Certificate name may only contain letters, numbers, dot and hyphen"
         pause
@@ -2107,49 +2265,27 @@ configure_v3_tls_server() {
 	fi
 
     echo "Certificate source:"
-	echo " 1. Use an existing publicly trusted certificate and key (recommended)"
+	echo " 1. Public certificate for $identity (reuse or Let's Encrypt)"
 	echo " 2. Generate a self-signed certificate (testing only; probe-visible)"
     read -r -p "Choose [1]: " answer
     answer="${answer:-1}"
     mkdir -p "$CONFIG_DIR"
 	if [ "$answer" = "1" ]; then
-		local -a found_pairs=()
-		local pair_line pair_cert pair_key pair_names pair_expiry
-		local cert_choice index=1
+		local pair_line
 		local selected_names="" suggested_name=""
 		cert_file=""
 		key_file=""
-		print_step "Looking for a certificate that covers $identity..."
-		if pair_line=$(v3_select_certificate_for_identity "$identity"); then
-			IFS='|' read -r cert_file key_file selected_names pair_expiry <<< "$pair_line"
-			print_success "Matched $identity without asking for a path"
+		print_step "Getting a public certificate for $identity..."
+		if v3_ensure_public_certificate "$identity"; then
+			cert_file="$V3_CERT_FILE"
+			key_file="$V3_CERT_KEY"
+			selected_names="$V3_CERT_NAMES"
+			print_success "Using public certificate for $identity"
 			echo "  cert: $cert_file"
 			echo "  key:  $key_file"
-			echo "  expires: ${pair_expiry:-unknown}"
+			echo "  expires: ${V3_CERT_EXPIRY:-unknown}"
 		else
-			print_warning "No installed certificate covers '$identity'"
-			mapfile -t found_pairs < <(v3_find_certificate_pairs)
-			if [ ${#found_pairs[@]} -gt 0 ]; then
-				echo "Other certificate/key pairs on this server:"
-				for pair_line in "${found_pairs[@]}"; do
-					IFS='|' read -r pair_cert pair_key pair_names pair_expiry <<< "$pair_line"
-					printf ' %d. %s\n' "$index" "$pair_cert"
-					printf '    key: %s\n' "$pair_key"
-					printf '    names: %s | expires: %s\n' "${pair_names:-unknown}" "${pair_expiry:-unknown}"
-					index=$((index + 1))
-				done
-				echo " 0. Enter the certificate and key paths manually"
-				read -r -p "Choose [0]: " cert_choice
-				cert_choice="${cert_choice:-0}"
-				if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] \
-					&& [ "$cert_choice" -le ${#found_pairs[@]} ]; then
-					IFS='|' read -r cert_file key_file selected_names pair_expiry \
-						<<< "${found_pairs[$((cert_choice - 1))]}"
-				fi
-			fi
-		fi
-
-		if [ -z "$cert_file" ] || [ -z "$key_file" ]; then
+			print_warning "Automatic issue/reuse failed; enter the certificate paths manually"
 			local default_cert="/etc/letsencrypt/live/$identity/fullchain.pem"
 			local default_key="/etc/letsencrypt/live/$identity/privkey.pem"
 			[ -f "$default_cert" ] || default_cert=""

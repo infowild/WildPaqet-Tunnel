@@ -100,4 +100,26 @@ export WILDPAQET_CERT_GLOBS="$test_dir/letsencrypt/live/*/fullchain.pem:$test_di
 selected=$(v3_select_certificate_for_identity 'pay.wilduser.org')
 test "$(printf '%s' "$selected" | cut -d'|' -f1)" = "$test_dir/letsencrypt/live/pay.wilduser.org-0001/fullchain.pem"
 
+v3_identity_is_dns_name 'download.infowild.ir'
+if v3_identity_is_dns_name '107.174.242.251'; then
+	echo 'an IPv4 address was treated as a DNS name' >&2
+	exit 1
+fi
+if v3_identity_is_dns_name '*.wilduser.org'; then
+	echo 'a wildcard was treated as an HTTP-01 name' >&2
+	exit 1
+fi
+if v3_issue_public_certificate '107.174.242.251' >/dev/null; then
+	echo 'an IP address was sent to ACME' >&2
+	exit 1
+fi
+
+v3_ensure_public_certificate 'pay.wilduser.org' >/dev/null
+test "$V3_CERT_FILE" = "$test_dir/letsencrypt/live/pay.wilduser.org-0001/fullchain.pem"
+test "$V3_CERT_KEY" = "$test_dir/letsencrypt/live/pay.wilduser.org-0001/privkey.pem"
+if v3_ensure_public_certificate 'missing.example.com' >/dev/null; then
+	echo 'a missing domain was issued in test mode' >&2
+	exit 1
+fi
+
 echo 'certificate-discovery: PASS'
