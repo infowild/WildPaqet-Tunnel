@@ -45,6 +45,9 @@ jobs:
       - name: Test complete per-service removal
         run: bash .github/tests/service-removal.sh
 
+      - name: Test certificate discovery
+        run: bash .github/tests/certificate-discovery.sh
+
       - name: Test full uninstall cleanup and state restoration
         run: bash .github/tests/uninstall-cleanup.sh
 

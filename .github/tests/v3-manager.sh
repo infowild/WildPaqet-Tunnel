@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export WILDPAQET_LIB_ONLY=1
 source "$repo_root/wildpaqet.sh"
 
-test "$SCRIPT_VERSION" = "9.6-v3"
+test "$SCRIPT_VERSION" = "9.7-v3"
 v3_validate_cover_path '/api/v1/cover/events'
 if v3_validate_cover_path '/api/../admin'; then
 	echo "unsafe cover path was accepted" >&2

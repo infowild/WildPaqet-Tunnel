@@ -91,7 +91,7 @@ toolchain switching or downloads a checksum-verified official compiler under
 
 1. Option **2** → **v3 HTTP/2-covered TLS**
 2. Use the same public certificate name and shared secret on all Kharej servers
-3. Prefer a publicly trusted certificate; self-signed mode is for testing
+3. Prefer a publicly trusted certificate; self-signed mode is for testing. Existing Certbot, acme.sh and panel certificates are detected and listed automatically, so paths rarely have to be typed
 4. Copy the `WPQ4` pairing code printed by each server; a code that carries a certificate chain is printed as a block of lines ending with `WPQEND`, and copying every line of it (or the saved `pairing-code.txt` file) keeps it intact
 
 ### 3) Iran

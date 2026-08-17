@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.6-v3
+# Version: 9.7-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.6-v3"
+readonly SCRIPT_VERSION="9.7-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1880,6 +1880,123 @@ v3_total_outer_connections() {
     printf '%s\n' "$total"
 }
 
+# Certbot, acme.sh and the panel installers each store the certificate pair in
+# their own layout, so the wizard scans the known locations instead of assuming
+# one Certbot path named after the certificate name.
+v3_certificate_search_globs() {
+	if [ -n "${WILDPAQET_CERT_GLOBS:-}" ]; then
+		printf '%s' "$WILDPAQET_CERT_GLOBS" | tr ':' '\n'
+		return 0
+	fi
+	cat <<EOF
+/etc/letsencrypt/live/*/fullchain.pem
+/root/.acme.sh/*/fullchain.cer
+/root/.acme.sh/*/*.cer
+${HOME:-/root}/.acme.sh/*/fullchain.cer
+${HOME:-/root}/.acme.sh/*/*.cer
+/root/cert/*/fullchain.pem
+/root/cert/*.crt
+/root/cert/*.pem
+/var/lib/marzban/certs/*.pem
+/var/lib/marzneshin/certs/*.pem
+/opt/hiddify-manager/ssl/*.crt
+/etc/x-ui/*.crt
+/etc/x-ui/*.pem
+/usr/local/etc/xray/*.crt
+/usr/local/etc/xray/*.pem
+/etc/nginx/ssl/*.crt
+/etc/nginx/ssl/*.pem
+/etc/ssl/*/fullchain.pem
+EOF
+}
+
+v3_certificate_key_candidates() {
+	local cert_file="$1"
+	local dir base stem dir_base
+	dir=$(dirname "$cert_file")
+	base=$(basename "$cert_file")
+	stem="${base%.*}"
+	dir_base=$(basename "$dir")
+	printf '%s\n' \
+		"$dir/privkey.pem" \
+		"$dir/private.key" \
+		"$dir/key.pem" \
+		"$dir/$stem.key" \
+		"$dir/$stem.privkey.pem" \
+		"${cert_file%.*}.key" \
+		"$dir/$dir_base.key" \
+		"$dir/${dir_base%_ecc}.key"
+}
+
+v3_certificate_key_matches() {
+	local cert_file="$1"
+	local key_file="$2"
+	local cert_pub key_pub
+	cert_pub=$(openssl x509 -in "$cert_file" -noout -pubkey 2>/dev/null </dev/null) || return 1
+	# An empty passphrase fails an encrypted key instead of blocking the wizard
+	# on an interactive prompt.
+	key_pub=$(openssl pkey -in "$key_file" -pubout -passin pass: 2>/dev/null </dev/null) || return 1
+	[ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ]
+}
+
+v3_certificate_names() {
+	local cert_file="$1"
+	{
+		v3_certificate_identity "$cert_file"
+		# A long SAN list wraps over several lines, so every following line that
+		# still carries entries is collected.
+		openssl x509 -in "$cert_file" -noout -text 2>/dev/null </dev/null \
+			| awk '
+				/X509v3 Subject Alternative Name/ { inside = 1; next }
+				inside && /DNS:|IP Address:/ { print; next }
+				inside { inside = 0 }
+			' \
+			| tr ',' '\n' \
+			| sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^DNS://; s/^IP Address://'
+	} | awk 'NF && !seen[$0]++'
+}
+
+v3_certificate_covers_name() {
+	local names_csv="$1"
+	local identity="${2,,}"
+	local name
+	while IFS= read -r name; do
+		name="${name,,}"
+		[ -n "$name" ] || continue
+		[ "$name" = "$identity" ] && return 0
+		if [ "${name:0:2}" = "*." ] && [ "$identity" != "${identity#*.}" ] \
+			&& [ "${identity#*.}" = "${name:2}" ]; then
+			return 0
+		fi
+	done < <(printf '%s\n' "$names_csv" | tr ',' '\n')
+	return 1
+}
+
+# Emit "cert|key|names|expiry" for every usable pair found on this server.
+v3_find_certificate_pairs() {
+	command -v openssl >/dev/null 2>&1 || return 0
+	local pattern cert key names enddate
+	{
+		while IFS= read -r pattern; do
+			[ -n "$pattern" ] || continue
+			while IFS= read -r cert; do
+				[ -f "$cert" ] || continue
+				openssl x509 -in "$cert" -noout >/dev/null 2>&1 </dev/null || continue
+				while IFS= read -r key; do
+					[ -f "$key" ] || continue
+					v3_certificate_key_matches "$cert" "$key" || continue
+					names=$(v3_certificate_names "$cert" | tr '\n' ',' | sed 's/,$//')
+					enddate=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null </dev/null | cut -d= -f2)
+					printf '%s|%s|%s|%s\n' "$cert" "$key" "$names" "$enddate"
+					break
+				done < <(v3_certificate_key_candidates "$cert")
+			done < <(compgen -G "$pattern" 2>/dev/null || true)
+		done < <(v3_certificate_search_globs)
+	# A leaf and its fullchain share one key; keep only the first, which the
+	# glob order lists as the chain file.
+	} | awk -F'|' '!seen[$2]++'
+}
+
 configure_v3_tls_server() {
     clear
     show_banner
@@ -1933,6 +2050,8 @@ configure_v3_tls_server() {
 	[ -n "$cover_path_id" ] || cover_path_id="$RANDOM$RANDOM"
 	generated_cover_path="/api/v1/${cover_path_id}/events"
 	read -r -p "Opaque HTTP/2 cover path [$generated_cover_path]: " cover_path
+	local cover_path_is_derived=0
+	[ -n "$cover_path" ] || cover_path_is_derived=1
 	cover_path="${cover_path:-$generated_cover_path}"
 	if ! v3_validate_cover_path "$cover_path"; then
 		print_error "Cover path must start with / and contain only URL-safe path characters"
@@ -1953,19 +2072,82 @@ configure_v3_tls_server() {
     answer="${answer:-1}"
     mkdir -p "$CONFIG_DIR"
 	if [ "$answer" = "1" ]; then
-		local default_cert="/etc/letsencrypt/live/$identity/fullchain.pem"
-		local default_key="/etc/letsencrypt/live/$identity/privkey.pem"
-		[ -f "$default_cert" ] || default_cert=""
-		[ -f "$default_key" ] || default_key=""
-		read -r -p "Certificate/fullchain path${default_cert:+ [$default_cert]}: " cert_file
-		read -r -p "Private key path${default_key:+ [$default_key]}: " key_file
-		cert_file="${cert_file:-$default_cert}"
-		key_file="${key_file:-$default_key}"
+		local -a found_pairs=()
+		local pair_line pair_cert pair_key pair_names pair_expiry
+		local cert_choice default_choice=0 index=1
+		local selected_names="" suggested_name=""
+		cert_file=""
+		key_file=""
+		print_step "Looking for existing certificates (Certbot, acme.sh, panels)..."
+		mapfile -t found_pairs < <(v3_find_certificate_pairs)
+
+		if [ ${#found_pairs[@]} -gt 0 ]; then
+			echo "Detected certificate/key pairs:"
+			for pair_line in "${found_pairs[@]}"; do
+				IFS='|' read -r pair_cert pair_key pair_names pair_expiry <<< "$pair_line"
+				printf ' %d. %s\n' "$index" "$pair_cert"
+				printf '    key: %s\n' "$pair_key"
+				printf '    names: %s | expires: %s\n' "${pair_names:-unknown}" "${pair_expiry:-unknown}"
+				if [ "$default_choice" -eq 0 ] && v3_certificate_covers_name "$pair_names" "$identity"; then
+					default_choice="$index"
+				fi
+				index=$((index + 1))
+			done
+			echo " 0. Enter the certificate and key paths manually"
+			[ "$default_choice" -eq 0 ] && default_choice=1
+			read -r -p "Choose [$default_choice]: " cert_choice
+			cert_choice="${cert_choice:-$default_choice}"
+			if [[ "$cert_choice" =~ ^[0-9]+$ ]] && [ "$cert_choice" -ge 1 ] \
+				&& [ "$cert_choice" -le ${#found_pairs[@]} ]; then
+				IFS='|' read -r cert_file key_file selected_names pair_expiry \
+					<<< "${found_pairs[$((cert_choice - 1))]}"
+			fi
+		else
+			print_warning "No certificate/key pair was found in the usual Certbot, acme.sh or panel locations"
+		fi
+
+		if [ -z "$cert_file" ] || [ -z "$key_file" ]; then
+			local default_cert="/etc/letsencrypt/live/$identity/fullchain.pem"
+			local default_key="/etc/letsencrypt/live/$identity/privkey.pem"
+			[ -f "$default_cert" ] || default_cert=""
+			[ -f "$default_key" ] || default_key=""
+			read -r -p "Certificate/fullchain path${default_cert:+ [$default_cert]}: " cert_file
+			read -r -p "Private key path${default_key:+ [$default_key]}: " key_file
+			cert_file="${cert_file:-$default_cert}"
+			key_file="${key_file:-$default_key}"
+			selected_names=$(v3_certificate_names "$cert_file" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+		fi
         [ -f "$cert_file" ] && [ -f "$key_file" ] || {
             print_error "Certificate or key file does not exist"
             pause
             return 1
         }
+		if ! v3_certificate_key_matches "$cert_file" "$key_file"; then
+			print_error "The private key does not belong to this certificate (or the key is passphrase-protected)"
+			pause
+			return 1
+		fi
+		# A certificate that does not carry the configured name makes every Iran
+		# handshake fail, so the mismatch is resolved here instead of at runtime.
+		if [ -n "$selected_names" ] && ! v3_certificate_covers_name "$selected_names" "$identity"; then
+			print_warning "This certificate does not cover '$identity' (it covers: $selected_names)"
+			suggested_name=$(printf '%s\n' "$selected_names" | tr ',' '\n' \
+				| grep -v '^\*\.' | grep -E '^[A-Za-z0-9.-]+$' | head -1)
+			if [ -n "$suggested_name" ]; then
+				read -r -p "Use '$suggested_name' as the certificate name instead? (Y/n): " answer
+				if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+					identity="$suggested_name"
+					if [ "$cover_path_is_derived" -eq 1 ]; then
+						cover_path_id=$(printf '%s' "${identity}:${secret_key}" \
+							| openssl dgst -sha256 -r 2>/dev/null | awk '{print substr($1,1,16)}')
+						[ -n "$cover_path_id" ] || cover_path_id="$RANDOM$RANDOM"
+						cover_path="/api/v1/${cover_path_id}/events"
+						print_info "Cover path re-derived for $identity: $cover_path"
+					fi
+				fi
+			fi
+		fi
+		print_success "Using certificate: $cert_file"
     else
 		print_warning "Self-signed certificates are secure for encryption but do not resist active probing"
         local cert_paths
