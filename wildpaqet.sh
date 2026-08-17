@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.12-v3
+# Version: 9.12.1-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.12-v3"
+readonly SCRIPT_VERSION="9.12.1-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -949,11 +949,13 @@ forward_entry_exists() {
 prompt_forward_protocol() {
     local port="$1"
     local choice=""
-    echo "Port $port — choose what to forward through the tunnel:"
-    echo " 1. TCP only"
-    echo " 2. UDP only"
-    echo " 3. TCP + UDP (both on this port)"
-    read -r -p "Choose [3]: " choice
+    # Menu on stderr so command substitution does not swallow the text.
+    echo "" >&2
+    echo -e "${CYAN}Protocol for port $port:${NC}" >&2
+    echo " 1 = TCP only (panel/VLESS TCP)" >&2
+    echo " 2 = UDP only" >&2
+    echo " 3 = TCP + UDP on the same port (recommended for panel)" >&2
+    read -r -p "Enter 1, 2, or 3 [default 3 = TCP+UDP]: " choice >&2
     choice="${choice:-3}"
     case "$choice" in
         1) printf '%s\n' "tcp" ;;
