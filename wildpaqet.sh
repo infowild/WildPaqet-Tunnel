@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.5-v3
+# Version: 9.6-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,15 +26,15 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.5-v3"
+readonly SCRIPT_VERSION="9.6-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
 readonly MANAGER_BRANCH="wild-paqet-v3"
 
 # Paths
-readonly CONFIG_DIR="/etc/paqet"
-readonly SERVICE_DIR="/etc/systemd/system"
+readonly CONFIG_DIR="${WILDPAQET_CONFIG_DIR:-/etc/paqet}"
+readonly SERVICE_DIR="${WILDPAQET_SERVICE_DIR:-/etc/systemd/system}"
 readonly BIN_DIR="/usr/local/bin"
 readonly INSTALL_DIR="/opt/paqet"
 readonly BACKUP_DIR="/root/paqet-backups"
@@ -994,6 +994,49 @@ manage_cronjob() {
 # SERVICE MANAGEMENT
 # ================================================
 
+# Remove every artifact owned by one tunnel without touching shared manager
+# state or certificates that live outside CONFIG_DIR (for example Certbot).
+remove_service_artifacts() {
+    local selected_service="$1"
+    local display_name="$2"
+    local config_file="$CONFIG_DIR/$display_name.yaml"
+    local config_file_yml="$CONFIG_DIR/$display_name.yml"
+    local failed=0
+
+    [[ "$selected_service" =~ ^paqet-[[:alnum:]_-]+\.service$ ]] || return 1
+    [ "$(clean_config_name "$display_name")" = "$display_name" ] || return 1
+
+    # Firewall rules must be derived while the config still exists.
+    if [ -f "$config_file" ]; then
+        cleanup_paqet_iptables_from_configs "$config_file" || failed=1
+        cleanup_managed_firewall_for_config "$config_file" || failed=1
+    elif [ -f "$config_file_yml" ]; then
+        cleanup_paqet_iptables_from_configs "$config_file_yml" || failed=1
+        cleanup_managed_firewall_for_config "$config_file_yml" || failed=1
+    fi
+
+    remove_cronjob "${selected_service%.service}" >/dev/null 2>&1 || true
+    systemctl stop "$selected_service" >/dev/null 2>&1 || true
+    systemctl disable "$selected_service" >/dev/null 2>&1 || true
+
+    rm -f "$SERVICE_DIR/$selected_service" \
+        "/lib/systemd/system/$selected_service" \
+        "/usr/lib/systemd/system/$selected_service" 2>/dev/null || failed=1
+    rm -rf "$SERVICE_DIR/$selected_service.d" \
+        "/lib/systemd/system/$selected_service.d" \
+        "/usr/lib/systemd/system/$selected_service.d" 2>/dev/null || failed=1
+    find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -type l \
+        -name "$selected_service" -delete 2>/dev/null || failed=1
+
+    rm -f "$config_file" "$config_file_yml" 2>/dev/null || failed=1
+    rm -rf "$CONFIG_DIR/tls/$display_name" 2>/dev/null || failed=1
+
+    systemctl daemon-reload >/dev/null 2>&1 || failed=1
+    systemctl reset-failed "$selected_service" >/dev/null 2>&1 || true
+    save_iptables >/dev/null 2>&1 || true
+    return "$failed"
+}
+
 # Get service details
 get_service_details() {
     local service_name="$1"
@@ -1137,15 +1180,13 @@ manage_single_service() {
                fi
                pause ;;
             8) manage_cronjob "${selected_service%.service}" "$display_name" ;;
-            9) read -p "Delete this service? (y/N): " confirm
+            9) read -p "Delete this service and all of its config, TLS files, firewall rules and cronjob? (y/N): " confirm
                if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                   remove_cronjob "${selected_service%.service}" 2>/dev/null || true
-                   systemctl stop "$selected_service" 2>/dev/null || true
-                   systemctl disable "$selected_service" 2>/dev/null || true
-                   rm -f "$SERVICE_DIR/$selected_service" 2>/dev/null || true
-                   rm -f "$CONFIG_DIR/$display_name.yaml" 2>/dev/null || true
-                   systemctl daemon-reload 2>/dev/null || true
-                   print_success "Service removed"
+                   if remove_service_artifacts "$selected_service" "$display_name"; then
+                       print_success "Service and all owned artifacts removed"
+                   else
+                       print_warning "Service removal finished, but one or more artifacts could not be removed"
+                   fi
                    pause
                    return
                fi ;;
@@ -6498,35 +6539,27 @@ delete_all_tunnels() {
     print_step "Stopping and removing all services..."
     
     local deleted_count=0
+    local failed_count=0
     
     for svc in "${services[@]}"; do
         local service_name="${svc%.service}"
         local display_name="${service_name#paqet-}"
-        local config_file="$CONFIG_DIR/$display_name.yaml"
-        
         echo -n " Removing $display_name... "
-        
-        remove_cronjob "$service_name" >/dev/null 2>&1 || true
-        systemctl stop "$svc" >/dev/null 2>&1 || true
-        systemctl disable "$svc" >/dev/null 2>&1 || true
-        
-        if [ -f "$SERVICE_DIR/$svc" ]; then
-            rm -f "$SERVICE_DIR/$svc" >/dev/null 2>&1 || true
+
+        if remove_service_artifacts "$svc" "$display_name"; then
+            echo -e "${GREEN}✅ Removed${NC}"
+            ((deleted_count++))
+        else
+            echo -e "${YELLOW}⚠️ Partially removed${NC}"
+            ((failed_count++))
         fi
-        
-        if [ -f "$config_file" ]; then
-            rm -f "$config_file" >/dev/null 2>&1 || true
-        fi
-        
-        echo -e "${GREEN}✅ Removed${NC}"
-        ((deleted_count++))
     done
-    
-    systemctl daemon-reload >/dev/null 2>&1
     
     echo -e "\n${CYAN}Results:${NC}"
     echo -e " ${GREEN}✅ Deleted:${NC} $deleted_count service(s)"
-    print_success "All tunnels deleted successfully!"
+    [ "$failed_count" -eq 0 ] \
+        && print_success "All tunnels and their owned artifacts deleted successfully!" \
+        || print_warning "$failed_count service(s) left one or more artifacts behind"
     pause
 }
 
@@ -6964,11 +6997,98 @@ cleanup_tls_iptables_port() {
     _iptables_delete_loop filter INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
 }
 
+# Remove persistent UFW/firewalld openings that were recorded when one v3
+# service was created. Untracked administrator rules are deliberately kept.
+cleanup_managed_firewall_for_config() {
+    local config="$1"
+    [ -f "$config" ] || return 0
+    [ -f "$FIREWALL_STATE_FILE" ] || return 0
+
+    local role port backend protocol tracked_port matched failed=0 firewalld_changed=0
+    local remaining_file="${FIREWALL_STATE_FILE}.service-remove.$$"
+    local -a ports=()
+    role=$(awk '$1 == "role:" {gsub(/"/, "", $2); print $2; exit}' "$config" 2>/dev/null)
+
+    if [ "$role" = "server" ]; then
+        port=$(awk '
+            /^listen:/ {in_listen=1; next}
+            in_listen && /^[^[:space:]]/ {exit}
+            in_listen && $1 == "addr:" {
+                value=$2; gsub(/"/, "", value); sub(/^.*:/, "", value); print value; exit
+            }
+        ' "$config" 2>/dev/null)
+        validate_port "$port" 2>/dev/null && ports+=("$port")
+    elif [ "$role" = "client" ]; then
+        while IFS= read -r port; do
+            validate_port "$port" 2>/dev/null && ports+=("$port")
+        done < <(grep -E 'listen:[[:space:]]*"' "$config" 2>/dev/null \
+            | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
+    fi
+
+    [ ${#ports[@]} -gt 0 ] || return 0
+    : > "$remaining_file" || return 1
+    chmod 600 "$remaining_file" 2>/dev/null || true
+
+    while IFS='|' read -r backend protocol tracked_port; do
+        matched=0
+        for port in "${ports[@]}"; do
+            [ "$protocol" = "tcp" ] && [ "$tracked_port" = "$port" ] && matched=1
+        done
+        if [ "$matched" -eq 0 ]; then
+            printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+            continue
+        fi
+
+        case "$backend" in
+            ufw)
+                if ! command -v ufw >/dev/null 2>&1; then
+                    printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+                    failed=1
+                elif ufw show added 2>/dev/null \
+                    | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${tracked_port}/tcp([[:space:]]|$)" \
+                    && ! ufw --force delete allow "$tracked_port/tcp" >/dev/null 2>&1; then
+                    printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+                    failed=1
+                fi
+                ;;
+            firewalld)
+                if ! command -v firewall-cmd >/dev/null 2>&1 \
+                    || ! firewall-cmd --state >/dev/null 2>&1; then
+                    printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+                    failed=1
+                elif firewall-cmd --permanent --query-port="$tracked_port/tcp" >/dev/null 2>&1; then
+                    if firewall-cmd --permanent --remove-port="$tracked_port/tcp" >/dev/null 2>&1; then
+                        firewalld_changed=1
+                    else
+                        printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+                        failed=1
+                    fi
+                fi
+                ;;
+            *)
+                printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
+                failed=1
+                ;;
+        esac
+    done < "$FIREWALL_STATE_FILE"
+
+    if [ "$firewalld_changed" -ne 0 ] && ! firewall-cmd --reload >/dev/null 2>&1; then
+        failed=1
+    fi
+    if [ -s "$remaining_file" ]; then
+        mv -f "$remaining_file" "$FIREWALL_STATE_FILE" || failed=1
+    else
+        rm -f "$remaining_file" "$FIREWALL_STATE_FILE" || failed=1
+    fi
+    return "$failed"
+}
+
 # Remove WildPaqet/Paqet protection rules derived from live configs
 cleanup_paqet_iptables_from_configs() {
     command -v iptables &>/dev/null || return 0
 
     local config port sip sport proto endpoint
+    local -a requested_configs=("$@")
     while IFS= read -r -d '' config; do
         local role
         role=$(grep "^role:" "$config" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
@@ -7052,7 +7172,13 @@ cleanup_paqet_iptables_from_configs() {
                 fi
             done < <(grep -E 'listen:[[:space:]]*"' "$config" 2>/dev/null | grep -oE ':[0-9]+' | tr -d ':' | sort -u)
         fi
-    done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+    done < <(
+        if [ ${#requested_configs[@]} -gt 0 ]; then
+            printf '%s\0' "${requested_configs[@]}"
+        else
+            find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null
+        fi
+    )
 }
 
 cleanup_wildpaqet_bot_silent() {
