@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.3-v3
+# Version: 9.4-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.3-v3"
+readonly SCRIPT_VERSION="9.4-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -53,12 +53,18 @@ readonly TELEGRAM_API_BASE="${TELEGRAM_API_BASE:-https://api.telegram.org}"
 readonly DEFAULT_TCP_PRESET="default"
 
 # Kernel optimization settings (Safe/Auto network optimizer)
-readonly SYSCTL_FILE="/etc/sysctl.d/99-paqet-tunnel.conf"
-readonly LIMITS_FILE="/etc/security/limits.d/99-paqet.conf"
-readonly NETOPT_STATE_DIR="/var/lib/wildpaqet/netopt"
+readonly STATE_DIR="${WILDPAQET_STATE_DIR:-/var/lib/wildpaqet}"
+readonly SYSCTL_FILE="${WILDPAQET_SYSCTL_FILE:-/etc/sysctl.d/99-paqet-tunnel.conf}"
+readonly LIMITS_FILE="${WILDPAQET_LIMITS_FILE:-/etc/security/limits.d/99-paqet.conf}"
+readonly NETOPT_STATE_DIR="${WILDPAQET_NETOPT_STATE_DIR:-$STATE_DIR/netopt}"
 readonly NETOPT_MARKER="wildpaqet-managed"
 readonly NETOPT_QDISC_UNIT="wildpaqet-qdisc.service"
-readonly NETOPT_QDISC_SCRIPT="/usr/local/lib/wildpaqet/fix-qdisc.sh"
+readonly NETOPT_QDISC_SCRIPT="${WILDPAQET_QDISC_SCRIPT:-/usr/local/lib/wildpaqet/fix-qdisc.sh}"
+readonly FIREWALL_COMMENT="wildpaqet-managed"
+readonly FIREWALL_STATE_FILE="${WILDPAQET_FIREWALL_STATE_FILE:-$STATE_DIR/firewall.rules}"
+readonly IP_FORWARD_FILE="${WILDPAQET_IP_FORWARD_FILE:-/etc/sysctl.d/30-ip_forward.conf}"
+readonly IP_FORWARD_BACKUP="$STATE_DIR/ip-forward.before"
+readonly IP_FORWARD_ABSENT_MARKER="$STATE_DIR/ip-forward.absent"
 
 # Default Values
 readonly DEFAULT_LISTEN_PORT="8888"
@@ -674,6 +680,30 @@ compare_floats() {
 # CONFIGURATION FUNCTIONS
 # ================================================
 
+ensure_state_dir() {
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 1
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+}
+
+# Persist only firewall rules that this script actually introduced. Existing
+# UFW/firewalld allowances are deliberately not claimed or removed later.
+record_managed_firewall_rule() {
+    local backend="$1"
+    local protocol="$2"
+    local port="$3"
+    validate_port "$port" || return 1
+    case "$backend:$protocol" in
+        ufw:tcp|firewalld:tcp) ;;
+        *) return 1 ;;
+    esac
+
+    ensure_state_dir || return 1
+    touch "$FIREWALL_STATE_FILE" || return 1
+    chmod 600 "$FIREWALL_STATE_FILE" 2>/dev/null || true
+    local entry="$backend|$protocol|$port"
+    grep -Fxq "$entry" "$FIREWALL_STATE_FILE" 2>/dev/null || printf '%s\n' "$entry" >> "$FIREWALL_STATE_FILE"
+}
+
 # Configure iptables
 configure_iptables() {
     local port="$1"
@@ -690,20 +720,24 @@ configure_iptables() {
     [ "$protocol" = "both" ] && protocols=("tcp" "udp") || protocols=("$protocol")
     
     for proto in "${protocols[@]}"; do
+        iptables -t raw -D PREROUTING -p "$proto" --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || true
+        iptables -t raw -D OUTPUT -p "$proto" --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || true
         iptables -t raw -D PREROUTING -p "$proto" --dport "$port" -j NOTRACK 2>/dev/null || true
         iptables -t raw -D OUTPUT -p "$proto" --sport "$port" -j NOTRACK 2>/dev/null || true
         
-        iptables -t raw -A PREROUTING -p "$proto" --dport "$port" -j NOTRACK
-        iptables -t raw -A OUTPUT -p "$proto" --sport "$port" -j NOTRACK
+        iptables -t raw -A PREROUTING -p "$proto" --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+        iptables -t raw -A OUTPUT -p "$proto" --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
         
         if [ "$proto" = "tcp" ]; then
             # Drop kernel RSTs on BOTH directions: the local kernel has no socket
             # for our raw flow, so it would answer inbound segments with a RST and
             # also emit outbound RSTs — either one tears the tunnel down.
+            iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || true
+            iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || true
             iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
-            iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
             iptables -t mangle -D PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
-            iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+            iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
+            iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
         fi
     done
     
@@ -722,14 +756,18 @@ protect_client_peer() {
     validate_ip "$sip" 2>/dev/null || return 0
     validate_port "$sport" 2>/dev/null || return 0
 
-    iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || \
-        iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
-    iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || \
-        iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
-    iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
-        iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
-    iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
-        iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP
+    iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+    iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || \
+        iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+    iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
+        iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
+        iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
+    iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
+        iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || \
+        iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
 }
 
 # Protect a client's primary server.addr plus every server.addrs[] failover
@@ -1454,13 +1492,29 @@ configure_tls_firewall() {
     print_step "Opening TCP/$port for the v3 TLS listener..."
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw allow "$port/tcp" >/dev/null 2>&1 || return 1
+        if ! ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/tcp[[:space:]]+ALLOW"; then
+            ufw allow "$port/tcp" >/dev/null 2>&1 || return 1
+            if ! record_managed_firewall_rule ufw tcp "$port"; then
+                ufw --force delete allow "$port/tcp" >/dev/null 2>&1 || true
+                return 1
+            fi
+        fi
     elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || return 1
-        firewall-cmd --reload >/dev/null 2>&1 || return 1
+        if ! firewall-cmd --permanent --query-port="$port/tcp" >/dev/null 2>&1; then
+            firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || return 1
+            firewall-cmd --reload >/dev/null 2>&1 || return 1
+            if ! record_managed_firewall_rule firewalld tcp "$port"; then
+                firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1 || true
+                firewall-cmd --reload >/dev/null 2>&1 || true
+                return 1
+            fi
+        fi
     elif command -v iptables >/dev/null 2>&1; then
-        iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null || \
-            iptables -A INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED \
+            -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT 2>/dev/null || \
+            iptables -C INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null || \
+            iptables -A INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED \
+                -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT
         save_iptables
     else
         print_warning "No supported firewall manager found; open TCP/$port manually"
@@ -4569,6 +4623,12 @@ optimizer_latest_snapshot() {
     [ -n "$d" ] && [ -d "$d" ] && echo "$d"
 }
 
+optimizer_oldest_snapshot() {
+    local d
+    d=$(ls -1dt "$NETOPT_STATE_DIR"/snap-* 2>/dev/null | tail -1)
+    [ -n "$d" ] && [ -d "$d" ] && echo "$d"
+}
+
 optimizer_snapshot() {
     local stamp snap
     stamp=$(date +%Y%m%d-%H%M%S)
@@ -4798,7 +4858,35 @@ optimizer_verify() {
     [ "$ok" -eq 1 ]
 }
 
-# Restore snapshot then drop owned files. Used by menu rollback and uninstall.
+optimizer_restore_qdisc_snapshot() {
+    local snap="$1"
+    command -v tc >/dev/null 2>&1 || return 0
+
+    local qfile iface root_kind line parent
+    for qfile in "$snap"/qdisc/*.txt; do
+        [ -f "$qfile" ] || continue
+        iface=$(basename "$qfile" .txt)
+        ip link show "$iface" >/dev/null 2>&1 || continue
+        root_kind=$(awk '/^qdisc / && $0 !~ /parent/ {print $2; exit}' "$qfile")
+        case "$root_kind" in
+            fq)
+                tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
+                ;;
+            mq)
+                while IFS= read -r line; do
+                    [[ "$line" =~ ^qdisc\ fq\  ]] || continue
+                    parent=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i=="parent"){print $(i+1); exit}}')
+                    [ -n "$parent" ] || continue
+                    tc qdisc replace dev "$iface" parent "$parent" fq >/dev/null 2>&1 || true
+                done < "$qfile"
+                ;;
+        esac
+    done
+}
+
+# Restore the selected snapshot. Menu rollback uses the newest snapshot; full
+# uninstall selects the oldest one so repeated optimizer runs return to the
+# true pre-WildPaqet baseline.
 optimizer_restore_snapshot() {
     local snap="${1:-}"
     if [ -z "$snap" ]; then
@@ -4821,6 +4909,10 @@ optimizer_restore_snapshot() {
         rm -f "$LIMITS_FILE"
     fi
 
+    # Reload restored distro/user drop-ins first, then reapply captured runtime
+    # values so sysctl --system cannot overwrite the snapshot.
+    sysctl --system >/dev/null 2>&1 || true
+
     local keyfile key val
     for keyfile in "$snap"/sysctl_values/*; do
         [ -f "$keyfile" ] || continue
@@ -4830,14 +4922,7 @@ optimizer_restore_snapshot() {
         sysctl -w "$key=$val" >/dev/null 2>&1 || true
     done
 
-    # Best-effort: if snap captured fq, migrate to fq_codel for safety on tunnel hosts
-    local iface
-    while IFS= read -r iface; do
-        [ -n "$iface" ] || continue
-        optimizer_fix_fq_on_iface "$iface" 0 || true
-    done < <(optimizer_detect_target_ifaces)
-
-    sysctl --system >/dev/null 2>&1 || true
+    optimizer_restore_qdisc_snapshot "$snap"
     print_success "Snapshot restored"
     return 0
 }
@@ -5625,20 +5710,24 @@ apply_connection_protection() {
             # Apply protection rules (check before add)
             local added=0
             
+            iptables -t raw -C PREROUTING -p tcp --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
             iptables -t raw -C PREROUTING -p tcp --dport "$port" -j NOTRACK 2>/dev/null || {
-                iptables -t raw -A PREROUTING -p tcp --dport "$port" -j NOTRACK
+                iptables -t raw -A PREROUTING -p tcp --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
                 ((added++))
             }
+            iptables -t raw -C OUTPUT -p tcp --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
             iptables -t raw -C OUTPUT -p tcp --sport "$port" -j NOTRACK 2>/dev/null || {
-                iptables -t raw -A OUTPUT -p tcp --sport "$port" -j NOTRACK
+                iptables -t raw -A OUTPUT -p tcp --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
                 ((added++))
             }
+            iptables -t mangle -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
             iptables -t mangle -C OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
+                iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
                 ((added++))
             }
+            iptables -t mangle -C PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
             iptables -t mangle -C PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
+                iptables -t mangle -A PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
                 ((added++))
             }
             
@@ -5673,14 +5762,18 @@ apply_connection_protection() {
             for peer in "${peers[@]}"; do
                 sip="${peer%:*}"
                 sport="${peer##*:}"
+                iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
                 iptables -t raw -C OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK 2>/dev/null || {
-                    iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK; ((added++)); }
+                    iptables -t raw -A OUTPUT -p tcp -d "$sip" --dport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK; ((added++)); }
+                iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK 2>/dev/null || \
                 iptables -t raw -C PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK 2>/dev/null || {
-                    iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK; ((added++)); }
+                    iptables -t raw -A PREROUTING -p tcp -s "$sip" --sport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK; ((added++)); }
+                iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
                 iptables -t mangle -C OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                    iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP; ((added++)); }
+                    iptables -t mangle -A OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP; ((added++)); }
+                iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP 2>/dev/null || \
                 iptables -t mangle -C PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP 2>/dev/null || {
-                    iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -j DROP; ((added++)); }
+                    iptables -t mangle -A PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP; ((added++)); }
             done
 
             if [ $added -gt 0 ]; then
@@ -6308,11 +6401,54 @@ delete_all_tunnels() {
 # NAT PORT FORWARDING FUNCTIONS
 # ================================================
 
+snapshot_ip_forwarding_dropin() {
+    ensure_state_dir || return 1
+    [ -e "$IP_FORWARD_BACKUP" ] || [ -e "$IP_FORWARD_ABSENT_MARKER" ] || {
+        if [ -e "$IP_FORWARD_FILE" ]; then
+            cp -a "$IP_FORWARD_FILE" "$IP_FORWARD_BACKUP" || return 1
+        else
+            touch "$IP_FORWARD_ABSENT_MARKER" || return 1
+        fi
+    }
+}
+
+write_managed_ip_forwarding_dropin() {
+    local value="$1"
+    [[ "$value" =~ ^[01]$ ]] || return 1
+    snapshot_ip_forwarding_dropin || return 1
+    {
+        echo "# WildPaqet NAT helper ($NETOPT_MARKER)"
+        echo "net.ipv4.ip_forward=$value"
+    } > "$IP_FORWARD_FILE"
+}
+
+restore_ip_forwarding_dropin() {
+    if [ -e "$IP_FORWARD_BACKUP" ]; then
+        cp -a "$IP_FORWARD_BACKUP" "$IP_FORWARD_FILE" 2>/dev/null || return 1
+    elif [ -e "$IP_FORWARD_ABSENT_MARKER" ]; then
+        rm -f "$IP_FORWARD_FILE" 2>/dev/null || return 1
+    elif [ -f "$IP_FORWARD_FILE" ]; then
+        # Backward compatibility for versions that wrote an unmarked one-line
+        # 30-ip_forward.conf. Never remove a file with any other content.
+        local content
+        content=$(tr -d '\r' < "$IP_FORWARD_FILE" 2>/dev/null)
+        if grep -q "$NETOPT_MARKER" "$IP_FORWARD_FILE" 2>/dev/null \
+            || [ "$content" = "net.ipv4.ip_forward=1" ] \
+            || [ "$content" = "net.ipv4.ip_forward=0" ]; then
+            rm -f "$IP_FORWARD_FILE" 2>/dev/null || return 1
+        fi
+    fi
+    rm -f "$IP_FORWARD_BACKUP" "$IP_FORWARD_ABSENT_MARKER" 2>/dev/null || true
+}
+
 ensure_ip_forwarding() {
     local current=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
     if [ "$current" != "1" ]; then
         print_step "Enabling IP forwarding..."
-        echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/30-ip_forward.conf
+        write_managed_ip_forwarding_dropin 1 || {
+            print_error "Could not safely snapshot/write $IP_FORWARD_FILE"
+            return 1
+        }
         sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
         sysctl --system > /dev/null 2>&1
         print_success "IP forwarding enabled"
@@ -6351,16 +6487,20 @@ add_nat_forward_multi_port() {
         print_error "Invalid port format. Use comma-separated numbers (e.g. 443,8443)."
     done
     
-    ensure_ip_forwarding
+    ensure_ip_forwarding || { pause; return 1; }
     
     print_step "Adding NAT forwarding rules: ports $ports -> $dest_ip ..."
     
     # TCP
-    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $ports -j DNAT --to-destination $dest_ip
-    iptables -t nat -A POSTROUTING -p tcp --match multiport --dports $ports -j MASQUERADE
+    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j DNAT --to-destination "$dest_ip"
+    iptables -t nat -A POSTROUTING -p tcp --match multiport --dports $ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j MASQUERADE
     # UDP
-    iptables -t nat -A PREROUTING -p udp --match multiport --dports $ports -j DNAT --to-destination $dest_ip
-    iptables -t nat -A POSTROUTING -p udp --match multiport --dports $ports -j MASQUERADE
+    iptables -t nat -A PREROUTING -p udp --match multiport --dports $ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j DNAT --to-destination "$dest_ip"
+    iptables -t nat -A POSTROUTING -p udp --match multiport --dports $ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j MASQUERADE
     
     save_iptables
     print_success "NAT forwarding added: ports $ports -> $dest_ip (TCP+UDP)"
@@ -6422,17 +6562,21 @@ add_nat_forward_all_ports() {
         fi
     fi
     
-    ensure_ip_forwarding
+    ensure_ip_forwarding || { pause; return 1; }
     
     print_step "Adding all-ports NAT forwarding to $dest_ip (excluding $exclude_ports)..."
     
     # First: redirect excluded ports back to this server (keeps them local)
-    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $exclude_ports -j DNAT --to-destination $relay_ip
-    iptables -t nat -A PREROUTING -p udp --match multiport --dports $exclude_ports -j DNAT --to-destination $relay_ip
+    iptables -t nat -A PREROUTING -p tcp --match multiport --dports $exclude_ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j DNAT --to-destination "$relay_ip"
+    iptables -t nat -A PREROUTING -p udp --match multiport --dports $exclude_ports \
+        -m comment --comment "$FIREWALL_COMMENT" -j DNAT --to-destination "$relay_ip"
     # Then: catch-all forward everything else to destination
-    iptables -t nat -A PREROUTING -p tcp -j DNAT --to-destination $dest_ip
-    iptables -t nat -A PREROUTING -p udp -j DNAT --to-destination $dest_ip
-    iptables -t nat -A POSTROUTING -j MASQUERADE
+    iptables -t nat -A PREROUTING -p tcp -m comment --comment "$FIREWALL_COMMENT" \
+        -j DNAT --to-destination "$dest_ip"
+    iptables -t nat -A PREROUTING -p udp -m comment --comment "$FIREWALL_COMMENT" \
+        -j DNAT --to-destination "$dest_ip"
+    iptables -t nat -A POSTROUTING -m comment --comment "$FIREWALL_COMMENT" -j MASQUERADE
     
     save_iptables
     print_success "All-ports NAT forwarding added to $dest_ip (excluding $exclude_ports)"
@@ -6531,7 +6675,11 @@ flush_nat_rules() {
     echo ""
     read -p "Also disable IP forwarding? (y/N): " disable_fwd
     if [[ "$disable_fwd" =~ ^[Yy]$ ]]; then
-        echo "net.ipv4.ip_forward=0" > /etc/sysctl.d/30-ip_forward.conf
+        write_managed_ip_forwarding_dropin 0 || {
+            print_error "Could not safely snapshot/write $IP_FORWARD_FILE"
+            pause
+            return 1
+        }
         sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1
         sysctl --system > /dev/null 2>&1
         print_success "IP forwarding disabled"
@@ -6572,6 +6720,98 @@ save_iptables() {
 # UNINSTALL & UTILITY FUNCTIONS
 # ================================================
 
+# Remove every iptables rule created by current versions, even when its YAML
+# was deleted manually. The comment is attached to raw/mangle/filter/NAT rules.
+cleanup_tagged_iptables_rules() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    local table chain number
+    while read -r table chain; do
+        while true; do
+            number=$(iptables -t "$table" -L "$chain" --line-numbers -n 2>/dev/null \
+                | awk -v marker="$FIREWALL_COMMENT" 'index($0, marker) {print $1; exit}')
+            [[ "$number" =~ ^[0-9]+$ ]] || break
+            iptables -t "$table" -D "$chain" "$number" 2>/dev/null || break
+        done
+    done <<'EOF'
+raw PREROUTING
+raw OUTPUT
+mangle PREROUTING
+mangle OUTPUT
+filter INPUT
+filter OUTPUT
+nat PREROUTING
+nat POSTROUTING
+EOF
+}
+
+cleanup_managed_firewall_rules() {
+    local backend protocol port firewalld_changed=0 failed=0
+    local remaining_file="${FIREWALL_STATE_FILE}.remaining.$$"
+    local firewalld_reload_file="${FIREWALL_STATE_FILE}.firewalld-reload.$$"
+    rm -f "$remaining_file" "$firewalld_reload_file" 2>/dev/null || true
+    if [ -f "$FIREWALL_STATE_FILE" ]; then
+        while IFS='|' read -r backend protocol port; do
+            if ! validate_port "$port" 2>/dev/null || [ "$protocol" != "tcp" ]; then
+                printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                failed=1
+                continue
+            fi
+            case "$backend" in
+                ufw)
+                    local ufw_added=""
+                    if ! command -v ufw >/dev/null 2>&1 \
+                        || ! ufw_added=$(ufw show added 2>/dev/null); then
+                        printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                        failed=1
+                    elif printf '%s\n' "$ufw_added" | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${port}/tcp([[:space:]]|$)" \
+                        && ! ufw --force delete allow "$port/tcp" >/dev/null 2>&1; then
+                        printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                        failed=1
+                    fi
+                    ;;
+                firewalld)
+                    if command -v firewall-cmd >/dev/null 2>&1 \
+                        && firewall-cmd --state >/dev/null 2>&1; then
+                        if firewall-cmd --permanent --query-port="$port/tcp" >/dev/null 2>&1; then
+                            if firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1; then
+                                firewalld_changed=1
+                                printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$firewalld_reload_file"
+                            else
+                                printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                                failed=1
+                            fi
+                        fi
+                    else
+                        printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                        failed=1
+                    fi
+                    ;;
+                *)
+                    printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
+                    failed=1
+                    ;;
+            esac
+        done < "$FIREWALL_STATE_FILE"
+    fi
+    if [ "$firewalld_changed" -ne 0 ]; then
+        if firewall-cmd --reload >/dev/null 2>&1; then
+            rm -f "$firewalld_reload_file" 2>/dev/null || true
+        else
+            cat "$firewalld_reload_file" >> "$remaining_file" 2>/dev/null || true
+            failed=1
+        fi
+    fi
+    cleanup_tagged_iptables_rules
+    if [ -s "$remaining_file" ]; then
+        mv -f "$remaining_file" "$FIREWALL_STATE_FILE" 2>/dev/null || true
+        chmod 600 "$FIREWALL_STATE_FILE" 2>/dev/null || true
+    else
+        rm -f "$remaining_file" "$FIREWALL_STATE_FILE" 2>/dev/null || true
+    fi
+    rm -f "$firewalld_reload_file" 2>/dev/null || true
+    return "$failed"
+}
+
 # Delete matching iptables rules repeatedly (duplicates possible)
 _iptables_delete_loop() {
     local table="$1"
@@ -6580,6 +6820,15 @@ _iptables_delete_loop() {
     for ((i=0; i<20; i++)); do
         iptables -t "$table" -D "$@" 2>/dev/null || return 0
     done
+}
+
+cleanup_tls_iptables_port() {
+    local port="$1"
+    validate_port "$port" 2>/dev/null || return 0
+    _iptables_delete_loop filter INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED \
+        -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT
+    # Legacy v3 releases created this same rule without an ownership comment.
+    _iptables_delete_loop filter INPUT -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
 }
 
 # Remove WildPaqet/Paqet protection rules derived from live configs
@@ -6599,12 +6848,17 @@ cleanup_paqet_iptables_from_configs() {
                        head -1 | sed -n 's/.*:\([0-9]*\)".*/\1/p' | tr -d ' ')
             fi
             if validate_port "$port"; then
+                cleanup_tls_iptables_port "$port"
                 for proto in tcp udp; do
+                    _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+                    _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
                     _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -j NOTRACK
                     _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -j NOTRACK
                     _iptables_delete_loop filter INPUT -p "$proto" --dport "$port" -j ACCEPT
                     _iptables_delete_loop filter OUTPUT -p "$proto" --sport "$port" -j ACCEPT
                 done
+                _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
+                _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
                 _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
                 _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
             fi
@@ -6616,6 +6870,10 @@ cleanup_paqet_iptables_from_configs() {
                 sip="${endpoint%%:*}"
                 sport="${endpoint##*:}"
                 if [ -n "$sip" ] && validate_port "$sport"; then
+                    _iptables_delete_loop raw OUTPUT -p tcp -d "$sip" --dport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+                    _iptables_delete_loop raw PREROUTING -p tcp -s "$sip" --sport "$sport" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+                    _iptables_delete_loop mangle OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
+                    _iptables_delete_loop mangle PREROUTING -p tcp -s "$sip" --sport "$sport" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
                     _iptables_delete_loop raw OUTPUT -p tcp -d "$sip" --dport "$sport" -j NOTRACK
                     _iptables_delete_loop raw PREROUTING -p tcp -s "$sip" --sport "$sport" -j NOTRACK
                     _iptables_delete_loop mangle OUTPUT -p tcp -d "$sip" --dport "$sport" --tcp-flags RST RST -j DROP
@@ -6647,10 +6905,15 @@ cleanup_paqet_iptables_from_configs() {
             while IFS= read -r port; do
                 [ -z "$port" ] && continue
                 if validate_port "$port"; then
+                    cleanup_tls_iptables_port "$port"
                     for proto in tcp udp; do
+                        _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
+                        _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -m comment --comment "$FIREWALL_COMMENT" -j NOTRACK
                         _iptables_delete_loop raw PREROUTING -p "$proto" --dport "$port" -j NOTRACK
                         _iptables_delete_loop raw OUTPUT -p "$proto" --sport "$port" -j NOTRACK
                     done
+                    _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
+                    _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -m comment --comment "$FIREWALL_COMMENT" -j DROP
                     _iptables_delete_loop mangle OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP
                     _iptables_delete_loop mangle PREROUTING -p tcp --dport "$port" --tcp-flags RST RST -j DROP
                 fi
@@ -6663,31 +6926,117 @@ cleanup_wildpaqet_bot_silent() {
     systemctl stop "${BOT_SERVICE:-telegram-paqet-bot}" 2>/dev/null || true
     systemctl disable "${BOT_SERVICE:-telegram-paqet-bot}" 2>/dev/null || true
     rm -f "/etc/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" 2>/dev/null || true
+    rm -f "/lib/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" 2>/dev/null || true
+    rm -f "/usr/lib/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" 2>/dev/null || true
+    find /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system -type l \
+        -name "${BOT_SERVICE:-telegram-paqet-bot}.service" -delete 2>/dev/null || true
     rm -f "${BOT_SCRIPT:-/usr/local/bin/telegram-paqet-bot}" 2>/dev/null || true
     rm -rf "${BOT_CONFIG_DIR:-/etc/telegram-paqet-bot}" 2>/dev/null || true
     rm -f "${BOT_LOG_FILE:-/var/log/telegram-paqet-bot.log}" 2>/dev/null || true
 }
 
 cleanup_kernel_optimizations_silent() {
-    # Prefer exact snapshot restore (same path as menu Rollback); avoid forcing cubic/pfifo.
+    # Stop persistence before restoring the oldest snapshot (the baseline that
+    # predates the first optimizer run, not a later WildPaqet profile).
+    optimizer_remove_qdisc_persistence >/dev/null 2>&1 || true
+    restore_ip_forwarding_dropin >/dev/null 2>&1 || true
+    local restored=0
     if [ -d "$NETOPT_STATE_DIR" ]; then
         local snap
-        snap=$(optimizer_latest_snapshot 2>/dev/null || true)
+        snap=$(optimizer_oldest_snapshot 2>/dev/null || true)
         if [ -n "$snap" ] && [ -d "$snap" ]; then
-            optimizer_restore_snapshot "$snap" >/dev/null 2>&1 || true
+            optimizer_restore_snapshot "$snap" >/dev/null 2>&1 && restored=1
         fi
     fi
-    rm -f "$SYSCTL_FILE" 2>/dev/null || true
-    rm -f "$LIMITS_FILE" 2>/dev/null || true
-    optimizer_remove_qdisc_persistence >/dev/null 2>&1 || true
-    # IP forward file created by NAT helpers in this script
-    rm -f /etc/sysctl.d/30-ip_forward.conf 2>/dev/null || true
+
+    if [ "$restored" -eq 0 ]; then
+        grep -q "$NETOPT_MARKER" "$SYSCTL_FILE" 2>/dev/null && rm -f "$SYSCTL_FILE" 2>/dev/null || true
+        grep -q "$NETOPT_MARKER" "$LIMITS_FILE" 2>/dev/null && rm -f "$LIMITS_FILE" 2>/dev/null || true
+        sysctl --system >/dev/null 2>&1 || true
+    fi
+
     rm -rf "$NETOPT_STATE_DIR" 2>/dev/null || true
-    sysctl --system >/dev/null 2>&1 || true
-    # Keep tunnel-safe egress qdisc if still on fq from an old/legacy optimizer
-    optimizer_apply_qdisc_targets >/dev/null 2>&1 || true
-    sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || \
-        sysctl -w net.core.default_qdisc=pfifo_fast >/dev/null 2>&1 || true
+}
+
+verify_full_uninstall_cleanup() {
+    local leftovers=()
+    local path unit table chain
+    for path in \
+        "$BIN_DIR/paqet" "$CONFIG_DIR" "$INSTALL_DIR" "$CORE_SRC_DIR" "$GO_TOOLCHAIN_DIR" \
+        "$MANAGER_PATH" /usr/local/bin/paqet-manager /usr/bin/paqet /usr/bin/wildpaqet \
+        /usr/bin/paqet-manager /bin/wildpaqet "$STATE_DIR" "$NETOPT_QDISC_SCRIPT" \
+        "$(dirname "$NETOPT_QDISC_SCRIPT")" /root/paqet "$BACKUP_DIR" \
+        "/etc/systemd/system/$NETOPT_QDISC_UNIT" \
+        "/etc/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" \
+        "/lib/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" \
+        "/usr/lib/systemd/system/${BOT_SERVICE:-telegram-paqet-bot}.service" \
+        "${BOT_SCRIPT:-/usr/local/bin/telegram-paqet-bot}" \
+        "${BOT_CONFIG_DIR:-/etc/telegram-paqet-bot}" \
+        "${BOT_LOG_FILE:-/var/log/telegram-paqet-bot.log}"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            leftovers+=("$path")
+        fi
+    done
+    for path in "$BIN_DIR"/paqet.bak-* "$BIN_DIR"/paqet.bak.*; do
+        [ -e "$path" ] && leftovers+=("$path")
+    done
+    for path in /tmp/paqet.tar.gz /tmp/paqet-extract.* /tmp/paqet_linux_* \
+        /tmp/paqet-linux-* /tmp/wildpaqet-go-* /tmp/wildpaqet-core-*; do
+        [ -e "$path" ] && leftovers+=("$path")
+    done
+    for path in "$SERVICE_DIR"/paqet.service "$SERVICE_DIR"/paqet-*.service \
+        /lib/systemd/system/paqet.service /lib/systemd/system/paqet-*.service \
+        /usr/lib/systemd/system/paqet.service /usr/lib/systemd/system/paqet-*.service \
+        "$SERVICE_DIR"/paqet.service.d "$SERVICE_DIR"/paqet-*.service.d; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            leftovers+=("$path")
+        fi
+    done
+    while IFS= read -r path; do
+        [ -n "$path" ] && leftovers+=("$path")
+    done < <(find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -type l \
+        \( -name 'paqet.service' -o -name 'paqet-*.service' \) -print 2>/dev/null)
+    while IFS= read -r path; do
+        [ -n "$path" ] && leftovers+=("$path")
+    done < <(find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -type l \
+        -name "${BOT_SERVICE:-telegram-paqet-bot}.service" -print 2>/dev/null)
+
+    while IFS= read -r unit; do
+        [ -n "$unit" ] && leftovers+=("systemd:$unit")
+    done < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | awk '/^paqet(-.*)?\.service/ {print $1}')
+    unit=$(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | awk '$1 == "telegram-paqet-bot.service" {print $1; exit}')
+    [ -z "$unit" ] || leftovers+=("systemd:$unit")
+
+    if crontab -l 2>/dev/null | grep -Eq 'systemctl[[:space:]]+restart[[:space:]]+paqet(-[^[:space:]]+|\.service)?([[:space:]]|$)|/usr/local/bin/paqet|/opt/paqet'; then
+        leftovers+=("root-crontab:paqet")
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        while read -r table chain; do
+            if iptables -t "$table" -L "$chain" -n 2>/dev/null | grep -q "$FIREWALL_COMMENT"; then
+                leftovers+=("iptables:$table/$chain")
+            fi
+        done <<'EOF'
+raw PREROUTING
+raw OUTPUT
+mangle PREROUTING
+mangle OUTPUT
+filter INPUT
+filter OUTPUT
+nat PREROUTING
+nat POSTROUTING
+EOF
+    fi
+
+    if [ ${#leftovers[@]} -gt 0 ]; then
+        print_error "Uninstall verification found ${#leftovers[@]} leftover item(s):"
+        printf '  - %s\n' "${leftovers[@]}"
+        return 1
+    fi
+    print_success "Post-uninstall verification passed: no managed artifacts remain"
+    return 0
 }
 
 # Full uninstall: remove every WildPaqet/Paqet script + tunnel artifact
@@ -6708,11 +7057,11 @@ uninstall_paqet() {
     echo -e "  • Manager: ${CYAN}wildpaqet${NC} (+ legacy paqet-manager links)"
     echo -e "  • Telegram bot service/files/logs"
     echo -e "  • Kernel sysctl/limits drop-ins from this script"
-    echo -e "  • Paqet iptables protection (raw/mangle/filter from configs)"
+    echo -e "  • Managed firewall/NAT rules (iptables marker + tracked UFW/firewalld rules)"
     echo -e "  • Download cache ${CYAN}/root/paqet${NC} and backups ${CYAN}$BACKUP_DIR${NC}"
     echo -e "  • Temp build/extract files under /tmp/paqet*"
     echo ""
-    echo -e "${CYAN}Optional (asked once):${NC} flush entire iptables NAT table"
+    echo -e "${CYAN}Optional (asked once):${NC} flush untracked legacy NAT rules"
     echo ""
     echo -e "${RED}Type YES to continue full uninstall:${NC}"
     read -p "> " confirm
@@ -6725,11 +7074,15 @@ uninstall_paqet() {
     # --- 1) iptables protection (before deleting configs) ---
     print_step "Removing Paqet iptables protection rules..."
     cleanup_paqet_iptables_from_configs
-    print_success "Protection rules cleaned (best-effort from configs)"
+    if cleanup_managed_firewall_rules; then
+        print_success "Managed firewall and NAT rules cleaned"
+    else
+        print_warning "Some tracked firewall rules could not be removed; final verification will list their state"
+    fi
 
     # --- 2) NAT leftovers (optional — can affect non-Paqet DNAT) ---
     echo ""
-    read -p "Flush ALL iptables NAT rules (DNAT/MASQUERADE)? Recommended if you used NAT helpers (y/N): " flush_nat
+    read -p "Flush ALL remaining iptables NAT rules, including non-WildPaqet rules? (y/N): " flush_nat
     if [[ "$flush_nat" =~ ^[Yy]$ ]]; then
         print_step "Flushing NAT table..."
         if command -v iptables &>/dev/null; then
@@ -6749,9 +7102,10 @@ uninstall_paqet() {
         [ -n "$unit" ] && services+=("$unit")
     done < <(
         {
-            systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '/^paqet-.*\.service/ {print $1}'
-            systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '/paqet-.*\.service/ {print $1}'
-            find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -maxdepth 1 -name 'paqet-*.service' -printf '%f\n' 2>/dev/null
+            systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '/^paqet(-.*)?\.service/ {print $1}'
+            systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '$1 ~ /^paqet(-.*)?\.service$/ {print $1}'
+            find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -maxdepth 1 \
+                \( -name 'paqet.service' -o -name 'paqet-*.service' \) -printf '%f\n' 2>/dev/null
         } | sed 's/\.service$/.service/' | sort -u
     )
 
@@ -6767,10 +7121,13 @@ uninstall_paqet() {
         rm -f "/lib/systemd/system/$service" 2>/dev/null || true
         rm -f "/usr/lib/systemd/system/$service" 2>/dev/null || true
     done
+    find "$SERVICE_DIR" /lib/systemd/system /usr/lib/systemd/system -type l \
+        \( -name 'paqet.service' -o -name 'paqet-*.service' \) -delete 2>/dev/null || true
+    rm -rf "$SERVICE_DIR"/paqet.service.d "$SERVICE_DIR"/paqet-*.service.d 2>/dev/null || true
 
     # Catch leftover paqet restart cron lines (any user crontab for root)
     if crontab -l >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -vE 'systemctl[[:space:]]+restart[[:space:]]+paqet-|/usr/local/bin/paqet|/opt/paqet' | crontab - 2>/dev/null || true
+        crontab -l 2>/dev/null | grep -vE 'systemctl[[:space:]]+restart[[:space:]]+paqet(-[^[:space:]]+|\.service)?([[:space:]]|$)|/usr/local/bin/paqet|/opt/paqet' | crontab - 2>/dev/null || true
     fi
 
     # --- 4) Telegram bot ---
@@ -6819,8 +7176,11 @@ uninstall_paqet() {
     rm -f /tmp/paqet_linux_* 2>/dev/null || true
     rm -f /tmp/paqet-linux-* 2>/dev/null || true
     rm -f /tmp/wildpaqet-go-* 2>/dev/null || true
+    rm -f /tmp/wildpaqet-core-* 2>/dev/null || true
     # orphaned mktemp dirs if glob failed on some shells
     find /tmp -maxdepth 1 -type d -name 'paqet-extract.*' -exec rm -rf {} + 2>/dev/null || true
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    rmdir "$(dirname "$NETOPT_QDISC_SCRIPT")" 2>/dev/null || true
     print_success "Removed /root/paqet, $BACKUP_DIR, and /tmp/paqet* leftovers"
 
     # --- 9) Persist firewall + reload units ---
@@ -6829,18 +7189,27 @@ uninstall_paqet() {
     systemctl reset-failed 2>/dev/null || true
     save_iptables >/dev/null 2>&1 || true
 
+    local verification_ok=1
+    verify_full_uninstall_cleanup || verification_ok=0
+
     echo ""
-    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}✅ WildPaqet full uninstall completed${NC}"
-    echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    if [ "$verification_ok" -eq 1 ]; then
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${GREEN}✅ WildPaqet full uninstall completed and verified${NC}"
+        echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
+    else
+        echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
+        echo -e "${RED}⚠ WildPaqet uninstall completed with leftovers (listed above)${NC}"
+        echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
+    fi
     echo -e "${YELLOW}Notes:${NC}"
     echo -e "  • Distro packages (curl, iptables-persistent, golang, libpcap-dev, …) were NOT removed"
-    echo -e "  • Safe/Auto optimizer: owned drop-ins + snapshots removed; live fq remapped to fq_codel when possible"
+    echo -e "  • Safe/Auto optimizer: the oldest snapshot baseline is restored, then owned state is removed"
     echo -e "  • External third-party BBR installs (if any) are left alone — undo separately if needed"
     echo -e "  • Reboot recommended for a fully clean sysctl/limits session state"
     echo ""
     pause
-    return 0
+    [ "$verification_ok" -eq 1 ]
 }
 # ================================================
 # TELEGRAM BOT CONFIGURATION

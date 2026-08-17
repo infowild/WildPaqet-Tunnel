@@ -42,6 +42,9 @@ jobs:
       - name: Test v3 manager pool and service refresh
         run: bash .github/tests/v3-manager.sh
 
+      - name: Test full uninstall cleanup and state restoration
+        run: bash .github/tests/uninstall-cleanup.sh
+
       - name: Test HTTP/2 cover at packet level
         working-directory: core
         run: go test -count=1 -run 'TestH2Cover(PacketLevelUsesRealPrefaceAndFrames|ClientHelloExposesOnlyPublicSNIAndALPN|TransportRoundTripAndDecoy)' ./internal/tnet/tls

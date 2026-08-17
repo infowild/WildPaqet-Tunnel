@@ -184,9 +184,9 @@ wildpaqet
 # گزینه 8 → تایپ YES
 ```
 
-سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، سورس Core v3، ابزار Go ایزوله، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین iptables محافظتی، کش `/root/paqet`، بکاپ‌ها و فایل‌های موقت `/tmp/paqet*` پاک می‌شوند. Flush جدول NAT اختیاری است.
+سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، سورس Core v3، ابزار Go ایزوله، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین علامت‌گذاری‌شدهٔ iptables/NAT، مجوزهای ثبت‌شدهٔ UFW/firewalld، کش `/root/paqet`، بکاپ‌ها، state مسیر `/var/lib/wildpaqet` و فایل‌های موقت build پاک می‌شوند. در پایان verifier هر مورد باقی‌مانده را گزارش می‌کند. Flush کامل قوانین قدیمی یا غیرمرتبط NAT فقط با تأیید جداگانه انجام می‌شود.
 
-پاکسازی بهینه‌ساز شبکه هنگام حذف کامل **snapshot-aware** است: آخرین `/var/lib/wildpaqet/netopt/snap-*` بازگردانی می‌شود (تا مقادیر sysctl توزیع/کاربر برگردند)، سپس drop-inهای sysctl/limits متعلق به WildPaqet و یونیت بوت `wildpaqet-qdisc.service` حذف و خودِ snapshot پاک می‌شود. هرگز به‌صورت کور `cubic`/`pfifo_fast` تحمیل نمی‌شود؛ اگر `fq` زندهٔ باقی‌مانده باشد به `fq_codel` امن مهاجرت داده می‌شود.
+پاکسازی بهینه‌ساز شبکه هنگام حذف کامل **snapshot-aware** است: قدیمی‌ترین `/var/lib/wildpaqet/netopt/snap-*` به‌عنوان وضعیت واقعی قبل از WildPaqet بازگردانی می‌شود؛ فایل‌های قبلی sysctl/limits، مقادیر runtime و qdiscهایی که Optimizer تغییر داده بود نیز برمی‌گردند. سپس یونیت `wildpaqet-qdisc.service` و snapshotها حذف می‌شوند و دیگر `fq_codel`، `cubic` یا `pfifo_fast` به‌صورت اجباری اعمال نمی‌شود. NAT helper نیز فایل قبلی `30-ip_forward.conf` را بازمی‌گرداند و محتوای کاربر را کورکورانه حذف نمی‌کند.
 
 پکیج‌های سیستم (curl، golang، …) دست نخورده می‌مانند. نصب‌کننده‌های BBR شخص‌ثالث جداگانه (در صورت وجود) هم دست نخورده می‌مانند.
 
