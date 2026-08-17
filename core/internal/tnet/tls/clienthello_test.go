@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"paqet/internal/conf"
 )
 
@@ -38,6 +40,42 @@ func TestPublicClientHelloCanSendSNIExplicitly(t *testing.T) {
 	hello := captureClientHello(t, cfg)
 	if !bytes.Contains(hello, []byte(cfg.ServerName)) {
 		t.Fatal("explicit public SNI was not included in the ClientHello")
+	}
+}
+
+func TestH2CoverClientHelloExposesOnlyPublicSNIAndALPN(t *testing.T) {
+	serverName := "cover.example.test"
+	coverPath := "/api/v1/secret/events"
+	client, server := net.Pipe()
+	uconn := utls.UClient(client, &utls.Config{
+		ServerName: serverName,
+		MinVersion: utls.VersionTLS12,
+		MaxVersion: utls.VersionTLS13,
+		NextProtos: []string{"h2", "http/1.1"},
+	}, utls.HelloChrome_Auto)
+	done := make(chan error, 1)
+	go func() { done <- uconn.Handshake() }()
+
+	header := make([]byte, 5)
+	if _, err := io.ReadFull(server, header); err != nil {
+		t.Fatalf("read cover TLS record header: %v", err)
+	}
+	payload := make([]byte, int(binary.BigEndian.Uint16(header[3:5])))
+	if _, err := io.ReadFull(server, payload); err != nil {
+		t.Fatalf("read cover ClientHello: %v", err)
+	}
+	hello := append(header, payload...)
+	_ = server.Close()
+	_ = client.Close()
+	<-done
+	if !bytes.Contains(hello, []byte(serverName)) {
+		t.Fatal("HTTP/2 cover ClientHello did not include its public SNI")
+	}
+	if !bytes.Contains(hello, []byte("h2")) {
+		t.Fatal("HTTP/2 cover ClientHello did not offer h2")
+	}
+	if bytes.Contains(hello, []byte(coverPath)) || bytes.Contains(hello, []byte(authMagic)) {
+		t.Fatal("private cover metadata leaked before TLS encryption")
 	}
 }
 

@@ -62,6 +62,13 @@ func (c *Conn) IsClosed() bool {
 	return c.session == nil || c.session.IsClosed()
 }
 
+func (c *Conn) NumStreams() int {
+	if c.session == nil {
+		return 0
+	}
+	return c.session.NumStreams()
+}
+
 func (c *Conn) Close() error {
 	var result error
 	if c.session != nil {

@@ -80,3 +80,30 @@ func TestReplayCacheAllowsSingleUse(t *testing.T) {
 		t.Fatal("expired replay-cache entry was not pruned")
 	}
 }
+
+func TestH2CoverAuthenticationRejectsTamperReplayAndStaleTokens(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	path := "/api/v1/private/events"
+	now := time.Now()
+	token, err := createCoverToken(secret, path, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache := newReplayCache()
+	if err := verifyCoverToken(token, secret, path, cache, now); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+	if err := verifyCoverToken(token, secret, path, cache, now); err == nil {
+		t.Fatal("replayed h2 token was accepted")
+	}
+	if err := verifyCoverToken(token, secret, path+"-tampered", newReplayCache(), now); err == nil {
+		t.Fatal("token was accepted for a different cover path")
+	}
+	stale, err := createCoverToken(secret, path, now.Add(-authClockSkew-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyCoverToken(stale, secret, path, newReplayCache(), now); err == nil {
+		t.Fatal("stale h2 token was accepted")
+	}
+}

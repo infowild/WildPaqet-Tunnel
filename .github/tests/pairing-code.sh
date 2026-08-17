@@ -24,11 +24,29 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
     -addext 'extendedKeyUsage=serverAuth' >/dev/null 2>&1
 
 code=$(v3_create_pairing_code \
-    "$test_dir/server.crt" '203.0.113.10:443' 'pay.wilduser.org')
+	"$test_dir/server.crt" '203.0.113.10:443' 'pay.wilduser.org' '/api/v1/test/events')
 v3_decode_pairing_code "$code" "$test_dir/imported.crt"
 test "$V3_PAIR_ENDPOINT" = '203.0.113.10:443'
 test "$V3_PAIR_IDENTITY" = 'pay.wilduser.org'
+test "$V3_PAIR_MODE" = 'h2'
+test "$V3_PAIR_COVER_PATH" = '/api/v1/test/events'
 cmp "$test_dir/server.crt" "$test_dir/imported.crt"
+
+legacy_code=$(v3_create_pairing_code \
+	"$test_dir/server.crt" '203.0.113.10:443' 'pay.wilduser.org')
+v3_decode_pairing_code "$legacy_code" "$test_dir/legacy.crt"
+test "$V3_PAIR_MODE" = 'direct'
+test -z "$V3_PAIR_COVER_PATH"
+
+if v3_create_pairing_code \
+	"$test_dir/server.crt" '203.0.113.10:443' 'pay.wilduser.org' '/../bad?path' >/dev/null; then
+	echo 'unsafe cover path was accepted' >&2
+	exit 1
+fi
+if v3_validate_cover_path '/api/../admin'; then
+	echo 'traversal cover path was accepted' >&2
+	exit 1
+fi
 
 if v3_create_pairing_code \
     "$test_dir/server.crt" '203.0.113.10:443' 'wrong.wilduser.org' >/dev/null; then

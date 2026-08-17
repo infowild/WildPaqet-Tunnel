@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -18,9 +19,57 @@ const (
 	authRequestSize = 4 + 1 + 8 + 32 + sha256.Size
 	authReplySize   = 4 + sha256.Size
 	authVersion     = byte(1)
+	coverAuthLabel  = "wildpaqet-h2-cover-v1"
+	coverTokenSize  = 1 + 8 + 32 + sha256.Size
 	authClockSkew   = 2 * time.Minute
 	replayLifetime  = 5 * time.Minute
 )
+
+func createCoverToken(secret []byte, path string, now time.Time) (string, error) {
+	token := make([]byte, coverTokenSize)
+	token[0] = authVersion
+	binary.BigEndian.PutUint64(token[1:9], uint64(now.Unix()))
+	if _, err := rand.Read(token[9:41]); err != nil {
+		return "", fmt.Errorf("h2 auth nonce: %w", err)
+	}
+	copy(token[41:], coverTokenMAC(secret, path, token[:41]))
+	return base64.RawURLEncoding.EncodeToString(token), nil
+}
+
+func verifyCoverToken(encoded string, secret []byte, path string, cache *replayCache, now time.Time) error {
+	token, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(token) != coverTokenSize {
+		return fmt.Errorf("h2 auth token is invalid")
+	}
+	if token[0] != authVersion {
+		return fmt.Errorf("h2 auth version is invalid")
+	}
+	stamp := int64(binary.BigEndian.Uint64(token[1:9]))
+	delta := now.Sub(time.Unix(stamp, 0))
+	if delta < -authClockSkew || delta > authClockSkew {
+		return fmt.Errorf("h2 auth timestamp outside allowed clock skew")
+	}
+	want := coverTokenMAC(secret, path, token[:41])
+	if subtle.ConstantTimeCompare(token[41:], want) != 1 {
+		return fmt.Errorf("h2 auth MAC is invalid")
+	}
+	var nonce [32]byte
+	copy(nonce[:], token[9:41])
+	if !cache.accept(nonce, now) {
+		return fmt.Errorf("h2 auth replay rejected")
+	}
+	return nil
+}
+
+func coverTokenMAC(secret []byte, path string, prefix []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = mac.Write([]byte(coverAuthLabel))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write([]byte(path))
+	_, _ = mac.Write([]byte{0})
+	_, _ = mac.Write(prefix)
+	return mac.Sum(nil)
+}
 
 type replayCache struct {
 	mu      sync.Mutex

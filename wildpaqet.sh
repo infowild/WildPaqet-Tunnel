@@ -1,9 +1,9 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.2-v3
-# Branch: wild-paqet-v3 (direct TLS 1.3 + authenticated multiplexing + resilient endpoint pools)
-# Direct TLS transport with legacy raw KCP available as an explicit fallback
+# Version: 9.3-v3
+# Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
+# HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
 # Forked from: https://github.com/behzadea12/Paqet-Tunnel-Manager
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.2-v3"
+readonly SCRIPT_VERSION="9.3-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1507,6 +1507,12 @@ v3_validate_endpoint() {
     [[ "$host" =~ ^[A-Za-z0-9.-]+$ || "$host" =~ ^\[[0-9A-Fa-f:]+\]$ ]]
 }
 
+v3_validate_cover_path() {
+	local cover_path="$1"
+	[[ "$cover_path" =~ ^/[A-Za-z0-9._~/-]{1,159}$ ]] || return 1
+	[[ "$cover_path" != *".."* && "$cover_path" != *"//"* ]]
+}
+
 v3_b64_encode() {
     base64 | tr -d '\r\n'
 }
@@ -1528,6 +1534,7 @@ v3_create_pairing_code() {
     local cert_file="$1"
     local endpoint="$2"
     local identity="$3"
+	local cover_path="${4:-}"
 
     command -v base64 >/dev/null 2>&1 || return 1
     command -v openssl >/dev/null 2>&1 || return 1
@@ -1536,28 +1543,54 @@ v3_create_pairing_code() {
     [[ "$identity" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
     v3_verify_pairing_certificate "$cert_file" "$identity" || return 1
 
-    local endpoint_b64 identity_b64 cert_b64
+	if [ -n "$cover_path" ]; then
+		v3_validate_cover_path "$cover_path" || return 1
+	fi
+
+    local endpoint_b64 identity_b64 path_b64 cert_b64
     endpoint_b64=$(printf '%s' "$endpoint" | v3_b64_encode) || return 1
     identity_b64=$(printf '%s' "$identity" | v3_b64_encode) || return 1
     cert_b64=$(v3_b64_encode < "$cert_file") || return 1
-    printf 'WPQ3|%s|%s|%s\n' "$endpoint_b64" "$identity_b64" "$cert_b64"
+	if [ -n "$cover_path" ]; then
+		path_b64=$(printf '%s' "$cover_path" | v3_b64_encode) || return 1
+		printf 'WPQ4|%s|%s|%s|%s\n' "$endpoint_b64" "$identity_b64" "$path_b64" "$cert_b64"
+	else
+		printf 'WPQ3|%s|%s|%s\n' "$endpoint_b64" "$identity_b64" "$cert_b64"
+	fi
 }
 
 # Decode and validate one pairing code. Results are returned in the two globals
 # below and the verified public certificate is written to the requested path.
 V3_PAIR_ENDPOINT=""
 V3_PAIR_IDENTITY=""
+V3_PAIR_MODE=""
+V3_PAIR_COVER_PATH=""
 v3_decode_pairing_code() {
     local code="$1"
     local cert_out="$2"
-    local prefix endpoint_b64 identity_b64 cert_b64 extra
+	local prefix endpoint_b64 identity_b64 field3 field4 extra cert_b64 path_b64
     V3_PAIR_ENDPOINT=""
     V3_PAIR_IDENTITY=""
+	V3_PAIR_MODE=""
+	V3_PAIR_COVER_PATH=""
 
     [ ${#code} -le 32768 ] || return 1
-    IFS='|' read -r prefix endpoint_b64 identity_b64 cert_b64 extra <<< "$code"
-    [ "$prefix" = "WPQ3" ] && [ -n "$endpoint_b64" ] \
-        && [ -n "$identity_b64" ] && [ -n "$cert_b64" ] && [ -z "$extra" ] || return 1
+	IFS='|' read -r prefix endpoint_b64 identity_b64 field3 field4 extra <<< "$code"
+	if [ "$prefix" = "WPQ4" ]; then
+		path_b64="$field3"
+		cert_b64="$field4"
+		[ -n "$path_b64" ] && [ -n "$cert_b64" ] && [ -z "$extra" ] || return 1
+		V3_PAIR_COVER_PATH=$(printf '%s' "$path_b64" | base64 -d 2>/dev/null) || return 1
+		v3_validate_cover_path "$V3_PAIR_COVER_PATH" || return 1
+		V3_PAIR_MODE="h2"
+	elif [ "$prefix" = "WPQ3" ]; then
+		cert_b64="$field3"
+		[ -n "$cert_b64" ] && [ -z "$field4" ] && [ -z "$extra" ] || return 1
+		V3_PAIR_MODE="direct"
+	else
+		return 1
+	fi
+	[ -n "$endpoint_b64" ] && [ -n "$identity_b64" ] || return 1
 
     V3_PAIR_ENDPOINT=$(printf '%s' "$endpoint_b64" | base64 -d 2>/dev/null) || return 1
     V3_PAIR_IDENTITY=$(printf '%s' "$identity_b64" | base64 -d 2>/dev/null) || return 1
@@ -1585,7 +1618,7 @@ show_v3_pairing_code() {
     show_banner
     echo -e "${GREEN}Export v3 pairing code (Kharej)${NC}\n"
 
-    local config_name config_file protocol cert_file listen_addr listen_port
+	local config_name config_file protocol cert_file listen_addr listen_port cover_mode cover_path
     local identity public_ip endpoint default_endpoint code pair_file answer
     read -r -p "Existing v3 service name [server-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-server-v3}")
@@ -1597,6 +1630,8 @@ show_v3_pairing_code() {
         || { print_error "Service is not a server"; pause; return 1; }
 
     cert_file=$(awk '$1 == "cert_file:" { value=$2; gsub(/"/, "", value); print value; exit }' "$config_file")
+	cover_mode=$(awk '$1 == "mode:" { value=$2; gsub(/"/, "", value); print value; exit }' "$config_file")
+	cover_path=$(awk '$1 == "cover_path:" { value=$2; gsub(/"/, "", value); print value; exit }' "$config_file")
     listen_addr=$(awk '
         /^listen:/ { in_listen=1; next }
         /^[^[:space:]]/ { if (in_listen) exit }
@@ -1617,7 +1652,8 @@ show_v3_pairing_code() {
     [[ "$public_ip" == *:* ]] && default_endpoint="[${public_ip}]:${listen_port}"
     read -r -p "Public endpoint for Iran [${default_endpoint}]: " endpoint
     endpoint="${endpoint:-$default_endpoint}"
-    if ! code=$(v3_create_pairing_code "$cert_file" "$endpoint" "$identity"); then
+	[ "$cover_mode" = "h2" ] || cover_path=""
+	if ! code=$(v3_create_pairing_code "$cert_file" "$endpoint" "$identity" "$cover_path"); then
         print_error "Could not create pairing code; check the endpoint, certificate name and certificate validity"
         pause
         return 1
@@ -1676,9 +1712,10 @@ v3_total_outer_connections() {
 configure_v3_tls_server() {
     clear
     show_banner
-    echo -e "${GREEN}Configure v3 Direct TLS Server (Kharej)${NC}\n"
+	echo -e "${GREEN}Configure v3 HTTP/2-Covered TLS Server (Kharej)${NC}\n"
 
-    local config_name port secret_key answer identity cert_file key_file svc public_ip public_endpoint default_endpoint
+	local config_name port secret_key answer identity cert_file key_file svc public_ip public_endpoint default_endpoint
+	local cover_path decoy_url generated_cover_path
 	public_ip=$(get_public_ip)
     read -r -p "Service name [server-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-server-v3}")
@@ -1716,22 +1753,50 @@ configure_v3_tls_server() {
         pause
         return 1
     fi
+	# The same identity + shared secret produces the same private path on every
+	# Kharej node, so a four-server pool pairs automatically without publishing
+	# another setting. The path is opaque routing metadata, not an auth secret;
+	# invalid requests still receive only the decoy response.
+	local cover_path_id
+	cover_path_id=$(printf '%s' "${identity}:${secret_key}" | openssl dgst -sha256 -r 2>/dev/null | awk '{print substr($1,1,16)}')
+	[ -n "$cover_path_id" ] || cover_path_id="$RANDOM$RANDOM"
+	generated_cover_path="/api/v1/${cover_path_id}/events"
+	read -r -p "Opaque HTTP/2 cover path [$generated_cover_path]: " cover_path
+	cover_path="${cover_path:-$generated_cover_path}"
+	if ! v3_validate_cover_path "$cover_path"; then
+		print_error "Cover path must start with / and contain only URL-safe path characters"
+		pause
+		return 1
+	fi
+	read -r -p "Local decoy website URL [Enter = built-in page]: " decoy_url
+	if [ -n "$decoy_url" ] && [[ ! "$decoy_url" =~ ^https?://[A-Za-z0-9.:[\]-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
+		print_error "Decoy URL must be a simple http(s) URL such as http://127.0.0.1:8080"
+		pause
+		return 1
+	fi
 
     echo "Certificate source:"
-    echo " 1. Generate a self-signed certificate (recommended for a private tunnel)"
-    echo " 2. Use existing certificate and key"
+	echo " 1. Use an existing publicly trusted certificate and key (recommended)"
+	echo " 2. Generate a self-signed certificate (testing only; probe-visible)"
     read -r -p "Choose [1]: " answer
     answer="${answer:-1}"
     mkdir -p "$CONFIG_DIR"
-    if [ "$answer" = "2" ]; then
-        read -r -p "Certificate path: " cert_file
-        read -r -p "Private key path: " key_file
+	if [ "$answer" = "1" ]; then
+		local default_cert="/etc/letsencrypt/live/$identity/fullchain.pem"
+		local default_key="/etc/letsencrypt/live/$identity/privkey.pem"
+		[ -f "$default_cert" ] || default_cert=""
+		[ -f "$default_key" ] || default_key=""
+		read -r -p "Certificate/fullchain path${default_cert:+ [$default_cert]}: " cert_file
+		read -r -p "Private key path${default_key:+ [$default_key]}: " key_file
+		cert_file="${cert_file:-$default_cert}"
+		key_file="${key_file:-$default_key}"
         [ -f "$cert_file" ] && [ -f "$key_file" ] || {
             print_error "Certificate or key file does not exist"
             pause
             return 1
         }
     else
+		print_warning "Self-signed certificates are secure for encryption but do not resist active probing"
         local cert_paths
         cert_paths=$(generate_v3_tls_certificate "$config_name" "$identity") || { pause; return 1; }
         cert_file=$(printf '%s\n' "$cert_paths" | sed -n '1p')
@@ -1742,7 +1807,7 @@ configure_v3_tls_server() {
     configure_tls_firewall "$port" || { print_error "Firewall configuration failed"; pause; return 1; }
 
     {
-        echo "# WildPaqet v3 direct TLS server"
+		echo "# WildPaqet v3 real HTTP/2-covered TLS server"
         echo 'role: "server"'
         echo 'log:'
         echo '  level: "info"'
@@ -1752,14 +1817,23 @@ configure_v3_tls_server() {
         echo '  protocol: "tls"'
         echo '  conn: 1'
         echo '  tls:'
+		echo '    mode: "h2"'
+		echo "    server_name: \"$identity\""
         echo "    cert_file: \"$cert_file\""
         echo "    key_file: \"$key_file\""
         echo "    secret: \"$secret_key\""
         echo '    alpn: "h2"'
+		echo "    cover_path: \"$cover_path\""
+		[ -n "$decoy_url" ] && echo "    decoy_url: \"$decoy_url\""
         echo '    connect_timeout: 10'
         echo '    handshake_timeout: 10'
         echo '    keepalive: 15'
         echo '    keepalive_timeout: 60'
+		echo '    connect_jitter: 2'
+		echo '    keepalive_jitter: 5'
+		echo '    max_connection_age: 7200'
+		echo '    connection_age_jitter: 1800'
+		echo '    drain_timeout: 1800'
         echo '    breaker_failures: 3'
         echo '    breaker_cooldown: 30'
         echo '    breaker_max_cooldown: 300'
@@ -1775,9 +1849,9 @@ configure_v3_tls_server() {
         return 1
     fi
 
-    print_success "v3 TLS server started on TCP/$port"
+	print_success "v3 HTTP/2-covered TLS server started on TCP/$port"
     local pairing_code pair_file
-    if pairing_code=$(v3_create_pairing_code "$cert_file" "$public_endpoint" "$identity"); then
+	if pairing_code=$(v3_create_pairing_code "$cert_file" "$public_endpoint" "$identity" "$cover_path"); then
         pair_file="$CONFIG_DIR/tls/$config_name/pairing-code.txt"
         mkdir -p "$(dirname "$pair_file")"
         chmod 700 "$(dirname "$pair_file")"
@@ -1797,12 +1871,12 @@ configure_v3_tls_server() {
 configure_v3_tls_client() {
     clear
     show_banner
-    echo -e "${GREEN}Configure v3 Direct TLS Client (Iran)${NC}\n"
+	echo -e "${GREEN}Configure v3 HTTP/2-Covered TLS Client (Iran)${NC}\n"
 
     local config_name endpoints_raw secret_key server_name send_server_name ca_file traffic_type svc
     local connections_per_endpoint total_connections
-    local trust_choice endpoint send_sni_answer
-    local bundle_dir bundle_tmp pair_code cert_tmp pair_count fingerprint duplicate imported_endpoint
+	local trust_choice endpoint send_sni_answer cover_mode cover_path carrier_choice imported_identity imported_mode imported_path
+	local bundle_dir bundle_tmp pair_code cert_tmp pair_count fingerprint duplicate imported_endpoint
     local -a endpoints forward_entries socks5_entries
     read -r -p "Service name [iran-v3]: " config_name
     config_name=$(clean_config_name "${config_name:-iran-v3}")
@@ -1815,6 +1889,8 @@ configure_v3_tls_client() {
     ca_file=""
     server_name=""
     send_server_name="false"
+	cover_mode="h2"
+	cover_path=""
     echo "Kharej certificate setup:"
     echo " 1. Paste pairing code(s) from Kharej (recommended, automatic bundle)"
     echo " 2. Use an existing CA bundle"
@@ -1835,7 +1911,8 @@ configure_v3_tls_client() {
         : > "$bundle_tmp"
         chmod 600 "$bundle_tmp"
         pair_count=0
-        echo "Paste one WPQ3 pairing code from each Kharej server."
+		echo "Paste one WPQ4 (HTTP/2 cover) pairing code from each Kharej server."
+		echo "Legacy WPQ3 direct-TLS codes are still accepted for compatibility."
         echo "Press Enter on an empty line when all codes are imported."
         while true; do
             read -r -p "Pairing code #$((pair_count + 1)): " pair_code
@@ -1857,6 +1934,23 @@ configure_v3_tls_client() {
                 continue
             fi
             imported_endpoint="$V3_PAIR_ENDPOINT"
+			imported_identity="$V3_PAIR_IDENTITY"
+			imported_mode="$V3_PAIR_MODE"
+			imported_path="$V3_PAIR_COVER_PATH"
+			if [ "$pair_count" -eq 0 ]; then
+				server_name="$imported_identity"
+				cover_mode="$imported_mode"
+				cover_path="$imported_path"
+				[ "$cover_mode" = "h2" ] && send_server_name="true"
+			elif [ "$imported_mode" != "$cover_mode" ]; then
+				rm -f "$cert_tmp"
+				print_warning "Cannot mix WPQ3 direct and WPQ4 HTTP/2 endpoints in one pool"
+				continue
+			elif [ "$cover_mode" = "h2" ] && { [ "$imported_identity" != "$server_name" ] || [ "$imported_path" != "$cover_path" ]; }; then
+				rm -f "$cert_tmp"
+				print_warning "All HTTP/2 endpoints must share the same certificate name and cover path"
+				continue
+			fi
             duplicate=0
             for endpoint in "${endpoints[@]}"; do
                 [ "$endpoint" = "$imported_endpoint" ] && duplicate=1
@@ -1926,6 +2020,26 @@ configure_v3_tls_client() {
             read -r -p "Send this name as TLS SNI? (Y/n): " send_sni_answer
             [[ ! "$send_sni_answer" =~ ^[Nn]$ ]] && send_server_name="true"
         fi
+		echo "TLS carrier:"
+		echo " 1. Real HTTP/2 cover (recommended)"
+		echo " 2. Legacy direct TLS"
+		read -r -p "Choose [1]: " carrier_choice
+		carrier_choice="${carrier_choice:-1}"
+		if [ "$carrier_choice" = "1" ]; then
+			cover_mode="h2"
+			if [ -z "$server_name" ]; then
+				read -r -p "Public certificate/SNI name (required): " server_name
+			fi
+			[ -n "$server_name" ] || { print_error "HTTP/2 cover requires a certificate/SNI name"; pause; return 1; }
+			send_server_name="true"
+			read -r -p "HTTP/2 cover path [/api/v1/events]: " cover_path
+			cover_path="${cover_path:-/api/v1/events}"
+			v3_validate_cover_path "$cover_path" \
+				|| { print_error "Invalid HTTP/2 cover path"; pause; return 1; }
+		else
+			cover_mode="direct"
+			cover_path=""
+		fi
     else
         print_error "Invalid certificate setup choice"
         pause
@@ -1989,7 +2103,7 @@ configure_v3_tls_client() {
     ensure_v3_core || return 1
     mkdir -p "$CONFIG_DIR"
     {
-        echo "# WildPaqet v3 direct TLS client"
+		echo "# WildPaqet v3 TLS client ($cover_mode carrier)"
         echo 'role: "client"'
         echo 'log:'
         echo '  level: "info"'
@@ -2013,11 +2127,21 @@ configure_v3_tls_client() {
         echo '  protocol: "tls"'
         echo "  conn: $total_connections"
         echo '  tls:'
+		echo "    mode: \"$cover_mode\""
         [ -n "$server_name" ] && echo "    server_name: \"$server_name\""
 		[ "$send_server_name" = "true" ] && echo '    send_server_name: true'
         [ -n "$ca_file" ] && echo "    ca_file: \"$ca_file\""
         echo "    secret: \"$secret_key\""
         echo '    alpn: "h2"'
+		if [ "$cover_mode" = "h2" ]; then
+			echo "    cover_path: \"$cover_path\""
+			echo '    client_hello: "chrome"'
+			echo '    connect_jitter: 2'
+			echo '    keepalive_jitter: 5'
+			echo '    max_connection_age: 7200'
+			echo '    connection_age_jitter: 1800'
+			echo '    drain_timeout: 1800'
+		fi
         echo '    connect_timeout: 10'
         echo '    handshake_timeout: 10'
         echo '    keepalive: 15'
@@ -2036,14 +2160,14 @@ configure_v3_tls_client() {
         pause
         return 1
     fi
-    print_success "v3 TLS client started with $total_connections outer connection(s) across ${#endpoints[@]} Kharej endpoint(s)"
+	print_success "v3 $cover_mode client started with $total_connections outer connection(s) across ${#endpoints[@]} Kharej endpoint(s)"
     pause
 }
 
 # Configure as Server
 configure_server() {
     echo -e "${CYAN}Transport:${NC}"
-    echo " 1. v3 direct TLS (recommended, no WebSocket)"
+	echo " 1. v3 real HTTP/2-covered TLS (recommended, no WebSocket)"
     echo " 2. Legacy raw KCP/pcap"
     echo " 3. Export pairing code for an existing v3 server"
     echo " 0. Back"
@@ -2407,7 +2531,7 @@ configure_server() {
 # Configure as Client
 configure_client() {
     echo -e "${CYAN}Transport:${NC}"
-    echo " 1. v3 direct TLS (recommended, no WebSocket)"
+	echo " 1. v3 real HTTP/2-covered TLS (recommended, no WebSocket)"
     echo " 2. Legacy raw KCP/pcap"
     echo " 0. Back"
     local transport_choice
@@ -3712,7 +3836,7 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
-            -X 'paqet/cmd/version.Version=v3.0.0-wildpaqet' \
+			-X 'paqet/cmd/version.Version=v3.1.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
@@ -3744,9 +3868,9 @@ build_wildpaqet_core_from_source() {
     print_success "WildPaqet Core v3 installed to $BIN_DIR/paqet"
     "$BIN_DIR/paqet" version 2>/dev/null || true
     echo ""
-    echo -e "${YELLOW}Tip:${NC} New configs use ${CYAN}network.tcp.preset: ${DEFAULT_TCP_PRESET}${NC}"
-    echo -e "Preset ${CYAN}default${NC} now does a real TCP handshake, tracks SEQ/ACK and drops the DSCP mark."
-    echo -e "${YELLOW}Update BOTH sides${NC} (Iran + Kharej) — the handshake only completes when both run this build."
+	echo -e "${YELLOW}Tip:${NC} New v3 configs use real HTTP/2 cover, visible SNI, authenticated paths and jittered rotation."
+	echo -e "Legacy KCP configs still use ${CYAN}network.tcp.preset: ${DEFAULT_TCP_PRESET}${NC} with the hardened raw handshake."
+	echo -e "${YELLOW}Update BOTH sides${NC} (Iran + Kharej) before enabling the HTTP/2 cover mode."
     pause
     return 0
 }

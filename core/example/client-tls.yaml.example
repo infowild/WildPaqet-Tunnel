@@ -1,4 +1,4 @@
-# WildPaqet v3 direct TLS client (Iran)
+# WildPaqet v3 real HTTP/2-covered TLS client (Iran)
 role: "client"
 
 log:
@@ -22,17 +22,26 @@ transport:
   # This example has four endpoints, so the total pool size is 4 x 4 = 16.
   conn: 16
   tls:
-    # Concatenate the four self-signed server.crt files into this bundle.
-    ca_file: "/etc/paqet/tls/kharej-ca-bundle.crt"
-    # SNI is off by default. For a public certificate, set both fields below.
-    # server_name: "tunnel.example.com"
-    # send_server_name: true
+    mode: "h2"
+    # All endpoints in one pool must present a certificate valid for this name.
+    server_name: "tunnel.example.com"
+    send_server_name: true
+    # Omit ca_file for a publicly trusted certificate. Pairing adds it when a
+    # private test certificate is used.
+    # ca_file: "/etc/paqet/tls/kharej-ca-bundle.crt"
     secret: "replace-with-the-same-32-character-secret"
     alpn: "h2"
+    cover_path: "/api/v1/change-this/events"
+    client_hello: "chrome"
     connect_timeout: 10
     handshake_timeout: 10
     keepalive: 15
     keepalive_timeout: 60
+    connect_jitter: 2
+    keepalive_jitter: 5
+    max_connection_age: 7200
+    connection_age_jitter: 1800
+    drain_timeout: 1800
     breaker_failures: 3
     breaker_cooldown: 30
     breaker_max_cooldown: 300

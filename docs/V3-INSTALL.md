@@ -1,6 +1,6 @@
 # WildPaqet v3 installation
 
-v3 uses direct TLS 1.3 over normal kernel TCP. It does not use HTTP or WebSocket. The legacy raw KCP/pcap transport remains available from the configuration wizard.
+v3.1 uses a real full-duplex HTTP/2 `CONNECT` request over TLS 1.3 on normal kernel TCP. Smux runs inside HTTP/2 DATA frames. It does not use WebSocket. Legacy direct TLS and raw KCP/pcap remain compatibility choices.
 
 ## Build and install
 
@@ -23,27 +23,30 @@ manager's full uninstall option removes this isolated toolchain.
 
 On each Kharej host:
 
-1. Choose `2 → v3 direct TLS`.
+1. Choose `2 → v3 HTTP/2-covered TLS`.
 2. Use TCP port `443` when it is free.
-3. For a private self-signed certificate, use that server's public IP as its certificate name.
-4. Use the same 32+ character shared secret on all four servers.
-5. Keep each generated private key on its own server.
-6. Copy the single-line `WPQ3` pairing code printed by the wizard. It is also saved beside the certificate as `pairing-code.txt`.
+3. Use a publicly trusted certificate and a DNS name that resolves to the server. A self-signed certificate is retained for testing but is visible to an active probe.
+4. Use the same certificate name and 32+ character shared secret on all four servers. The wizard then derives the same opaque HTTP/2 cover path automatically. The path is pairing metadata, not an authentication secret.
+5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a built-in page is served.
+6. Keep each private key on its own server.
+7. Copy the single-line `WPQ4` pairing code printed by the wizard. It is also saved beside the certificate as `pairing-code.txt`.
+
+The core reloads certificate/key files when they change, so Certbot or another ACME client can renew them without a Paqet restart.
 
 For a server configured before manager v9.1, update the manager and choose
 `2 → Export pairing code for an existing v3 server`. The pairing code contains
-only the public endpoint, certificate name and public certificate; it never
+only public bootstrap data; it never
 contains the shared secret or `server.key`.
 
 On Iran:
 
-1. Choose `3 → v3 direct TLS`.
+1. Choose `3 → v3 HTTP/2-covered TLS`.
 2. Select `Paste pairing code(s)` (the default).
 3. Paste one code from each Kharej server, then submit an empty line.
 4. Choose the outer connections per Kharej. Four is the recommended default.
 5. Enter the shared secret once and choose Port Forward or SOCKS5.
 
-The Iran wizard validates each certificate name, expiry and SHA-256
+The Iran wizard validates each certificate name, expiry, cover path and SHA-256
 fingerprint, imports the endpoints, and creates the protected CA bundle
 automatically. Manual certificate transfer remains available through the
 `Use an existing CA bundle` option:
@@ -54,19 +57,23 @@ cat kharej-1.crt kharej-2.crt kharej-3.crt kharej-4.crt > /etc/paqet/tls/kharej-
 chmod 600 /etc/paqet/tls/kharej-ca-bundle.crt
 ```
 
-Manager v9.2 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
+Manager v9.3 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. HTTP/2 connections have jittered startup, keepalive and maximum age. Rotation installs the replacement first and drains existing streams from the old connection. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
 
 Choose two connections per endpoint for low traffic, four for balanced traffic, or eight for high concurrency on a larger Iran VPS. More connections reduce the head-of-line impact of loss on one outer TCP flow, but they do not repair a poor route or create bandwidth. Size the Iran host by simultaneous throughput, not registered users; use a 1-vCPU/1-GB VPS only for testing and load-test production starting around 4 vCPU / 4 GB.
 
 ## Security model
 
-- TLS is restricted to TLS 1.3. Visible ALPN uses the common `h2` value instead of a project-specific fingerprint.
+- The server enforces TLS 1.3. The client offers a browser-compatible TLS range and negotiates TLS 1.3 with a uTLS ClientHello.
+- Visible SNI and ALPN `h2` are followed by the standards-required HTTP/2 preface, SETTINGS and DATA frames.
 - The server certificate is verified against the configured CA bundle or system trust store.
-- SNI is disabled by default for private CA-bundle deployments. Public certificates can enable it explicitly with `send_server_name: true`.
-- A post-TLS HMAC authentication frame uses a timestamp and random nonce.
+- HTTP/2 cover mode requires SNI. A publicly trusted certificate is recommended for active-probe resistance.
+- Invalid probes receive a built-in page or optional local decoy website rather than a tunnel-specific close pattern.
+- An encrypted HMAC bearer token binds the opaque path, timestamp and random nonce.
 - Timestamps outside a two-minute window and reused nonces are rejected before smux starts.
 - Authentication and ALPN negotiation fail closed.
-- Pairing codes contain no shared secret or private key. The shared secret is entered separately on Iran.
+- `WPQ4` pairing codes contain no shared secret or private key. The shared secret is entered separately on Iran.
+
+This cover reduces protocol-level fingerprints but cannot guarantee that an IP will never be filtered. Use multiple Iran and Kharej nodes for production availability, and test from the networks you actually serve.
 
 Keep the Iran and Kharej clocks synchronized with systemd-timesyncd, chrony, or another NTP client. Do not expose the shared secret in tickets or screenshots.
 

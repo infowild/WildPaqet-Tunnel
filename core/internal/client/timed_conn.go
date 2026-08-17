@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
@@ -33,6 +34,7 @@ func newTimedConn(ctx context.Context, cfg *conf.Conf, endpoints *endpointPool, 
 	if err != nil {
 		return nil, err
 	}
+	tc.expire = tc.nextExpiry(time.Now())
 
 	return &tc, nil
 }
@@ -62,8 +64,102 @@ func (tc *timedConn) ensureConn(ctx context.Context) (tnet.Conn, error) {
 		return nil, err
 	}
 	tc.conn = conn
-	tc.expire = time.Now().Add(300 * time.Second)
+	tc.expire = tc.nextExpiry(time.Now())
 	return conn, nil
+}
+
+func (tc *timedConn) nextExpiry(now time.Time) time.Time {
+	if tc.cfg == nil || tc.cfg.Transport.TLS == nil || tc.cfg.Transport.TLS.Mode != "h2" {
+		return time.Time{}
+	}
+	base := tc.cfg.Transport.TLS.MaxConnectionAge
+	jitter := tc.cfg.Transport.TLS.ConnectionAgeJitter
+	if base <= 0 {
+		return time.Time{}
+	}
+	if jitter > 0 {
+		base += time.Duration(rand.Int63n(int64(2*jitter)+1)) - jitter
+	}
+	return now.Add(base)
+}
+
+func (tc *timedConn) rotationDue(now time.Time) bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.conn != nil && !tc.conn.IsClosed() && !tc.expire.IsZero() && !now.Before(tc.expire)
+}
+
+func (tc *timedConn) rotate(ctx context.Context) error {
+	tc.mu.Lock()
+	if tc.conn == nil || tc.conn.IsClosed() || tc.expire.IsZero() || time.Now().Before(tc.expire) {
+		tc.mu.Unlock()
+		return nil
+	}
+	old := tc.conn
+	replacement, err := tc.openConn(ctx)
+	if err != nil {
+		// Avoid a synchronized five-second redial storm when several slots reach
+		// their age limit during the same upstream outage.
+		tc.expire = time.Now().Add(time.Minute + time.Duration(rand.Int63n(int64(time.Minute))))
+		tc.mu.Unlock()
+		return err
+	}
+	tc.conn = replacement
+	tc.expire = tc.nextExpiry(time.Now())
+	drainTimeout := tc.cfg.Transport.TLS.DrainTimeout
+	tc.mu.Unlock()
+
+	go drainAndClose(ctx, old, drainTimeout)
+	return nil
+}
+
+type streamCountConn interface {
+	NumStreams() int
+}
+
+func drainAndClose(ctx context.Context, conn tnet.Conn, timeout time.Duration) {
+	if timeout <= 0 {
+		_ = conn.Close()
+		return
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	// A short grace period covers a caller that obtained the old pool slot just
+	// before the atomic swap but has not opened its smux stream yet.
+	grace := time.NewTimer(time.Second)
+	defer grace.Stop()
+	select {
+	case <-ctx.Done():
+		_ = conn.Close()
+		return
+	case <-deadline.C:
+		_ = conn.Close()
+		return
+	case <-grace.C:
+	}
+
+	counter, ok := conn.(streamCountConn)
+	if !ok {
+		_ = conn.Close()
+		return
+	}
+	for {
+		if counter.NumStreams() == 0 {
+			_ = conn.Close()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+			return
+		case <-deadline.C:
+			_ = conn.Close()
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (tc *timedConn) isClosed() bool {

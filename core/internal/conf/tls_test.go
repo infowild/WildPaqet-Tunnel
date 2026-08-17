@@ -81,3 +81,71 @@ transport:
 		t.Fatalf("listen endpoints = %v", cfg.Listen.Endpoints)
 	}
 }
+
+func TestH2TLSClientDefaultsRequireVisibleSNIAndRotation(t *testing.T) {
+	dir := t.TempDir()
+	caFile := filepath.Join(dir, "ca.pem")
+	if err := os.WriteFile(caFile, []byte("test fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "client-h2.yaml")
+	yaml := fmt.Sprintf(`
+role: client
+forward:
+  - listen: "127.0.0.1:9090"
+    target: "127.0.0.1:9090"
+server:
+  addr: "203.0.113.10:443"
+transport:
+  protocol: tls
+  tls:
+    mode: h2
+    server_name: cover.example.test
+    send_server_name: true
+    ca_file: %q
+    secret: "0123456789abcdef0123456789abcdef"
+`, caFile)
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFromFile(path)
+	if err != nil {
+		t.Fatalf("load h2 config: %v", err)
+	}
+	tlsCfg := cfg.Transport.TLS
+	if tlsCfg.CoverPath != defaultTLSCoverPath || tlsCfg.ClientHello != "chrome" {
+		t.Fatalf("unexpected cover defaults: %q/%q", tlsCfg.CoverPath, tlsCfg.ClientHello)
+	}
+	if tlsCfg.MaxConnectionAge != 2*time.Hour || tlsCfg.DrainTimeout != 30*time.Minute {
+		t.Fatalf("unexpected rotation defaults: %s/%s", tlsCfg.MaxConnectionAge, tlsCfg.DrainTimeout)
+	}
+}
+
+func TestH2TLSClientRejectsHiddenSNI(t *testing.T) {
+	tlsCfg := TLS{
+		Mode:                 "h2",
+		ServerName:           "cover.example.test",
+		SendServerName:       false,
+		Secret:               "0123456789abcdef0123456789abcdef",
+		ALPN:                 "h2",
+		CoverPath:            "/api/v1/events",
+		ClientHello:          "chrome",
+		ConnectTimeout_:      10,
+		HandshakeTimeout_:    10,
+		KeepAlive_:           15,
+		KeepAliveTimeout_:    60,
+		ConnectJitter_:       2,
+		KeepAliveJitter_:     5,
+		MaxConnectionAge_:    7200,
+		ConnectionAgeJitter_: 1800,
+		DrainTimeout_:        1800,
+		BreakerFailures:      3,
+		BreakerCooldown_:     30,
+		BreakerMax_:          300,
+		Smuxbuf:              1024,
+		Streambuf:            1024,
+	}
+	if errs := tlsCfg.validate("client"); len(errs) == 0 {
+		t.Fatal("h2 client with hidden SNI was accepted")
+	}
+}

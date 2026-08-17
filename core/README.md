@@ -1,11 +1,17 @@
-# paqet - transport over raw packets
+# WildPaqet Core - HTTP/2/TLS and raw-packet transports
 
-> **WildPaqet Core** — this tree is a forked upstream `paqet` core with WildPaqet v2 upgrades: wire realism (`network.tcp.preset` / tracked SEQ+ACK), optional mimic TCP handshake before KCP dial, and client multi-address failover (`server.addrs`). Module path remains `paqet`.
+> **WildPaqet Core** — this tree is a forked upstream `paqet` core with a normal-kernel TCP transport using real HTTP/2 over TLS, authenticated resilient endpoint pools, and the hardened legacy raw-KCP transport. Module path remains `paqet`.
 
 [![Go Version](https://img.shields.io/badge/go-1.25+-blue.svg)](https://golang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-paqet is a raw-packet proxy that tunnels traffic inside raw TCP packets. Instead of relying on the host's TCP/IP stack, it crafts and captures packets directly, while KCP provides fast, reliable, encrypted transport.
+WildPaqet can use either real HTTP/2/TLS over the host TCP stack (`transport.protocol: tls`) or the original raw-packet KCP transport (`transport.protocol: kcp`).
+
+## WildPaqet HTTP/2/TLS transport
+
+Set `transport.protocol: tls` and `transport.tls.mode: h2` to use the covered transport. The client sends visible SNI with a uTLS ClientHello, negotiates TLS 1.3 and actual HTTP/2, authenticates an encrypted streaming `CONNECT` request, and runs smux inside HTTP/2 DATA frames. Unauthenticated requests receive a built-in or reverse-proxied decoy page. See [`example/client-tls.yaml.example`](example/client-tls.yaml.example) and [`example/server-tls.yaml.example`](example/server-tls.yaml.example).
+
+`mode: direct` remains available for old v3 configurations. It is encrypted and authenticated but does not provide the HTTP/2 cover. The raw-KCP sections below apply only to `transport.protocol: kcp`; do not install NOTRACK or RST-drop rules on the kernel TCP/TLS listener.
 
 > [!WARNING]
 > This project is in active development. APIs, configuration formats, and interfaces may change without notice. Use with caution in production environments.
@@ -20,7 +26,7 @@ paqet operates on raw packets instead. It crafts TCP packets directly and uses p
 
 ### Prerequisites
 
-- `libpcap` development libraries must be installed on both the client and server machines.
+- `libpcap` development libraries are required only when building or using the legacy KCP/pcap transport.
   - **Linux:** No prerequisites - binaries are statically linked.
   - **macOS:** Comes pre-installed with Xcode Command Line Tools. Install with `xcode-select --install`
   - **Windows:** Install Npcap. Download from [npcap.com](https://npcap.com/).

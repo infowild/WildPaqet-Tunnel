@@ -14,6 +14,9 @@ import (
 )
 
 func Dial(ctx context.Context, addr string, cfg *conf.TLS) (tnet.Conn, error) {
+	if cfg.Mode == "h2" {
+		return dialH2(ctx, addr, cfg)
+	}
 	dialer := net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: cfg.KeepAlive}
 	raw, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {

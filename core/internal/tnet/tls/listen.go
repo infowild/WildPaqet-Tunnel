@@ -32,6 +32,9 @@ type acceptResult struct {
 }
 
 func Listen(addr string, cfg *conf.TLS) (tnet.Listener, error) {
+	if cfg.Mode == "h2" {
+		return listenH2(addr, cfg)
+	}
 	tlsCfg, err := serverTLSConfig(cfg)
 	if err != nil {
 		return nil, err

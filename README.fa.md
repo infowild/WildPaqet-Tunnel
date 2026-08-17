@@ -2,9 +2,9 @@
 
 # WildPaqet Tunnel
 
-**تونل مستقیم TLS 1.3 با fallback سخت‌سازی‌شدهٔ Raw-KCP**
+**تونل پوششی HTTP/2 واقعی روی TLS با سازگاری Direct-TLS و Raw-KCP**
 
-[![Version](https://img.shields.io/badge/version-9.2--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.3--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
@@ -56,10 +56,10 @@ wildpaqet
 ```mermaid
 flowchart LR
   U[کاربر / پنل] --> IR[سرور ایران<br/>کلاینت wildpaqet]
-  IR -->|TLS 1.3 + smux| KH1[خارج A]
-  IR -->|TLS 1.3 + smux| KH2[خارج B]
-  IR -->|TLS 1.3 + smux| KH3[خارج C]
-  IR -->|TLS 1.3 + smux| KH4[خارج D]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH1[خارج A]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH2[خارج B]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH3[خارج C]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH4[خارج D]
   KH1 --> NET[اینترنت / سرویس اصلی]
   KH2 --> NET
 ```
@@ -86,7 +86,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wi
 
 ### ۲) خارج → گزینه ۲
 
-روی هر خارج، کد یک‌خطی `WPQ3` را که ویزارد نمایش می‌دهد کپی کن. Secret یکسان را جداگانه نگه دار.
+روی هر خارج حالت پوششی HTTP/2 را انتخاب کن، ترجیحاً certificate عمومی معتبر بده و از نام certificate و Secret یکسان روی همهٔ خارج‌ها استفاده کن. سپس کد یک‌خطی `WPQ4` را کپی کن. حالت self-signed فقط برای تست است.
 
 ### ۳) ایران → گزینه ۳
 
@@ -120,13 +120,17 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ---
 
-## ترنسپورت مستقیم TLS در v3
+## ترنسپورت پوششی HTTP/2 واقعی در v3
 
-ترنسپورت `tls` مستقیماً از TLS 1.3 استفاده می‌کند و هیچ لایهٔ HTTP یا WebSocket ندارد. گواهی سرور بررسی می‌شود، ALPN قابل‌مشاهده مقدار رایج `h2` دارد، و پیش از شروع smux یک احراز هویت HMAC شامل timestamp و nonce اجرا می‌شود. nonce تکراری یا اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شود. در حالت CA bundle خصوصی، SNI به‌صورت پیش‌فرض ارسال نمی‌شود.
+کانفیگ جدید `tls.mode: h2` با SNI قابل‌مشاهده، ALPN استاندارد `h2` و ClientHello پوششی uTLS وارد TLS می‌شود و سپس واقعاً preface، SETTINGS و frameهای HTTP/2 را می‌فرستد. smux داخل بدنهٔ دوطرفه و احرازشدهٔ یک درخواست استاندارد HTTP/2 `CONNECT` قرار می‌گیرد. این روش WebSocket نیست و برخلاف نسخهٔ قبلی، `h2` را اعلام نمی‌کند که بلافاصله پروتکل خصوصی دیگری صحبت کند.
 
-منیجر v9.1 به بعد با کد یک‌خطی `WPQ3`، certificate عمومی و endpoint را وارد می‌کند و روی ایران CA bundle را خودکار می‌سازد. این کد نه Shared Secret دارد و نه private key.
+درخواست یا probe نامعتبر یک صفحهٔ معمولی داخلی یا وب‌سایت decoy محلی می‌بیند. احراز هویت تونل داخل TLS و با HMAC متصل به cover path مبهم، timestamp و nonce تصادفی انجام می‌شود؛ replay و اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شوند. برای مقاومت در برابر active probe، certificate عمومی معتبر قویاً توصیه می‌شود؛ self-signed همچنان برای probe قابل‌مشاهده است.
 
-منیجر v9.2 به‌طور پیش‌فرض برای هر endpoint خارج چهار اتصال بیرونی می‌سازد و streamها را round-robin پخش می‌کند؛ بنابراین چهار خارج یک pool شانزده‌اتصالی دارند. supervisor پس‌زمینه slot بسته‌شده را بدون انتظار برای درخواست بعدی کاربر بازسازی می‌کند. پس از سه خطای dial متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود؛ زمان توقف حداکثر تا پنج دقیقه رشد می‌کند و فقط یک probe نیمه‌باز اجازه دارد.
+فایل‌های certificate و key هنگام handshake جدید بررسی می‌شوند و اگر Certbot/ACME آن‌ها را جایگزین کرده باشد خودکار reload می‌شوند؛ تمدید معمول certificate به restart کردن Paqet نیاز ندارد.
+
+منیجر v9.3 از pairing یک‌خطی `WPQ4` استفاده می‌کند که endpoint، نام عمومی certificate، cover path مبهم و certificate عمومی را دارد؛ Secret و private key در آن نیست و خود path کلید احراز هویت محسوب نمی‌شود. همهٔ خارج‌های یک pool باید نام certificate، cover path و Secret یکسان داشته باشند. مسیر پیش‌فرض از نام certificate و Secret مشتق می‌شود تا روی خارج‌های هماهنگ خودکار یکسان باشد. `WPQ3` و `mode: direct` قدیمی فقط برای سازگاری باقی مانده‌اند و پوشش HTTP/2 ندارند.
+
+برای هر endpoint خارج چهار اتصال ساخته می‌شود و streamها round-robin پخش می‌شوند. supervisor اتصال بسته را بازسازی می‌کند. اتصال‌های HTTP/2 پس از عمر تصادفی‌شده تعویض می‌شوند؛ اتصال جایگزین ابتدا وارد pool می‌شود و اتصال قدیمی تا پایان streamهایش drain می‌شود. شروع اتصال و keepalive نیز jitter دارند. پس از سه خطای dial متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود و cooldown حداکثر تا پنج دقیقه رشد می‌کند.
 
 برای بار کم دو اتصال، برای حالت متعادل چهار اتصال و فقط روی ایران قوی‌تر و بار هم‌زمان زیاد هشت اتصال به‌ازای هر خارج انتخاب کن. تعداد کاربر ثبت‌شده معیار ظرفیت نیست؛ پهنای‌باند هم‌زمان تعیین‌کننده است. سرور `1 vCPU / 1 GB` برای تست مناسب است؛ برای تولید از حدود `4 vCPU / 4 GB` شروع کن و حتماً با بار واقعی اندازه‌گیری کن.
 

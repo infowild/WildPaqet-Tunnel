@@ -2,9 +2,9 @@
 
 # WildPaqet Tunnel
 
-**Direct TLS 1.3 tunnel with a hardened raw-KCP fallback**
+**Real HTTP/2-covered TLS tunnel with direct-TLS and raw-KCP compatibility**
 
-[![Version](https://img.shields.io/badge/version-9.2--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.3--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -38,7 +38,7 @@ wildpaqet
 
 ## Why WildPaqet?
 
-WildPaqet is a production-oriented tunnel manager for Kharej ↔ Iran deployments. v3 defaults to **direct TLS 1.3 + smux** over normal kernel TCP; the hardened raw socket + KCP transport remains an explicit legacy fallback.
+WildPaqet is a production-oriented tunnel manager for Kharej ↔ Iran deployments. v3 defaults to **real HTTP/2 over TLS 1.3 with smux inside the HTTP/2 body** over normal kernel TCP. Legacy direct TLS and hardened raw socket + KCP remain compatibility modes.
 
 | | |
 |---|---|
@@ -57,10 +57,10 @@ Forked and maintained from [Paqet-Tunnel-Manager](https://github.com/behzadea12/
 ```mermaid
 flowchart LR
   U[Users / Panels] --> IR[Iran VPS<br/>wildpaqet client]
-  IR -->|TLS 1.3 + smux| KH1[Kharej A]
-  IR -->|TLS 1.3 + smux| KH2[Kharej B]
-  IR -->|TLS 1.3 + smux| KH3[Kharej C]
-  IR -->|TLS 1.3 + smux| KH4[Kharej D]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH1[Kharej A]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH2[Kharej B]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH3[Kharej C]
+  IR -->|HTTP/2 + TLS 1.3 + smux| KH4[Kharej D]
   KH1 --> NET[Internet / Origin services]
   KH2 --> NET
 ```
@@ -89,13 +89,14 @@ toolchain switching or downloads a checksum-verified official compiler under
 
 ### 2) Kharej
 
-1. Option **2** → **v3 direct TLS**
-2. Use the same shared secret on all Kharej servers
-3. Copy the one-line `WPQ3` pairing code printed by each server
+1. Option **2** → **v3 HTTP/2-covered TLS**
+2. Use the same public certificate name and shared secret on all Kharej servers
+3. Prefer a publicly trusted certificate; self-signed mode is for testing
+4. Copy the one-line `WPQ4` pairing code printed by each server
 
 ### 3) Iran
 
-1. Option **3** → **v3 direct TLS**
+1. Option **3** → **v3 HTTP/2-covered TLS**
 2. Choose the default **Paste pairing code(s)** option
 3. Paste the four codes and submit an empty line; endpoints and the CA bundle are created automatically
 4. Keep the recommended four outer connections per Kharej (16 total for four endpoints)
@@ -156,13 +157,17 @@ wildpaqet
 
 ---
 
-## Direct TLS transport (9.0-v3)
+## Real HTTP/2 cover transport (9.3-v3)
 
-The `tls` transport is direct TLS — there is no HTTP or WebSocket layer. It uses TLS 1.3, certificate verification, the common visible ALPN value `h2`, and a fail-closed post-TLS HMAC challenge with a timestamp and nonce. A replayed nonce or a timestamp outside the two-minute window is rejected before smux starts. Private CA-bundle deployments do not send SNI by default.
+New `tls.mode: h2` configurations negotiate TLS with visible SNI, ALPN `h2`, and a uTLS ClientHello, then send the standards-required HTTP/2 preface, SETTINGS and DATA frames. Smux remains inside one authenticated, full-duplex HTTP/2 `CONNECT` request. This is not WebSocket and does not falsely advertise HTTP/2 while speaking a private protocol immediately after TLS.
 
-Manager v9.1+ supports one-line `WPQ3` pairing codes. Iran validates the embedded public certificate and automatically builds the endpoint list and CA bundle. Pairing codes contain neither the shared secret nor the private key.
+Unknown or unauthenticated HTTP requests receive a normal built-in page or an optional local decoy website. Tunnel authentication is an encrypted HMAC token bound to the opaque cover path, timestamp and random nonce. Replays and timestamps outside the two-minute window fail closed. A publicly trusted certificate is strongly recommended because a self-signed certificate remains visible to an active probe.
 
-Manager v9.2 defaults to four outer connections per Kharej endpoint and distributes new streams round-robin. Four Kharej servers therefore produce a 16-connection pool. A background supervisor rebuilds closed pool slots without waiting for the next user request. Three consecutive dial failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
+Certificate and key files are checked on each new TLS handshake and reloaded after ACME/Certbot replaces them; routine certificate renewal therefore does not require a Paqet restart.
+
+Manager v9.3 uses one-line `WPQ4` pairing codes containing the endpoint, public certificate name, opaque cover path and public certificate. They contain neither the shared secret nor private key. The cover path is routing metadata, not an authentication secret. All endpoints in one pool must use the same certificate name, cover path and shared secret. The wizard derives the default path from the certificate name and shared secret, so matching Kharej nodes get the same path automatically. Legacy `WPQ3` / `mode: direct` configurations remain supported but do not provide the HTTP/2 cover.
+
+Four outer connections per Kharej endpoint distribute new streams round-robin. A background supervisor rebuilds closed slots. HTTP/2 connections rotate after a jittered lifetime; the replacement enters the pool first and the old connection drains existing streams before closing. Connection startup and smux keepalives are also jittered. Three consecutive dial failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
 
 Use two connections per endpoint for low traffic, four for balanced production traffic, or eight only for high concurrency on a larger Iran VPS. Registered-user count is not a capacity figure: size the Iran host and uplink for simultaneous traffic. A 1-vCPU/1-GB host is suitable for testing; start production sizing around 4 vCPU / 4 GB and verify with a representative load test.
 

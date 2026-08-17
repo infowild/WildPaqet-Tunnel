@@ -8,7 +8,7 @@ import (
 )
 
 var (
-	Version   = "v3.0.0-wildpaqet"
+	Version   = "v3.1.0-wildpaqet"
 	GitCommit = "unknown"
 	GitTag    = "unknown"
 	BuildTime = "unknown"

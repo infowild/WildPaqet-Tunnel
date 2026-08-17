@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"paqet/internal/conf"
 	"paqet/internal/tnet"
 )
 
 type reconnectTestConn struct {
-	closed atomic.Bool
+	closed  atomic.Bool
+	streams atomic.Int32
 }
 
 func (c *reconnectTestConn) OpenStrm() (tnet.Strm, error) {
@@ -31,6 +33,7 @@ func (c *reconnectTestConn) SetReadDeadline(time.Time) error { return nil }
 func (c *reconnectTestConn) SetWriteDeadline(time.Time) error {
 	return nil
 }
+func (c *reconnectTestConn) NumStreams() int { return int(c.streams.Load()) }
 
 func TestMaintainTimedConnRestoresClosedPoolSlot(t *testing.T) {
 	closed := &reconnectTestConn{}
@@ -69,5 +72,46 @@ func TestMaintainTimedConnRestoresClosedPoolSlot(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if got := dials.Load(); got != 1 {
 		t.Fatalf("healthy replacement was redialed %d times", got)
+	}
+}
+
+func TestRotateSwapsBeforeGracefullyDrainingOldConnection(t *testing.T) {
+	old := &reconnectTestConn{}
+	old.streams.Store(1)
+	replacement := &reconnectTestConn{}
+	tc := &timedConn{
+		cfg: &conf.Conf{Transport: conf.Transport{TLS: &conf.TLS{
+			Mode:                "h2",
+			MaxConnectionAge:    time.Hour,
+			ConnectionAgeJitter: 0,
+			DrainTimeout:        5 * time.Second,
+		}}},
+		conn:   old,
+		expire: time.Now().Add(-time.Second),
+		connect: func(context.Context) (tnet.Conn, error) {
+			return replacement, nil
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := tc.rotate(ctx); err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	tc.mu.Lock()
+	got := tc.conn
+	tc.mu.Unlock()
+	if got != replacement {
+		t.Fatal("replacement was not installed before draining")
+	}
+	if old.closed.Load() {
+		t.Fatal("old connection closed while it still had an active stream")
+	}
+	old.streams.Store(0)
+	deadline := time.Now().Add(3 * time.Second)
+	for !old.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !old.closed.Load() {
+		t.Fatal("drained old connection was not closed")
 	}
 }

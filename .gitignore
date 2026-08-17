@@ -18,6 +18,7 @@ tests/
 !core/internal/conf/tls_test.go
 !core/internal/tnet/tls/auth_test.go
 !core/internal/tnet/tls/clienthello_test.go
+!core/internal/tnet/tls/packet_test.go
 !core/internal/tnet/tls/transport_test.go
 
 # Editor / OS junk
@@ -30,6 +31,7 @@ Thumbs.db
 
 # Local scratch / review artifacts
 _review_*
+.tmp-go-cache/
 *.local.md
 .env
 .env.*

@@ -43,6 +43,13 @@ func maintainTimedConn(ctx context.Context, tc *timedConn, interval time.Duratio
 		if !tc.isClosed() {
 			attempt = 0
 		}
+		if tc.rotationDue(time.Now()) {
+			if err := tc.rotate(ctx); err != nil {
+				flog.Warnf("background connection rotation failed: %v", err)
+			} else {
+				flog.Infof("background connection to %s rotated and draining", tc.remoteAddr())
+			}
+		}
 		timer.Reset(interval)
 	}
 }
