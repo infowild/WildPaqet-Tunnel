@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.10-v3
+# Version: 9.11-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.10-v3"
+readonly SCRIPT_VERSION="9.11-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -693,7 +693,7 @@ record_managed_firewall_rule() {
     local port="$3"
     validate_port "$port" || return 1
     case "$backend:$protocol" in
-        ufw:tcp|firewalld:tcp) ;;
+        ufw:tcp|ufw:udp|firewalld:tcp|firewalld:udp) ;;
         *) return 1 ;;
     esac
 
@@ -851,6 +851,300 @@ yaml_set_transport_conn() {
         return 0
     fi
     return 1
+}
+
+yaml_forward_entry_line() {
+    local listen_port="$1"
+    local target="$2"
+    local protocol="$3"
+    printf '%s|%s|%s' "$listen_port" "$target" "$protocol"
+}
+
+yaml_forward_entry_yaml() {
+    local listen_port="$1"
+    local target="$2"
+    local protocol="$3"
+    printf '  - listen: "0.0.0.0:%s"\n    target: "%s"\n    protocol: "%s"\n' \
+        "$listen_port" "$target" "$protocol"
+}
+
+# One line per forward rule: listen_port|target|protocol
+yaml_list_forward_entries() {
+    local cfg="$1"
+    [ -f "$cfg" ] || return 0
+    awk '
+        /^forward:/ { in_fwd=1; next }
+        in_fwd && /^[^[:space:]]/ { exit }
+        in_fwd && /^[[:space:]]*- listen:/ {
+            listen=$3; gsub(/"/, "", listen); sub(/^.*:/, "", listen)
+            target=""; proto="tcp"; next
+        }
+        in_fwd && /^[[:space:]]*target:/ {
+            target=$2; gsub(/"/, "", target); next
+        }
+        in_fwd && /^[[:space:]]*protocol:/ {
+            proto=$2; gsub(/"/, "", proto)
+            if (listen != "") print listen "|" target "|" proto
+            listen=""; target=""; proto="tcp"; next
+        }
+    ' "$cfg"
+}
+
+yaml_rewrite_forward_entries() {
+    local cfg="$1"
+    shift
+    local -a entries=("$@")
+    local tmp block
+    [ -f "$cfg" ] || return 1
+    tmp=$(mktemp)
+    block=$(mktemp)
+    if [ ${#entries[@]} -gt 0 ]; then
+        echo "forward:" > "$block"
+        local entry listen target proto
+        for entry in "${entries[@]}"; do
+            [ -n "$entry" ] || continue
+            IFS='|' read -r listen target proto <<< "$entry"
+            [ -n "$listen" ] && [ -n "$target" ] && [ -n "$proto" ] || continue
+            yaml_forward_entry_yaml "$listen" "$target" "$proto" >> "$block"
+        done
+    else
+        : > "$block"
+    fi
+    awk -v blockfile="$block" '
+        BEGIN {
+            while ((getline line < blockfile) > 0) {
+                block[block_len++] = line
+            }
+            close(blockfile)
+        }
+        function emit_block() {
+            if (block_len > 0 && !inserted) {
+                for (i = 0; i < block_len; i++) print block[i]
+                inserted = 1
+            }
+        }
+        /^forward:/ { skip=1; emit_block(); next }
+        skip && /^[^[:space:]]/ { skip=0 }
+        skip { next }
+        /^server:/ { emit_block() }
+        { print }
+        END { emit_block() }
+    ' "$cfg" > "$tmp" && mv -f "$tmp" "$cfg"
+    rm -f "$block"
+}
+
+forward_entry_exists() {
+    local listen_port="$1"
+    local protocol="$2"
+    local entry lp tp proto
+    shift 2
+    for entry; do
+        [ -n "$entry" ] || continue
+        IFS='|' read -r lp tp proto <<< "$entry"
+        [ "$lp" = "$listen_port" ] && [ "$proto" = "$protocol" ] && return 0
+    done
+    return 1
+}
+
+prompt_forward_protocol() {
+    local port="$1"
+    local choice=""
+    echo "Port $port — tunnel carries this as TCP or UDP inside HTTP/2:"
+    echo " 1. TCP only"
+    echo " 2. UDP only"
+    echo " 3. TCP + UDP (two forward rules)"
+    read -r -p "Choose [1]: " choice
+    choice="${choice:-1}"
+    case "$choice" in
+        2) printf '%s\n' "udp" ;;
+        3) printf '%s\n' "both" ;;
+        *) printf '%s\n' "tcp" ;;
+    esac
+}
+
+append_forward_entries_for_port() {
+    local -n _out=$1
+    local port="$2"
+    local target="$3"
+    local proto_choice="$4"
+    case "$proto_choice" in
+        udp)
+            _out+=("$(yaml_forward_entry_line "$port" "$target" "udp")")
+            ;;
+        both)
+            _out+=("$(yaml_forward_entry_line "$port" "$target" "tcp")")
+            _out+=("$(yaml_forward_entry_line "$port" "$target" "udp")")
+            ;;
+        *)
+            _out+=("$(yaml_forward_entry_line "$port" "$target" "tcp")")
+            ;;
+    esac
+}
+
+apply_forward_listener_firewall() {
+    local port="$1"
+    local protocol="$2"
+    validate_port "$port" || return 1
+    case "$protocol" in
+        tcp|udp|both) ;;
+        *) return 1 ;;
+    esac
+    local -a protos=()
+    if [ "$protocol" = "both" ]; then
+        protos=(tcp udp)
+    else
+        protos=("$protocol")
+    fi
+    local proto
+    for proto in "${protos[@]}"; do
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+            if ! ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}/${proto}[[:space:]]+ALLOW"; then
+                ufw allow "$port/$proto" >/dev/null 2>&1 || return 1
+                record_managed_firewall_rule ufw "$proto" "$port" || true
+            fi
+        elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+            if ! firewall-cmd --permanent --query-port="$port/$proto" >/dev/null 2>&1; then
+                firewall-cmd --permanent --add-port="$port/$proto" >/dev/null 2>&1 || return 1
+                firewall-cmd --reload >/dev/null 2>&1 || return 1
+                record_managed_firewall_rule firewalld "$proto" "$port" || true
+            fi
+        elif command -v iptables >/dev/null 2>&1; then
+            iptables -C INPUT -p "$proto" --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED \
+                -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT 2>/dev/null || \
+                iptables -C INPUT -p "$proto" --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT 2>/dev/null || \
+                iptables -A INPUT -p "$proto" --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED \
+                    -m comment --comment "$FIREWALL_COMMENT" -j ACCEPT
+            save_iptables
+        fi
+    done
+    return 0
+}
+
+restart_paqet_service_if_requested() {
+    local selected_service="$1"
+    local default_yes="${2:-0}"
+    local restart_choice=""
+    if [ "$default_yes" -eq 1 ]; then
+        read -r -p "Restart service now? (Y/n): " restart_choice
+        [[ "$restart_choice" =~ ^[Nn]$ ]] && return 0
+    else
+        read -r -p "Restart service to apply changes? (y/N): " restart_choice
+        [[ ! "$restart_choice" =~ ^[Yy]$ ]] && return 0
+    fi
+    systemctl restart "$selected_service" >/dev/null 2>&1
+    if systemctl is-active --quiet "$selected_service"; then
+        print_success "Service restarted"
+    else
+        print_error "Service failed to start"
+        systemctl status "$selected_service" --no-pager -l
+    fi
+}
+
+edit_v3_client_listen_ports() {
+    local cfg="$1"
+    local selected_service="$2"
+    local -a entries=()
+    local choice port target proto_choice lp tp proto entry new_port new_target
+    mapfile -t entries < <(yaml_list_forward_entries "$cfg")
+    while true; do
+        echo -e "\n${CYAN}Forward ports (TCP/UDP inside the h2 tunnel):${NC}"
+        if [ ${#entries[@]} -eq 0 ]; then
+            echo "  (none configured)"
+        else
+            for entry in "${entries[@]}"; do
+                [ -n "$entry" ] || continue
+                IFS='|' read -r lp tp proto <<< "$entry"
+                echo "  • $lp → $tp ($proto)"
+            done
+        fi
+        echo ""
+        echo " 1. Add a forward port"
+        echo " 2. Remove a forward port"
+        echo " 0. Back"
+        read -r -p "Choose [0-2]: " choice
+        case "$choice" in
+            0) return ;;
+            1)
+                read -r -p "Listen port on Iran: " new_port
+                validate_port "$new_port" || { print_error "Invalid port"; continue; }
+                read -r -p "Local target [127.0.0.1:$new_port]: " new_target
+                new_target="${new_target:-127.0.0.1:$new_port}"
+                proto_choice=$(prompt_forward_protocol "$new_port")
+                case "$proto_choice" in
+                    both)
+                        forward_entry_exists "$new_port" "tcp" "${entries[@]}" && {
+                            print_warning "TCP forward for port $new_port already exists"
+                        } || append_forward_entries_for_port entries "$new_port" "$new_target" "tcp"
+                        forward_entry_exists "$new_port" "udp" "${entries[@]}" && {
+                            print_warning "UDP forward for port $new_port already exists"
+                        } || append_forward_entries_for_port entries "$new_port" "$new_target" "udp"
+                        apply_forward_listener_firewall "$new_port" both || \
+                            print_warning "Could not open firewall for $new_port (open TCP+UDP manually)"
+                        ;;
+                    udp)
+                        forward_entry_exists "$new_port" "udp" "${entries[@]}" && {
+                            print_error "UDP forward for port $new_port already exists"; continue
+                        }
+                        append_forward_entries_for_port entries "$new_port" "$new_target" "udp"
+                        apply_forward_listener_firewall "$new_port" udp || \
+                            print_warning "Could not open firewall for UDP/$new_port"
+                        ;;
+                    *)
+                        forward_entry_exists "$new_port" "tcp" "${entries[@]}" && {
+                            print_error "TCP forward for port $new_port already exists"; continue
+                        }
+                        append_forward_entries_for_port entries "$new_port" "$new_target" "tcp"
+                        apply_forward_listener_firewall "$new_port" tcp || \
+                            print_warning "Could not open firewall for TCP/$new_port"
+                        ;;
+                esac
+                yaml_rewrite_forward_entries "$cfg" "${entries[@]}" || {
+                    print_error "Could not update forward section"
+                    continue
+                }
+                print_success "Forward port(s) added"
+                restart_paqet_service_if_requested "$selected_service" 1
+                mapfile -t entries < <(yaml_list_forward_entries "$cfg")
+                ;;
+            2)
+                [ ${#entries[@]} -gt 0 ] || { print_warning "No forward ports to remove"; continue; }
+                read -r -p "Listen port to remove: " port
+                validate_port "$port" || { print_error "Invalid port"; continue; }
+                echo " 1. Remove TCP only"
+                echo " 2. Remove UDP only"
+                echo " 3. Remove both TCP and UDP on this port"
+                read -r -p "Choose [3]: " choice
+                choice="${choice:-3}"
+                local -a kept=() removed=0
+                for entry in "${entries[@]}"; do
+                    [ -n "$entry" ] || continue
+                    IFS='|' read -r lp tp proto <<< "$entry"
+                    local drop=0
+                    case "$choice" in
+                        1) [ "$lp" = "$port" ] && [ "$proto" = "tcp" ] && drop=1 ;;
+                        2) [ "$lp" = "$port" ] && [ "$proto" = "udp" ] && drop=1 ;;
+                        *) [ "$lp" = "$port" ] && drop=1 ;;
+                    esac
+                    if [ "$drop" -eq 1 ]; then
+                        removed=1
+                        continue
+                    fi
+                    kept+=("$entry")
+                done
+                [ "$removed" -eq 1 ] || { print_warning "No matching forward rule found"; continue; }
+                entries=("${kept[@]}")
+                yaml_rewrite_forward_entries "$cfg" "${entries[@]}" || {
+                    print_error "Could not update forward section"
+                    continue
+                }
+                print_success "Forward rule(s) removed for port $port"
+                print_info "Firewall rules were left in place; remove manually if this port is unused"
+                restart_paqet_service_if_requested "$selected_service" 1
+                mapfile -t entries < <(yaml_list_forward_entries "$cfg")
+                ;;
+            *) print_error "Invalid choice" ;;
+        esac
+    done
 }
 
 # Install a binary onto a possibly-running path without hitting ETXTBSY.
@@ -1127,15 +1421,23 @@ edit_paqet_service_yaml() {
 edit_v3_tls_service_config() {
     local cfg="$1"
     local selected_service="$2"
-    local current_conn choice new_conn
+    local current_conn choice new_conn is_client=0
     current_conn=$(grep -E '^[[:space:]]*conn:' "$cfg" | head -1 | awk '{print $2}' | tr -d '"')
+    grep -q '^role:[[:space:]]*"client"' "$cfg" && is_client=1
     while true; do
         echo -e "\n${CYAN}v3 HTTP/2 uses kernel TCP. KCP speed (normal/fast) and KCP MTU do not apply.${NC}"
-        echo "The knob that changes capacity on this tunnel is outer connections."
+        echo "UDP/TCP user traffic is forwarded inside the tunnel; outer leg stays HTTPS."
         echo " 1. Change outer connections (current: ${current_conn:-unset})"
-        echo " 2. Open YAML in editor"
+        if [ "$is_client" -eq 1 ]; then
+            if grep -q '^socks5:' "$cfg"; then
+                echo " 2. SOCKS5 mode (UDP uses UDP_ASSOCIATE on the SOCKS TCP port)"
+            else
+                echo " 2. Manage forward ports (add/remove TCP or UDP)"
+            fi
+        fi
+        echo " 3. Open YAML in editor"
         echo " 0. Back"
-        read -r -p "Choose [0-2]: " choice
+        read -r -p "Choose [0-3]: " choice
         case "$choice" in
             0) return ;;
             1)
@@ -1151,18 +1453,20 @@ edit_v3_tls_service_config() {
                 }
                 current_conn="$new_conn"
                 print_success "conn set to $new_conn"
-                read -r -p "Restart service now? (Y/n): " restart_choice
-                if [[ ! "$restart_choice" =~ ^[Nn]$ ]]; then
-                    systemctl restart "$selected_service" >/dev/null 2>&1
-                    if systemctl is-active --quiet "$selected_service"; then
-                        print_success "Service restarted"
-                    else
-                        print_error "Service failed to start"
-                        systemctl status "$selected_service" --no-pager -l
-                    fi
-                fi
+                restart_paqet_service_if_requested "$selected_service" 1
                 ;;
-            2) edit_paqet_service_yaml "$cfg" "$selected_service" ;;
+            2)
+                if [ "$is_client" -ne 1 ]; then
+                    print_error "Forward ports apply only to Iran client configs"
+                    continue
+                fi
+                if grep -q '^socks5:' "$cfg"; then
+                    print_info "SOCKS5 already tunnels UDP via UDP_ASSOCIATE; no separate UDP forward port is needed"
+                    continue
+                fi
+                edit_v3_client_listen_ports "$cfg" "$selected_service"
+                ;;
+            3) edit_paqet_service_yaml "$cfg" "$selected_service" ;;
             *) print_error "Invalid choice" ;;
         esac
     done
@@ -2776,15 +3080,33 @@ configure_v3_tls_client() {
         fi
         configure_tls_firewall "$socks_port" || true
     else
-        local forward_ports p
-        read -r -p "TCP forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
+        local forward_ports p proto_choice display_ports=""
+        read -r -p "Forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
         forward_ports=$(clean_port_list "${forward_ports:-$DEFAULT_V2RAY_PORTS}")
         [ -n "$forward_ports" ] || { print_error "No valid forward port"; pause; return 1; }
         IFS=',' read -ra _v3_ports <<< "$forward_ports"
         for p in "${_v3_ports[@]}"; do
-            forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
-            configure_tls_firewall "$p" || true
+            proto_choice=$(prompt_forward_protocol "$p")
+            case "$proto_choice" in
+                both)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"udp\"")
+                    display_ports+=" $p (TCP+UDP)"
+                    apply_forward_listener_firewall "$p" both || true
+                    ;;
+                udp)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"udp\"")
+                    display_ports+=" $p (UDP)"
+                    apply_forward_listener_firewall "$p" udp || true
+                    ;;
+                *)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
+                    display_ports+=" $p (TCP)"
+                    apply_forward_listener_firewall "$p" tcp || true
+                    ;;
+            esac
         done
+        [ -n "$display_ports" ] && print_info "Forward:${display_ports}"
     fi
 
     ensure_v3_core || return 1

@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export WILDPAQET_LIB_ONLY=1
 source "$repo_root/wildpaqet.sh"
 
-test "$SCRIPT_VERSION" = "9.10-v3"
+test "$SCRIPT_VERSION" = "9.11-v3"
 v3_validate_cover_path '/api/v1/cover/events'
 if v3_validate_cover_path '/api/../admin'; then
 	echo "unsafe cover path was accepted" >&2
@@ -69,5 +69,27 @@ test "$(config_transport_protocol "$parse_dir/germany.yaml")" = "tls"
 test "$(config_tls_mode "$parse_dir/germany.yaml")" = "h2"
 yaml_set_transport_conn "$parse_dir/germany.yaml" 2
 grep -qE '^[[:space:]]*conn: 2$' "$parse_dir/germany.yaml"
+
+cat > "$parse_dir/forward-client.yaml" <<'EOF'
+role: "client"
+log:
+  level: "info"
+forward:
+  - listen: "0.0.0.0:8080"
+    target: "127.0.0.1:8080"
+    protocol: "tcp"
+server:
+  addr: "203.0.113.10:443"
+transport:
+  protocol: "tls"
+  conn: 4
+EOF
+mapfile -t fwd < <(yaml_list_forward_entries "$parse_dir/forward-client.yaml")
+test "${#fwd[@]}" -eq 1
+test "$fwd" = "8080|127.0.0.1:8080|tcp"
+yaml_rewrite_forward_entries "$parse_dir/forward-client.yaml" \
+    "8080|127.0.0.1:8080|tcp" "8443|127.0.0.1:8443|udp"
+mapfile -t fwd < <(yaml_list_forward_entries "$parse_dir/forward-client.yaml")
+test "${#fwd[@]}" -eq 2
 
 echo 'v3-manager-pool-and-refresh: PASS'
