@@ -4,7 +4,7 @@
 
 **Direct TLS 1.3 tunnel with a hardened raw-KCP fallback**
 
-[![Version](https://img.shields.io/badge/version-9.1--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.2--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -98,7 +98,8 @@ toolchain switching or downloads a checksum-verified official compiler under
 1. Option **3** → **v3 direct TLS**
 2. Choose the default **Paste pairing code(s)** option
 3. Paste the four codes and submit an empty line; endpoints and the CA bundle are created automatically
-4. Enter the shared secret once, then choose Port Forward or SOCKS5
+4. Keep the recommended four outer connections per Kharej (16 total for four endpoints)
+5. Enter the shared secret once, then choose Port Forward or SOCKS5
 
 ### 4) Daily use
 
@@ -159,9 +160,11 @@ wildpaqet
 
 The `tls` transport is direct TLS — there is no HTTP or WebSocket layer. It uses TLS 1.3, certificate verification, the common visible ALPN value `h2`, and a fail-closed post-TLS HMAC challenge with a timestamp and nonce. A replayed nonce or a timestamp outside the two-minute window is rejected before smux starts. Private CA-bundle deployments do not send SNI by default.
 
-Manager v9.1 adds one-line `WPQ3` pairing codes. Iran validates the embedded public certificate and automatically builds the endpoint list and CA bundle. Pairing codes contain neither the shared secret nor the private key.
+Manager v9.1+ supports one-line `WPQ3` pairing codes. Iran validates the embedded public certificate and automatically builds the endpoint list and CA bundle. Pairing codes contain neither the shared secret nor the private key.
 
-For multiple Kharej endpoints, the default is one outer connection per endpoint. Streams are distributed round-robin. Three consecutive failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
+Manager v9.2 defaults to four outer connections per Kharej endpoint and distributes new streams round-robin. Four Kharej servers therefore produce a 16-connection pool. A background supervisor rebuilds closed pool slots without waiting for the next user request. Three consecutive dial failures open that endpoint's circuit for 30 seconds, with exponential cooldown capped at five minutes and a single half-open probe.
+
+Use two connections per endpoint for low traffic, four for balanced production traffic, or eight only for high concurrency on a larger Iran VPS. Registered-user count is not a capacity figure: size the Iran host and uplink for simultaneous traffic. A 1-vCPU/1-GB host is suitable for testing; start production sizing around 4 vCPU / 4 GB and verify with a representative load test.
 
 See [the v3 install guide](docs/V3-INSTALL.md) and the [client](core/example/client-tls.yaml.example) / [server](core/example/server-tls.yaml.example) examples.
 

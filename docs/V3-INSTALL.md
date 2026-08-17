@@ -40,7 +40,8 @@ On Iran:
 1. Choose `3 → v3 direct TLS`.
 2. Select `Paste pairing code(s)` (the default).
 3. Paste one code from each Kharej server, then submit an empty line.
-4. Enter the shared secret once and choose Port Forward or SOCKS5.
+4. Choose the outer connections per Kharej. Four is the recommended default.
+5. Enter the shared secret once and choose Port Forward or SOCKS5.
 
 The Iran wizard validates each certificate name, expiry and SHA-256
 fingerprint, imports the endpoints, and creates the protected CA bundle
@@ -53,7 +54,9 @@ cat kharej-1.crt kharej-2.crt kharej-3.crt kharej-4.crt > /etc/paqet/tls/kharej-
 chmod 600 /etc/paqet/tls/kharej-ca-bundle.crt
 ```
 
-The client creates one outer connection per endpoint by default and distributes new streams round-robin. After three consecutive failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
+Manager v9.2 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
+
+Choose two connections per endpoint for low traffic, four for balanced traffic, or eight for high concurrency on a larger Iran VPS. More connections reduce the head-of-line impact of loss on one outer TCP flow, but they do not repair a poor route or create bandwidth. Size the Iran host by simultaneous throughput, not registered users; use a 1-vCPU/1-GB VPS only for testing and load-test production starting around 4 vCPU / 4 GB.
 
 ## Security model
 

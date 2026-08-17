@@ -14,6 +14,7 @@ tests/
 
 # Security-critical v3 transport tests are part of the published source.
 !core/internal/client/endpoint_pool_test.go
+!core/internal/client/ticker_test.go
 !core/internal/conf/tls_test.go
 !core/internal/tnet/tls/auth_test.go
 !core/internal/tnet/tls/clienthello_test.go

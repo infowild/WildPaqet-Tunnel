@@ -18,8 +18,9 @@ server:
 
 transport:
   protocol: "tls"
-  # One outer connection per endpoint. If omitted, this is derived automatically.
-  conn: 4
+  # Four outer connections per endpoint reduce one-flow head-of-line stalls.
+  # This example has four endpoints, so the total pool size is 4 x 4 = 16.
+  conn: 16
   tls:
     # Concatenate the four self-signed server.crt files into this bundle.
     ca_file: "/etc/paqet/tls/kharej-ca-bundle.crt"

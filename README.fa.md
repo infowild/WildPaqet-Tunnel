@@ -4,7 +4,7 @@
 
 **تونل مستقیم TLS 1.3 با fallback سخت‌سازی‌شدهٔ Raw-KCP**
 
-[![Version](https://img.shields.io/badge/version-9.1--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.2--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
@@ -90,7 +90,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wi
 
 ### ۳) ایران → گزینه ۳
 
-حالت پیش‌فرض **Paste pairing code(s)** را انتخاب کن، کدهای چهار خارج را یکی‌یکی paste کن و در پایان Enter خالی بزن. endpointها، بررسی certificate و CA bundle خودکار انجام می‌شوند؛ فقط Secret را یک‌بار وارد می‌کنی.
+حالت پیش‌فرض **Paste pairing code(s)** را انتخاب کن، کدهای چهار خارج را یکی‌یکی paste کن و در پایان Enter خالی بزن. endpointها، بررسی certificate و CA bundle خودکار انجام می‌شوند. مقدار پیشنهادی چهار اتصال برای هر خارج را نگه دار (برای چهار خارج مجموعاً ۱۶ اتصال) و Secret را یک‌بار وارد کن.
 
 ### ۴) استفاده روزانه
 
@@ -124,9 +124,11 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ترنسپورت `tls` مستقیماً از TLS 1.3 استفاده می‌کند و هیچ لایهٔ HTTP یا WebSocket ندارد. گواهی سرور بررسی می‌شود، ALPN قابل‌مشاهده مقدار رایج `h2` دارد، و پیش از شروع smux یک احراز هویت HMAC شامل timestamp و nonce اجرا می‌شود. nonce تکراری یا اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شود. در حالت CA bundle خصوصی، SNI به‌صورت پیش‌فرض ارسال نمی‌شود.
 
-منیجر v9.1 با کد یک‌خطی `WPQ3`، certificate عمومی و endpoint را وارد می‌کند و روی ایران CA bundle را خودکار می‌سازد. این کد نه Shared Secret دارد و نه private key.
+منیجر v9.1 به بعد با کد یک‌خطی `WPQ3`، certificate عمومی و endpoint را وارد می‌کند و روی ایران CA bundle را خودکار می‌سازد. این کد نه Shared Secret دارد و نه private key.
 
-برای چهار سرور خارج، کلاینت به‌طور پیش‌فرض برای هر endpoint یک اتصال بیرونی می‌سازد و streamها را round-robin پخش می‌کند. پس از سه خطای متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود؛ زمان توقف حداکثر تا پنج دقیقه رشد می‌کند و فقط یک probe نیمه‌باز اجازه دارد.
+منیجر v9.2 به‌طور پیش‌فرض برای هر endpoint خارج چهار اتصال بیرونی می‌سازد و streamها را round-robin پخش می‌کند؛ بنابراین چهار خارج یک pool شانزده‌اتصالی دارند. supervisor پس‌زمینه slot بسته‌شده را بدون انتظار برای درخواست بعدی کاربر بازسازی می‌کند. پس از سه خطای dial متوالی circuit آن endpoint برای ۳۰ ثانیه باز می‌شود؛ زمان توقف حداکثر تا پنج دقیقه رشد می‌کند و فقط یک probe نیمه‌باز اجازه دارد.
+
+برای بار کم دو اتصال، برای حالت متعادل چهار اتصال و فقط روی ایران قوی‌تر و بار هم‌زمان زیاد هشت اتصال به‌ازای هر خارج انتخاب کن. تعداد کاربر ثبت‌شده معیار ظرفیت نیست؛ پهنای‌باند هم‌زمان تعیین‌کننده است. سرور `1 vCPU / 1 GB` برای تست مناسب است؛ برای تولید از حدود `4 vCPU / 4 GB` شروع کن و حتماً با بار واقعی اندازه‌گیری کن.
 
 راهنمای نصب: [docs/V3-INSTALL.md](docs/V3-INSTALL.md). نمونه کانفیگ‌ها: [ایران](core/example/client-tls.yaml.example) و [خارج](core/example/server-tls.yaml.example).
 

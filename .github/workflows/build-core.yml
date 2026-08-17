@@ -39,6 +39,9 @@ jobs:
       - name: Test manager pairing code
         run: bash .github/tests/pairing-code.sh
 
+      - name: Test v3 manager pool and service refresh
+        run: bash .github/tests/v3-manager.sh
+
       - name: Test core
         working-directory: core
         run: go test -count=1 ./...

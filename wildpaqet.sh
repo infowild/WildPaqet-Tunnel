@@ -1,8 +1,8 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.1-v3
-# Branch: wild-paqet-v3 (direct TLS 1.3 + authenticated multiplexing + endpoint circuit breaker)
+# Version: 9.2-v3
+# Branch: wild-paqet-v3 (direct TLS 1.3 + authenticated multiplexing + resilient endpoint pools)
 # Direct TLS transport with legacy raw KCP available as an explicit fallback
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
 # Manager: https://github.com/infowild/WildPaqet-Tunnel
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.1-v3"
+readonly SCRIPT_VERSION="9.2-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -69,6 +69,7 @@ readonly DEFAULT_CONNECTIONS_CLIENT="1"
 readonly DEFAULT_MTU="1350"
 readonly DEFAULT_SMUX_KEEPALIVE="15"
 readonly DEFAULT_SMUX_KEEPALIVE_TIMEOUT="60"
+readonly DEFAULT_V3_CONNECTIONS_PER_ENDPOINT="4"
 readonly DEFAULT_PCAP_SOCKBUF_SERVER="8388608"
 readonly DEFAULT_PCAP_SOCKBUF_CLIENT="4194304"
 readonly DEFAULT_TRANSPORT_TCPBUF="8192"
@@ -835,6 +836,19 @@ EOF
     
     systemctl daemon-reload
     print_success "Service created: ${service_name}"
+}
+
+# Enabling an already-running unit does not reload a newly written config.
+# Always restart an active service after a wizard overwrite; start it otherwise.
+enable_and_refresh_service() {
+    local service_name="$1"
+
+    systemctl enable "$service_name" >/dev/null 2>&1 || return 1
+    if systemctl is-active --quiet "$service_name"; then
+        systemctl restart "$service_name" >/dev/null 2>&1
+    else
+        systemctl start "$service_name" >/dev/null 2>&1
+    fi
 }
 
 # ================================================
@@ -1643,6 +1657,22 @@ ensure_v3_core() {
     build_wildpaqet_core_from_source "$arch"
 }
 
+# Print the total pool size for a v3 client. Keeping this calculation in one
+# validated helper makes the interactive wizard and regression tests agree.
+v3_total_outer_connections() {
+    local endpoint_count="${1:-}"
+    local per_endpoint="${2:-}"
+
+    [[ "$endpoint_count" =~ ^[0-9]+$ ]] || return 1
+    [[ "$per_endpoint" =~ ^[0-9]+$ ]] || return 1
+    [ "$endpoint_count" -ge 1 ] && [ "$endpoint_count" -le 16 ] || return 1
+    [ "$per_endpoint" -ge 1 ] && [ "$per_endpoint" -le 16 ] || return 1
+
+    local total=$((endpoint_count * per_endpoint))
+    [ "$total" -le 256 ] || return 1
+    printf '%s\n' "$total"
+}
+
 configure_v3_tls_server() {
     clear
     show_banner
@@ -1738,8 +1768,7 @@ configure_v3_tls_server() {
 
     create_systemd_service "$config_name"
     svc="paqet-${config_name}"
-    systemctl enable "$svc" --now >/dev/null 2>&1
-    if ! systemctl is-active --quiet "$svc"; then
+    if ! enable_and_refresh_service "$svc" || ! systemctl is-active --quiet "$svc"; then
         print_error "TLS server failed to start"
         systemctl status "$svc" --no-pager -l
         pause
@@ -1771,6 +1800,7 @@ configure_v3_tls_client() {
     echo -e "${GREEN}Configure v3 Direct TLS Client (Iran)${NC}\n"
 
     local config_name endpoints_raw secret_key server_name send_server_name ca_file traffic_type svc
+    local connections_per_endpoint total_connections
     local trust_choice endpoint send_sni_answer
     local bundle_dir bundle_tmp pair_code cert_tmp pair_count fingerprint duplicate imported_endpoint
     local -a endpoints forward_entries socks5_entries
@@ -1902,6 +1932,19 @@ configure_v3_tls_client() {
         return 1
     fi
 
+    echo "TLS connection pool:"
+    echo "  2 per Kharej: low traffic / lower memory"
+    echo "  4 per Kharej: balanced and recommended"
+    echo "  8 per Kharej: high concurrent traffic on a larger Iran VPS"
+    read -r -p "Outer connections per Kharej [${DEFAULT_V3_CONNECTIONS_PER_ENDPOINT}]: " connections_per_endpoint
+    connections_per_endpoint="${connections_per_endpoint:-$DEFAULT_V3_CONNECTIONS_PER_ENDPOINT}"
+    if ! total_connections=$(v3_total_outer_connections "${#endpoints[@]}" "$connections_per_endpoint"); then
+        print_error "Connections per Kharej must be between 1 and 16 (256 total maximum)"
+        pause
+        return 1
+    fi
+    print_info "Outer pool: ${#endpoints[@]} Kharej endpoint(s) × ${connections_per_endpoint} = ${total_connections} TLS connections"
+
     read -r -s -p "Shared secret from Kharej: " secret_key
     echo
     if [ ${#secret_key} -lt 32 ]; then
@@ -1968,7 +2011,7 @@ configure_v3_tls_client() {
         fi
         echo 'transport:'
         echo '  protocol: "tls"'
-        echo "  conn: ${#endpoints[@]}"
+        echo "  conn: $total_connections"
         echo '  tls:'
         [ -n "$server_name" ] && echo "    server_name: \"$server_name\""
 		[ "$send_server_name" = "true" ] && echo '    send_server_name: true'
@@ -1987,14 +2030,13 @@ configure_v3_tls_client() {
 
     create_systemd_service "$config_name"
     svc="paqet-${config_name}"
-    systemctl enable "$svc" --now >/dev/null 2>&1
-    if ! systemctl is-active --quiet "$svc"; then
+    if ! enable_and_refresh_service "$svc" || ! systemctl is-active --quiet "$svc"; then
         print_error "TLS client failed to start"
         systemctl status "$svc" --no-pager -l
         pause
         return 1
     fi
-    print_success "v3 TLS client started with ${#endpoints[@]} distributed outer connection(s)"
+    print_success "v3 TLS client started with $total_connections outer connection(s) across ${#endpoints[@]} Kharej endpoint(s)"
     pause
 }
 

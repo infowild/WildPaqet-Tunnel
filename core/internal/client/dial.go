@@ -38,23 +38,8 @@ func waitRetry(ctx context.Context, attempt int) error {
 }
 
 func (c *Client) newConn(ctx context.Context) (tnet.Conn, error) {
-	autoExpire := 300
 	tc := c.iter.Next()
-	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if tc.conn == nil || tc.conn.IsClosed() {
-		flog.Infof("connection lost, retrying....")
-		if tc.conn != nil {
-			_ = tc.conn.Close()
-		}
-		conn, err := tc.createConn(ctx)
-		if err != nil {
-			return nil, err
-		}
-		tc.conn = conn
-		tc.expire = time.Now().Add(time.Duration(autoExpire) * time.Second)
-	}
-	return tc.conn, nil
+	return tc.ensureConn(ctx)
 }
 
 func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {

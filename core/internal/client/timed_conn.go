@@ -18,6 +18,7 @@ import (
 type timedConn struct {
 	cfg       *conf.Conf
 	conn      tnet.Conn
+	connect   func(context.Context) (tnet.Conn, error)
 	expire    time.Time
 	addr      string
 	preferred int
@@ -28,12 +29,53 @@ type timedConn struct {
 func newTimedConn(ctx context.Context, cfg *conf.Conf, endpoints *endpointPool, preferred int) (*timedConn, error) {
 	var err error
 	tc := timedConn{cfg: cfg, preferred: preferred, endpoints: endpoints}
-	tc.conn, err = tc.createConn(ctx)
+	tc.conn, err = tc.openConn(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	return &tc, nil
+}
+
+func (tc *timedConn) openConn(ctx context.Context) (tnet.Conn, error) {
+	if tc.connect != nil {
+		return tc.connect(ctx)
+	}
+	return tc.createConn(ctx)
+}
+
+func (tc *timedConn) ensureConn(ctx context.Context) (tnet.Conn, error) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	if tc.conn != nil && !tc.conn.IsClosed() {
+		return tc.conn, nil
+	}
+	if tc.conn != nil {
+		flog.Infof("connection lost, retrying....")
+		_ = tc.conn.Close()
+		tc.conn = nil
+	}
+
+	conn, err := tc.openConn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tc.conn = conn
+	tc.expire = time.Now().Add(300 * time.Second)
+	return conn, nil
+}
+
+func (tc *timedConn) isClosed() bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.conn == nil || tc.conn.IsClosed()
+}
+
+func (tc *timedConn) remoteAddr() string {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.addr
 }
 
 func (tc *timedConn) createConn(ctx context.Context) (tnet.Conn, error) {
@@ -117,7 +159,10 @@ func (tc *timedConn) sendTCPF(conn tnet.Conn) error {
 }
 
 func (tc *timedConn) close() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
 	if tc.conn != nil {
-		tc.conn.Close()
+		_ = tc.conn.Close()
+		tc.conn = nil
 	}
 }
