@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.11-v3
+# Version: 9.12-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.11-v3"
+readonly SCRIPT_VERSION="9.12-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -949,17 +949,75 @@ forward_entry_exists() {
 prompt_forward_protocol() {
     local port="$1"
     local choice=""
-    echo "Port $port — tunnel carries this as TCP or UDP inside HTTP/2:"
+    echo "Port $port — choose what to forward through the tunnel:"
     echo " 1. TCP only"
     echo " 2. UDP only"
-    echo " 3. TCP + UDP (two forward rules)"
-    read -r -p "Choose [1]: " choice
-    choice="${choice:-1}"
+    echo " 3. TCP + UDP (both on this port)"
+    read -r -p "Choose [3]: " choice
+    choice="${choice:-3}"
     case "$choice" in
+        1) printf '%s\n' "tcp" ;;
         2) printf '%s\n' "udp" ;;
-        3) printf '%s\n' "both" ;;
-        *) printf '%s\n' "tcp" ;;
+        *) printf '%s\n' "both" ;;
     esac
+}
+
+forward_find_target_for_port() {
+    local port="$1"
+    shift
+    local entry lp tp proto
+    for entry in "$@"; do
+        [ -n "$entry" ] || continue
+        IFS='|' read -r lp tp proto <<< "$entry"
+        [ "$lp" = "$port" ] && printf '%s\n' "$tp" && return 0
+    done
+    return 1
+}
+
+print_forward_port_summary() {
+    local -a entries=("$@")
+    declare -A p_tcp p_udp
+    declare -A p_target
+    local entry lp tp proto
+    for entry in "${entries[@]}"; do
+        [ -n "$entry" ] || continue
+        IFS='|' read -r lp tp proto <<< "$entry"
+        p_target[$lp]=$tp
+        [ "$proto" = "tcp" ] && p_tcp[$lp]=1
+        [ "$proto" = "udp" ] && p_udp[$lp]=1
+    done
+    if [ ${#p_target[@]} -eq 0 ]; then
+        echo "  (none configured)"
+        return 0
+    fi
+    local lp label
+    while IFS= read -r lp; do
+        [ -n "$lp" ] || continue
+        if [ -n "${p_tcp[$lp]:-}" ] && [ -n "${p_udp[$lp]:-}" ]; then
+            label="TCP+UDP"
+        elif [ -n "${p_udp[$lp]:-}" ]; then
+            label="UDP"
+        else
+            label="TCP"
+        fi
+        echo "  • $lp → ${p_target[$lp]} ($label)"
+    done < <(printf '%s\n' "${!p_target[@]}" | sort -n)
+}
+
+enable_forward_port_tcp_udp() {
+    local -n _entries=$1
+    local port="$2"
+    local target="$3"
+    local added=0
+    if ! forward_entry_exists "$port" "tcp" "${_entries[@]}"; then
+        append_forward_entries_for_port _entries "$port" "$target" "tcp"
+        added=1
+    fi
+    if ! forward_entry_exists "$port" "udp" "${_entries[@]}"; then
+        append_forward_entries_for_port _entries "$port" "$target" "udp"
+        added=1
+    fi
+    [ "$added" -eq 1 ]
 }
 
 append_forward_entries_for_port() {
@@ -1047,21 +1105,14 @@ edit_v3_client_listen_ports() {
     local choice port target proto_choice lp tp proto entry new_port new_target
     mapfile -t entries < <(yaml_list_forward_entries "$cfg")
     while true; do
-        echo -e "\n${CYAN}Forward ports (TCP/UDP inside the h2 tunnel):${NC}"
-        if [ ${#entries[@]} -eq 0 ]; then
-            echo "  (none configured)"
-        else
-            for entry in "${entries[@]}"; do
-                [ -n "$entry" ] || continue
-                IFS='|' read -r lp tp proto <<< "$entry"
-                echo "  • $lp → $tp ($proto)"
-            done
-        fi
+        echo -e "\n${CYAN}Forward ports on Iran (carried inside the h2 tunnel):${NC}"
+        print_forward_port_summary "${entries[@]}"
         echo ""
-        echo " 1. Add a forward port"
-        echo " 2. Remove a forward port"
+        echo " 1. Add a forward port (choose TCP / UDP / TCP+UDP)"
+        echo " 2. Set an existing port to TCP+UDP"
+        echo " 3. Remove a forward port"
         echo " 0. Back"
-        read -r -p "Choose [0-2]: " choice
+        read -r -p "Choose [0-3]: " choice
         case "$choice" in
             0) return ;;
             1)
@@ -1072,12 +1123,9 @@ edit_v3_client_listen_ports() {
                 proto_choice=$(prompt_forward_protocol "$new_port")
                 case "$proto_choice" in
                     both)
-                        forward_entry_exists "$new_port" "tcp" "${entries[@]}" && {
-                            print_warning "TCP forward for port $new_port already exists"
-                        } || append_forward_entries_for_port entries "$new_port" "$new_target" "tcp"
-                        forward_entry_exists "$new_port" "udp" "${entries[@]}" && {
-                            print_warning "UDP forward for port $new_port already exists"
-                        } || append_forward_entries_for_port entries "$new_port" "$new_target" "udp"
+                        enable_forward_port_tcp_udp entries "$new_port" "$new_target" || {
+                            print_warning "Port $new_port already has TCP+UDP"
+                        }
                         apply_forward_listener_firewall "$new_port" both || \
                             print_warning "Could not open firewall for $new_port (open TCP+UDP manually)"
                         ;;
@@ -1102,11 +1150,40 @@ edit_v3_client_listen_ports() {
                     print_error "Could not update forward section"
                     continue
                 }
-                print_success "Forward port(s) added"
+                print_success "Forward port(s) updated"
                 restart_paqet_service_if_requested "$selected_service" 1
                 mapfile -t entries < <(yaml_list_forward_entries "$cfg")
                 ;;
             2)
+                read -r -p "Port to set as TCP+UDP: " port
+                validate_port "$port" || { print_error "Invalid port"; continue; }
+                if forward_entry_exists "$port" "tcp" "${entries[@]}" \
+                    && forward_entry_exists "$port" "udp" "${entries[@]}"; then
+                    print_info "Port $port is already TCP+UDP"
+                    continue
+                fi
+                target=$(forward_find_target_for_port "$port" "${entries[@]}" 2>/dev/null || true)
+                if [ -z "$target" ]; then
+                    read -r -p "Local target [127.0.0.1:$port]: " target
+                    target="${target:-127.0.0.1:$port}"
+                else
+                    print_info "Using target $target from the existing rule"
+                fi
+                if ! enable_forward_port_tcp_udp entries "$port" "$target"; then
+                    print_error "Could not enable TCP+UDP on port $port"
+                    continue
+                fi
+                yaml_rewrite_forward_entries "$cfg" "${entries[@]}" || {
+                    print_error "Could not update forward section"
+                    continue
+                }
+                apply_forward_listener_firewall "$port" both || \
+                    print_warning "Could not open firewall for TCP+UDP/$port"
+                print_success "Port $port is now TCP+UDP → $target"
+                restart_paqet_service_if_requested "$selected_service" 1
+                mapfile -t entries < <(yaml_list_forward_entries "$cfg")
+                ;;
+            3)
                 [ ${#entries[@]} -gt 0 ] || { print_warning "No forward ports to remove"; continue; }
                 read -r -p "Listen port to remove: " port
                 validate_port "$port" || { print_error "Invalid port"; continue; }
@@ -1432,7 +1509,7 @@ edit_v3_tls_service_config() {
             if grep -q '^socks5:' "$cfg"; then
                 echo " 2. SOCKS5 mode (UDP uses UDP_ASSOCIATE on the SOCKS TCP port)"
             else
-                echo " 2. Manage forward ports (add/remove TCP or UDP)"
+                echo " 2. Manage forward ports (TCP / UDP / TCP+UDP)"
             fi
         fi
         echo " 3. Open YAML in editor"
