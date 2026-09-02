@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export WILDPAQET_LIB_ONLY=1
 source "$repo_root/wildpaqet.sh"
 
-test "$SCRIPT_VERSION" = "9.13-v3"
+test "$SCRIPT_VERSION" = "9.15-v3"
 v3_validate_cover_path '/api/v1/cover/events'
 if v3_validate_cover_path '/api/../admin'; then
 	echo "unsafe cover path was accepted" >&2
@@ -113,19 +113,52 @@ echo 'v3-manager-pool-and-refresh: PASS'
 # ------------------------------------------------------------------
 # v3 throughput tuning keys
 #
-# Go's HTTP/2 server defaults both receive windows to 1 MiB while its transport
-# defaults the reverse direction to 4 MiB, so upload ran at roughly a quarter of
-# download on the same RTT. The core now derives the window from smuxbuf, and
-# smux v2 makes streambuf meaningful (v1 ignored it). These keys must land in
-# new configs and be back-filled into existing ones.
+# Every one of these windows bounds in-flight bytes to window/RTT. Go's HTTP/2
+# server defaults both receive windows to 1 MiB while its transport defaults the
+# reverse direction to 4 MiB, which is why upload ran at a quarter of download;
+# and on smux v2 streambuf is a per-stream limit that v1 did not have at all.
+# A LAN-sized value here silently caps a single flow however fast the link is.
 # ------------------------------------------------------------------
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
 tuning_dir=$(mktemp -d /tmp/wildpaqet-v3-tuning.XXXXXX)
 cleanup_tuning() { rm -rf -- "$tuning_dir"; }
 trap 'cleanup_parse; cleanup_tuning' EXIT
 
-v3_emit_tuning_keys '    ' | grep -qx '    smuxbuf: 4194304'
-v3_emit_tuning_keys '    ' | grep -qx '    streambuf: 2097152'
-v3_emit_tuning_keys '    ' | grep -qx '    smux_version: 2'
+# --- per-RAM sizing -------------------------------------------------
+test "$(v3_default_smuxbuf 1024)"  = "4194304" || fail "1 GB host smuxbuf"
+test "$(v3_default_streambuf 1024)" = "2097152" || fail "1 GB host streambuf"
+test "$(v3_default_smuxbuf 4096)"  = "8388608" || fail "4 GB host smuxbuf"
+test "$(v3_default_streambuf 4096)" = "4194304" || fail "4 GB host streambuf"
+
+# Capture first: piping into `grep -q` lets grep exit on the first match and
+# SIGPIPE the producer, which `set -o pipefail` then reports as a failure.
+emitted_large=$(v3_emit_tuning_keys '    ' 4096)
+emitted_small=$(v3_emit_tuning_keys '    ' 1024)
+grep -qx '    smuxbuf: 8388608'  <<<"$emitted_large" || fail "emit smuxbuf"
+grep -qx '    streambuf: 4194304' <<<"$emitted_large" || fail "emit streambuf"
+grep -qx '    smux_version: 2'    <<<"$emitted_large" || fail "emit smux_version"
+grep -qx '    smuxbuf: 4194304'   <<<"$emitted_small" || fail "emit small-host smuxbuf"
+
+# --- the numbers must actually clear a WAN path ----------------------
+# 2 MiB over a 100 ms path is ~168 Mbps: that was the 9.13-v3 regression.
+test "$(v3_window_mbps 2097152 100)" -lt 200  || fail "sanity: 2 MiB window"
+test "$(v3_window_mbps "$(v3_default_streambuf 4096)" 100)" -ge 300 \
+    || fail "default streambuf caps a single flow below 300 Mbps at 100 ms"
+# The other half of the trade: whatever one bulk transfer has outstanding also
+# sits ahead of every other stream on the same outer connection, so an oversized
+# window buys latency, not speed.
+test "$(v3_window_queue_ms "$(v3_default_streambuf 4096)" 100)" -le 400 \
+    || fail "default streambuf parks over 400 ms of queue on a 100 Mbps link"
+# The optimizer holds the outer TCP receive window at 8 MiB to keep window
+# scale 7; going past it here would only move the stall one layer down.
+test "$(v3_default_streambuf 4096)" -le 8388608 \
+    || fail "streambuf exceeds the outer TCP window the optimizer allows"
+test "$(v3_default_streambuf 4096)" -le "$(v3_default_smuxbuf 4096)" \
+    || fail "streambuf exceeds smuxbuf; smux rejects that pairing"
+
+# --- migration ------------------------------------------------------
+v3_host_ram_mb() { echo 4096; }
 
 cat > "$tuning_dir/iran.yaml" <<'EOF'
 role: "client"
@@ -143,7 +176,46 @@ transport:
     keepalive: 15
 EOF
 
-# An h2 config whose tls block is followed by another top-level section.
+# Written by manager 9.13-v3, which sized the buffers for a LAN by mistake.
+cat > "$tuning_dir/stale.yaml" <<'EOF'
+role: "server"
+transport:
+  protocol: "tls"
+  tls:
+    mode: "h2"
+    alpn: "h2"
+    smuxbuf: 4194304
+    streambuf: 2097152
+    smux_version: 2
+EOF
+
+# Written by the first 9.14-v3 attempt: sized purely for throughput.
+cat > "$tuning_dir/stale14.yaml" <<'EOF'
+role: "server"
+transport:
+  protocol: "tls"
+  tls:
+    mode: "h2"
+    alpn: "h2"
+    smuxbuf: 16777216
+    streambuf: 8388608
+    smux_version: 2
+EOF
+
+# Values the operator chose: never overwritten.
+cat > "$tuning_dir/custom.yaml" <<'EOF'
+role: "server"
+transport:
+  protocol: "tls"
+  tls:
+    mode: "h2"
+    alpn: "h2"
+    smuxbuf: 33554432
+    streambuf: 16777216
+    smux_version: 2
+EOF
+
+# tls block followed by another top-level section.
 cat > "$tuning_dir/mixed.yaml" <<'EOF'
 role: "client"
 transport:
@@ -155,19 +227,6 @@ transport:
 network:
   tcp:
     preset: "default"
-EOF
-
-# A hand-tuned host must not be overwritten.
-cat > "$tuning_dir/tuned.yaml" <<'EOF'
-role: "server"
-transport:
-  protocol: "tls"
-  tls:
-    mode: "h2"
-    alpn: "h2"
-    smuxbuf: 8388608
-    streambuf: 4194304
-    smux_version: 2
 EOF
 
 # Legacy direct mode keeps smux v1 for wire compatibility with older peers.
@@ -187,42 +246,40 @@ transport:
 EOF
 
 changed=$(v3_migrate_all_configs "$tuning_dir")
-if [ "$changed" != "2" ]; then
-    echo "expected 2 migrated configs, got $changed" >&2
-    exit 1
-fi
+test "$changed" = "4" || fail "expected 4 migrated configs (iran, stale, stale14, mixed), got $changed"
 
-grep -qx '    smuxbuf: 4194304' "$tuning_dir/iran.yaml"
-grep -qx '    streambuf: 2097152' "$tuning_dir/iran.yaml"
-grep -qx '    smux_version: 2' "$tuning_dir/iran.yaml"
+grep -qx '    smuxbuf: 8388608' "$tuning_dir/iran.yaml"   || fail "iran smuxbuf"
+grep -qx '    streambuf: 4194304' "$tuning_dir/iran.yaml"  || fail "iran streambuf"
+grep -qx '    smux_version: 2' "$tuning_dir/iran.yaml"     || fail "iran smux_version"
+
+grep -qx '    smuxbuf: 8388608' "$tuning_dir/stale.yaml"  || fail "9.13 smuxbuf not upgraded"
+grep -qx '    streambuf: 4194304' "$tuning_dir/stale.yaml" || fail "9.13 streambuf not upgraded"
+grep -qx '    smuxbuf: 8388608' "$tuning_dir/stale14.yaml"  || fail "9.14 smuxbuf not corrected"
+grep -qx '    streambuf: 4194304' "$tuning_dir/stale14.yaml" || fail "9.14 streambuf not corrected"
+
+grep -qx '    smuxbuf: 33554432' "$tuning_dir/custom.yaml"  || fail "operator smuxbuf overwritten"
+grep -qx '    streambuf: 16777216' "$tuning_dir/custom.yaml" || fail "operator streambuf overwritten"
 
 # The keys belong inside the tls block, not after the next section.
-if ! awk '/^[[:space:]]*tls:/ { in_tls=1; next }
-          in_tls && /^[^[:space:]]/ { exit }
-          in_tls && $1 == "smux_version:" { found=1 }
-          END { exit(found ? 0 : 1) }' "$tuning_dir/mixed.yaml"; then
-    echo "tuning keys were inserted outside the tls block" >&2
-    exit 1
-fi
-grep -qx 'network:' "$tuning_dir/mixed.yaml"
+awk '/^[[:space:]]*tls:/ { in_tls=1; next }
+     in_tls && /^[^[:space:]]/ { exit }
+     in_tls && $1 == "smux_version:" { found=1 }
+     END { exit(found ? 0 : 1) }' "$tuning_dir/mixed.yaml" \
+    || fail "tuning keys landed outside the tls block"
+grep -qx 'network:' "$tuning_dir/mixed.yaml" || fail "mixed.yaml lost its network section"
 
-grep -qx '    smuxbuf: 8388608' "$tuning_dir/tuned.yaml"
-if grep -q 'smuxbuf: 4194304' "$tuning_dir/tuned.yaml"; then
-    echo "hand-tuned smuxbuf was overwritten" >&2
-    exit 1
-fi
-
-if grep -q 'smux_version' "$tuning_dir/legacy.yaml"; then
-    echo "direct-mode config was migrated to smux v2" >&2
-    exit 1
-fi
-if grep -q 'smux_version' "$tuning_dir/kcp.yaml"; then
-    echo "KCP config was given TLS tuning keys" >&2
-    exit 1
-fi
+grep -q 'smux_version' "$tuning_dir/legacy.yaml" && fail "direct-mode config was migrated to smux v2"
+grep -q 'smux_version' "$tuning_dir/kcp.yaml" && fail "KCP config was given TLS tuning keys"
 
 changed=$(v3_migrate_all_configs "$tuning_dir")
-if [ "$changed" != "0" ]; then
-    echo "migration is not idempotent: $changed files changed on a second run" >&2
-    exit 1
-fi
+test "$changed" = "0" || fail "migration is not idempotent: $changed files changed on a second run"
+
+# The retired sysctl key must still be cleanable on already-optimized hosts.
+owned_keys=$(optimizer_owned_sysctl_keys)
+retired_keys=$(optimizer_retired_sysctl_keys)
+grep -qx 'net.ipv4.ip_local_port_range' <<<"$owned_keys" \
+    || fail "port range no longer owned for cleanup"
+grep -qF 'net.ipv4.ip_local_port_range|10000 65535|32768 60999' <<<"$retired_keys" \
+    || fail "retired key mapping missing"
+
+echo 'v3-manager-tuning-and-migration: PASS'

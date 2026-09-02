@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xtaci/smux"
@@ -84,7 +85,7 @@ func listenH2(addr string, cfg *conf.TLS) (tnet.Listener, error) {
 		return nil, fmt.Errorf("h2: configure server: %w", err)
 	}
 
-	tlsListener := stdtls.NewListener(raw, tlsCfg)
+	tlsListener := stdtls.NewListener(notsentLowatListener{Listener: raw}, tlsCfg)
 	go func() {
 		err := l.server.Serve(tlsListener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
@@ -247,4 +248,24 @@ func h2UploadWindow(smuxbuf int) int32 {
 		return h2MaxUploadWindow
 	}
 	return int32(smuxbuf)
+}
+
+// notsentLowatListener caps the unsent backlog on every accepted connection.
+// The server is the sender for the download direction, so it needs the same
+// treatment the client applies on dial.
+type notsentLowatListener struct {
+	net.Listener
+}
+
+func (l notsentLowatListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if sc, ok := conn.(syscall.Conn); ok {
+		if raw, rawErr := sc.SyscallConn(); rawErr == nil {
+			_ = setNotsentLowat(raw)
+		}
+	}
+	return conn, nil
 }

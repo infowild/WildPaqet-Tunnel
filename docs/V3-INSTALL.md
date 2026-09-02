@@ -1,6 +1,6 @@
 # WildPaqet v3 installation
 
-v3.2 uses a real full-duplex HTTP/2 `CONNECT` request over TLS 1.3 on normal kernel TCP. Smux runs inside HTTP/2 DATA frames. It does not use WebSocket. Legacy direct TLS and raw KCP/pcap remain compatibility choices.
+v3.4 uses a real full-duplex HTTP/2 `CONNECT` request over TLS 1.3 on normal kernel TCP. Smux runs inside HTTP/2 DATA frames. It does not use WebSocket. Legacy direct TLS and raw KCP/pcap remain compatibility choices.
 
 ## Build and install
 
@@ -74,21 +74,54 @@ Three keys now appear in the `tls:` block of v3 configs:
 
 | Key | Default | Effect |
 |---|---|---|
-| `smuxbuf` | `4194304` | smux session buffer, and the HTTP/2 client-to-server receive window on the server |
-| `streambuf` | `2097152` | per-stream smux buffer; requires `smux_version: 2` |
+| `smuxbuf` | `4194304` under 2 GB RAM, else `8388608` | smux session buffer, and the HTTP/2 client-to-server receive window on the server |
+| `streambuf` | `2097152` / `4194304` | per-stream smux buffer; requires `smux_version: 2` |
 | `smux_version` | `2` in `h2` mode, `1` in `direct` mode | v1 has no per-stream flow control and ignores `streambuf` |
 
-Raising `smuxbuf` raises the upload window with it, up to 64 MiB. Size it for
-your RTT: `smuxbuf / RTT` is the ceiling for one outer connection. At 100 ms the
-4 MiB default allows roughly 335 Mbps per connection, and `transport.conn`
-multiplies that across the pool.
+Every window here bounds in-flight bytes to `window / RTT`, and the smallest one
+sets the ceiling. On smux v2 that is almost always `streambuf`, because it
+applies per stream:
+
+| Round trip | `streambuf / RTT`, one flow | `smuxbuf / RTT`, one outer connection |
+|---|---|---|
+| 60 ms | ~559 Mbps | ~1118 Mbps |
+| 100 ms | ~335 Mbps | ~671 Mbps |
+| 180 ms | ~186 Mbps | ~373 Mbps |
+
+Measured single-flow upload lands at roughly 80-85% of those figures. A
+single-flow speed test cannot exceed the first column, however many outer
+connections the pool has - one user connection uses exactly one of them.
+`transport.conn` multiplies the aggregate, not one flow.
+
+The same window is also a latency cost. smux multiplexes every user connection
+onto one TCP stream, so whatever a bulk transfer has outstanding sits ahead of
+every other stream on that connection. Worst case that is `streambuf / link
+rate`: 4 MiB on a 100 Mbps link is 335 ms. Both ends set `TCP_NOTSENT_LOWAT` to
+128 KiB, which should keep the real figure far below that by stopping the sender
+from parking a whole window in the socket buffer; confirm on a busy tunnel with
+`ss -tim dst <kharej-ip> | grep -o 'notsent_lowat:[0-9]*'`. If ping under load is
+still high, lower `streambuf` on both ends; raise it on a fast, well-buffered
+path where bulk speed matters more. The wizard prints both sides of the trade.
+
+`streambuf` stops at 8 MiB deliberately. The outer TCP connection's own receive
+window is the next ceiling, and the network optimizer holds it at 8 MB so hosts
+keep advertising the stock TCP window scale of 7; raising `streambuf` past that
+only moves the stall one layer down. Going above ~640 Mbps per flow at 100 ms
+means raising `net.ipv4.tcp_rmem`, which advertises wscale 8 or more and gives
+passive TCP fingerprinting something to key on.
+
+Worst-case memory on the Kharej side is about `2 x smuxbuf x conn` (smux buffers
+plus the HTTP/2 receive window), so 16 outer connections at 8 MiB is roughly
+256 MiB. The wizard prints this budget and warns when it exceeds a quarter of
+the host's RAM; lower `conn` or `smuxbuf` on a small VPS.
 
 **Both ends must run the same core build.** `smux_version: 2` is not compatible
 with an older peer and a mismatch fails the connection rather than degrading
 quietly. Rebuild with `0 -> 8` on every Iran and Kharej node before restarting.
-The core installer back-fills these keys into existing v3 configs and leaves
-hand-tuned values alone; a config that omits them gets the defaults from the
-core anyway. Set `smux_version: 1` on both ends to fall back.
+The core installer back-fills these keys into existing v3 configs, and replaces
+the pairs manager 9.13-v3 and the first 9.14-v3 wrote; values you set yourself
+are left alone. A config that omits the keys gets the defaults from
+the core anyway. Set `smux_version: 1` on both ends to fall back.
 
 To confirm the tunnel rather than the path is the limit, compare a single-flow
 and a parallel upload:
@@ -98,8 +131,10 @@ iperf3 -c <target-through-tunnel> -t 30
 iperf3 -c <target-through-tunnel> -t 30 -P 16
 ```
 
-If the single-flow number sits close to `smuxbuf / RTT` while the parallel run
-scales, the window is the binding constraint and `smuxbuf` is the knob.
+If the single-flow number sits close to `streambuf / RTT` while the parallel run
+scales, the window is the binding constraint and `streambuf` is the knob. The
+wizard prints the same figures for the configuration on disk, so compare against
+those before assuming the path is at fault.
 
 ## Security model
 

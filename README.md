@@ -4,7 +4,7 @@
 
 **Real HTTP/2-covered TLS tunnel with direct-TLS and raw-KCP compatibility**
 
-[![Version](https://img.shields.io/badge/version-9.13--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.15--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -173,22 +173,62 @@ Use two connections per endpoint for low traffic, four for balanced production t
 
 See [the v3 install guide](docs/V3-INSTALL.md) and the [client](core/example/client-tls.yaml.example) / [server](core/example/server-tls.yaml.example) examples.
 
-## Upload throughput (9.13-v3)
+## Upload throughput and latency under load (9.15-v3)
 
 Uploads used to run at roughly a quarter of download speed on the same link.
-The cause was HTTP/2 flow control, not bandwidth: Go's HTTP/2 **server**
-defaults both of its receive windows to 1 MiB, while its **transport** defaults
-the opposite direction to 1 GiB connection / 4 MiB stream. A flow-control
-window bounds in-flight bytes to `window / RTT`, so on a 100 ms Iran-Kharej
-path a single upload flow was capped near 84 Mbps regardless of the link.
+The cause was flow control, not bandwidth. Every window in the stack bounds
+in-flight bytes to `window / RTT`, so the smallest one sets the ceiling for a
+single flow regardless of how fast the link is:
 
-| Direction | Before | Now |
+| Layer | Before | Now |
 |---|---|---|
-| Iran to Kharej (upload) | 1 MiB connection / 1 MiB stream | `smuxbuf` (4 MiB by default) for both |
-| Kharej to Iran (download) | 1 GiB connection / 4 MiB stream | unchanged |
+| HTTP/2 receive window, Iran to Kharej | 1 MiB (Go's server default) | `smuxbuf` |
+| HTTP/2 receive window, Kharej to Iran | 4 MiB (Go's transport default) | unchanged |
+| smux session buffer (`smuxbuf`) | 4 MiB | 4 MiB under 2 GB RAM, else 8 MiB |
+| smux per-stream buffer (`streambuf`) | ignored on v1 | 2 MiB / 4 MiB, live on v2 |
+| Unsent backlog per socket | unlimited | 128 KiB (`TCP_NOTSENT_LOWAT`) |
+| Outer TCP receive window | 8–32 MB | 8 MB, to hold window scale at the stock 7 |
 
-Measured on a loopback path with 100 ms of injected latency, a single upload
-flow went from **81 Mbps to about 152 Mbps**. Four other changes go with it:
+These windows cut both ways, and this project got caught by each side in turn.
+
+**Too small** and one flow is capped however fast the link is. **Too large** and
+the queue a bulk transfer builds sits ahead of every other stream on the same
+outer connection, because smux multiplexes them all onto one TCP stream - which
+is ping and jitter climbing whenever the tunnel is busy.
+
+Single-flow upload, and interactive round-trip on a second stream of the same
+session while that upload runs, over a 100 Mbps bottleneck at 100 ms base RTT:
+
+| `smuxbuf` / `streambuf` | upload | ping under load (2 MB path buffer) | (8 MB path buffer) |
+|---|---|---|---|
+| 4M / 2M | 155 Mbps | 238 ms | 238 ms |
+| **8M / 4M (now)** | **240 Mbps** | **275 ms** | **497 ms** |
+| 16M / 8M | 546 Mbps | 301 ms | 1019 ms |
+
+9.13-v3 fixed the HTTP/2 window but switched smux to v2 without resizing
+`streambuf`, turning that 2 MiB value into a new per-stream ceiling v1 never
+had. The first 9.14 attempt then over-corrected to 16M/8M and bought a second of
+standing queue on a bufferbloated path. 8M/4M is the middle, and the wizard now
+prints both sides so the value can be moved deliberately.
+
+Two changes make a large window cheaper than the table suggests:
+
+- The client's HTTP/2 hand-off buffer is 64 KiB, not the 256 KiB first shipped.
+  Measured: 33 ms off the loaded round trip.
+- Both ends set **`TCP_NOTSENT_LOWAT`** (128 KiB) on the outer socket. smux puts
+  every user connection on one TCP stream, so anything already handed to the
+  kernel sits ahead of everything written after it; without a cap an upload can
+  park megabytes there. It does not cap throughput - the congestion controller
+  still decides what is in flight. This is Linux-only and could not be measured
+  on the development machine, so confirm it on a busy tunnel with
+  `ss -tim dst <kharej-ip> | grep -o 'notsent_lowat:[0-9]*'`.
+
+`streambuf` also stops at the 8 MB outer TCP receive window the optimizer allows,
+which is held there so hosts keep advertising the stock TCP window scale of 7.
+
+Four other changes go with it:
+
+Four other changes go with it:
 
 - The client no longer feeds HTTP/2 through an unbuffered `io.Pipe`. That pipe
   handed off every write synchronously, so smux's single sendLoop stalled for
@@ -210,8 +250,13 @@ flow went from **81 Mbps to about 152 Mbps**. Four other changes go with it:
 > **Update both ends.** `smux_version: 2` is not compatible with an older peer,
 > and a mismatch fails the connection outright. Rebuild the core with `0 -> 8`
 > on every Iran and Kharej node, then restart the services. Menu `0 -> 8` also
-> back-fills the tuning keys into existing v3 configs; hand-tuned values are
-> left alone. Set `smux_version: 1` on both ends to fall back.
+> back-fills the tuning keys into existing v3 configs and replaces the values
+> 9.13-v3 and the first 9.14-v3 wrote; values you chose yourself are left alone. Set
+> `smux_version: 1` on both ends to fall back.
+>
+> The wizard now prints the single-flow ceiling your configuration implies, so
+> a throughput complaint can be checked against the config rather than guessed
+> at. A single-flow speed test cannot exceed the `streambuf / RTT` line.
 
 ---
 

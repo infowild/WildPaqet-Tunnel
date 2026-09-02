@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.13-v3
+# Version: 9.15-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.13-v3"
+readonly SCRIPT_VERSION="9.15-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -851,18 +851,137 @@ config_tls_mode() {
 # These keys are written into new v3 configs and back-filled into existing
 # ones so an upgraded install actually picks the tuning up.
 # ------------------------------------------------------------------
-readonly V3_DEFAULT_SMUXBUF=4194304
-readonly V3_DEFAULT_STREAMBUF=2097152
+# Buffer sizes trade throughput against latency, and both directions are real.
+#
+# Every window bounds in-flight bytes to window/RTT, so a LAN-sized value caps a
+# single flow however fast the link is: 2 MiB is only ~170 Mbps at 100 ms. But
+# smux multiplexes every user connection onto one TCP stream, so whatever a bulk
+# transfer has outstanding sits ahead of every other stream on that connection.
+# Oversizing shows up as ping and jitter climbing whenever the tunnel is busy,
+# measurably so on a path with deep buffers - which is most consumer routes.
+#
+# 8 MiB / 4 MiB is the middle of that trade: about 340 Mbps for one flow at
+# 100 ms RTT without the standing queue a larger streambuf builds. The wizard
+# prints both sides so the operator can move it deliberately.
+#
+# Worst-case memory is roughly 2 x smuxbuf per outer connection on the Kharej
+# side (smux buffers plus the HTTP/2 receive window).
+readonly V3_SMUXBUF_SMALL=4194304
+readonly V3_STREAMBUF_SMALL=2097152
+readonly V3_SMUXBUF_LARGE=8388608
+readonly V3_STREAMBUF_LARGE=4194304
 readonly V3_DEFAULT_SMUX_VERSION=2
+
+# Values earlier managers wrote that are now known to be wrong: 9.13-v3 sized
+# them for a LAN (too slow), and the first 9.14 attempt sized them purely for
+# throughput (too much standing queue). Both are replaced on migration; any
+# other value is treated as operator intent and left alone.
+# Format: smuxbuf|streambuf
+v3_stale_buffer_pairs() {
+    cat <<'EOF'
+4194304|2097152
+16777216|8388608
+EOF
+}
+
+v3_host_ram_mb() {
+    local kb
+    kb=$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || echo 0)
+    echo $((kb / 1024))
+}
+
+v3_default_smuxbuf() {
+    local ram_mb="${1:-$(v3_host_ram_mb)}"
+    if [ "${ram_mb:-0}" -lt 2048 ] 2>/dev/null; then
+        echo "$V3_SMUXBUF_SMALL"
+    else
+        echo "$V3_SMUXBUF_LARGE"
+    fi
+}
+
+v3_default_streambuf() {
+    local ram_mb="${1:-$(v3_host_ram_mb)}"
+    if [ "${ram_mb:-0}" -lt 2048 ] 2>/dev/null; then
+        echo "$V3_STREAMBUF_SMALL"
+    else
+        echo "$V3_STREAMBUF_LARGE"
+    fi
+}
+
+# Single-flow ceiling in Mbps for a given window and RTT.
+v3_window_mbps() {
+    local window="$1" rtt_ms="$2"
+    [ "${rtt_ms:-0}" -gt 0 ] 2>/dev/null || return 1
+    echo $(( window * 8 / rtt_ms / 1000 ))
+}
+
+# Milliseconds a full window of one stream takes to drain at a given link rate.
+# This is the queue a bulk transfer can park ahead of every other stream on the
+# same outer connection, so it is also the latency those streams inherit.
+v3_window_queue_ms() {
+    local window="$1" mbps="$2"
+    [ "${mbps:-0}" -gt 0 ] 2>/dev/null || return 1
+    echo $(( window * 8 / mbps / 1000 ))
+}
+
+# Print what the configuration on disk implies, so a speed or latency complaint
+# can be checked against it instead of guessed at.
+v3_report_throughput_budget() {
+    local config="$1"
+    local rtt="${2:-100}"
+    local link="${3:-100}"
+    local smuxbuf streambuf conn
+
+    smuxbuf=$(v3_config_tls_value "$config" smuxbuf)
+    streambuf=$(v3_config_tls_value "$config" streambuf)
+    [ -n "$smuxbuf" ] || smuxbuf=$(v3_default_smuxbuf)
+    [ -n "$streambuf" ] || streambuf=$(v3_default_streambuf)
+    conn=$(grep -E '^[[:space:]]*conn:' "$config" 2>/dev/null | head -1 | awk '{print $2}' | tr -d '"')
+    [ -n "$conn" ] || conn=1
+
+    echo -e "
+${CYAN}What this configuration allows${NC} (assuming ${rtt} ms RTT, ${link} Mbps link)"
+    echo -e "  Each window caps in-flight bytes to window/RTT; the smallest one wins."
+    printf "    %-36s %s Mbps
+" "one flow (streambuf)" "$(v3_window_mbps "$streambuf" "$rtt")"
+    printf "    %-36s %s Mbps
+" "one outer conn (smuxbuf / HTTP2)" "$(v3_window_mbps "$smuxbuf" "$rtt")"
+    printf "    %-36s %s Mbps
+" "one outer conn (kernel TCP window)" "$(v3_window_mbps 8000000 "$rtt")"
+    printf "    %-36s %s Mbps
+" "all ${conn} outer connections together"         "$(( $(v3_window_mbps "$smuxbuf" "$rtt") * conn ))"
+    echo -e "  ${YELLOW}A single-flow speed test cannot exceed the first line.${NC}"
+
+    echo -e "
+${CYAN}What it costs in latency${NC}"
+    echo -e "  smux puts every user connection on one TCP stream, so a bulk transfer"
+    echo -e "  queues ahead of the others sharing that outer connection."
+    printf "    %-36s +%s ms
+" "added ping under load, worst case"         "$(v3_window_queue_ms "$streambuf" "$link")"
+    echo -e "  That worst case assumes the sender may buffer a whole window ahead."
+    echo -e "  The core caps the unsent backlog per socket (TCP_NOTSENT_LOWAT), which"
+    echo -e "  should keep the real figure far below it. Confirm on a busy tunnel with:"
+    echo -e "    ${CYAN}ss -tim dst <kharej-ip> | grep -o 'notsent_lowat:[0-9]*'${NC}"
+    echo -e "  If ping under load is still high, lower ${CYAN}streambuf${NC} on both ends;"
+    echo -e "  raise it on a fast, well-buffered path when bulk speed matters more."
+
+    local budget_mib ram_mb
+    budget_mib=$(( smuxbuf * 2 * conn / 1024 / 1024 ))
+    ram_mb=$(v3_host_ram_mb)
+    echo -e "
+  Worst-case memory: ~${budget_mib} MiB (2 x smuxbuf x conn)."
+    if [ "${ram_mb:-0}" -gt 0 ] && [ "$budget_mib" -gt $(( ram_mb / 4 )) ]; then
+        print_warning "That is over a quarter of this host's ${ram_mb} MiB of RAM."
+        print_info "Lower 'conn' (menu 4) or smuxbuf if the box is memory tight."
+    fi
+}
 
 v3_emit_tuning_keys() {
     local indent="${1:-    }"
-    printf '%ssmuxbuf: %s
-' "$indent" "$V3_DEFAULT_SMUXBUF"
-    printf '%sstreambuf: %s
-' "$indent" "$V3_DEFAULT_STREAMBUF"
-    printf '%ssmux_version: %s
-' "$indent" "$V3_DEFAULT_SMUX_VERSION"
+    local ram_mb="${2:-$(v3_host_ram_mb)}"
+    printf '%ssmuxbuf: %s\n' "$indent" "$(v3_default_smuxbuf "$ram_mb")"
+    printf '%sstreambuf: %s\n' "$indent" "$(v3_default_streambuf "$ram_mb")"
+    printf '%ssmux_version: %s\n' "$indent" "$V3_DEFAULT_SMUX_VERSION"
 }
 
 # Report whether a tls: block already carries the given key.
@@ -878,23 +997,65 @@ v3_config_has_tls_key() {
     ' "$config"
 }
 
-# Back-fill the tuning keys into one h2 config. Existing values are left alone
-# so a hand-tuned host is never overwritten. Returns 0 when the file changed,
-# 2 when it was already complete, 1 when it is not a v3 h2 config.
+# Read one key's value out of a config's tls block.
+v3_config_tls_value() {
+    local config="$1" key="$2"
+    [ -f "$config" ] || return 1
+    awk -v key="$key" '
+        /^[[:space:]]*tls:[[:space:]]*$/ { in_tls=1; next }
+        in_tls && /^[^[:space:]]/ { exit }
+        in_tls && $1 == key ":" { value=$2; gsub(/"/, "", value); print value; exit }
+    ' "$config"
+}
+
+# Replace a tls key that still carries a value an older manager wrote. A value
+# the operator picked themselves is left alone.
+v3_upgrade_stale_tls_value() {
+    local config="$1" key="$2" stale="$3" fresh="$4"
+    [ "$stale" != "$fresh" ] || return 1
+    [ "$(v3_config_tls_value "$config" "$key")" = "$stale" ] || return 1
+    sed -i -E "s/^([[:space:]]*)${key}:[[:space:]].*/\1${key}: ${fresh}/" "$config"
+}
+
+# Back-fill the tuning keys into one h2 config, and upgrade values an older
+# manager wrote that are now known to be wrong. A value the operator chose is
+# never overwritten. Returns 0 when the file changed, 2 when it was already
+# correct, 1 when it is not a v3 h2 config.
 v3_migrate_config_tuning() {
     local config="$1"
     [ -f "$config" ] || return 1
     [ "$(config_transport_protocol "$config")" = "tls" ] || return 1
     [ "$(config_tls_mode "$config")" = "h2" ] || return 1
 
+    local ram_mb smuxbuf streambuf changed=0
+    ram_mb=$(v3_host_ram_mb)
+    smuxbuf=$(v3_default_smuxbuf "$ram_mb")
+    streambuf=$(v3_default_streambuf "$ram_mb")
+
+    # Replace only the pairs earlier managers wrote, and only when both keys
+    # still match one of them: a config where either value was hand-edited is
+    # the operator's, not ours.
+    local stale_smux stale_stream
+    while IFS='|' read -r stale_smux stale_stream; do
+        [ -n "$stale_smux" ] || continue
+        [ "$(v3_config_tls_value "$config" smuxbuf)" = "$stale_smux" ] || continue
+        [ "$(v3_config_tls_value "$config" streambuf)" = "$stale_stream" ] || continue
+        v3_upgrade_stale_tls_value "$config" smuxbuf "$stale_smux" "$smuxbuf" && changed=1
+        v3_upgrade_stale_tls_value "$config" streambuf "$stale_stream" "$streambuf" && changed=1
+        break
+    done < <(v3_stale_buffer_pairs)
+
     local missing="" key value pair
-    for pair in "smuxbuf $V3_DEFAULT_SMUXBUF" "streambuf $V3_DEFAULT_STREAMBUF" "smux_version $V3_DEFAULT_SMUX_VERSION"; do
+    for pair in "smuxbuf $smuxbuf" "streambuf $streambuf" "smux_version $V3_DEFAULT_SMUX_VERSION"; do
         key="${pair%% *}"
         value="${pair##* }"
         v3_config_has_tls_key "$config" "$key" && continue
         missing="${missing:+$missing|}${key}: ${value}"
     done
-    [ -n "$missing" ] || return 2
+    if [ -z "$missing" ]; then
+        [ "$changed" -eq 1 ] && return 0
+        return 2
+    fi
 
     # Match the indentation the existing keys in the tls block already use.
     local indent
@@ -2968,6 +3129,7 @@ configure_v3_tls_server() {
         v3_emit_tuning_keys '    '
     } > "$CONFIG_DIR/${config_name}.yaml"
     chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+    v3_report_throughput_budget "$CONFIG_DIR/${config_name}.yaml"
 
     create_systemd_service "$config_name"
     svc="paqet-${config_name}"
@@ -3358,6 +3520,7 @@ configure_v3_tls_client() {
         fi
     } > "$CONFIG_DIR/${config_name}.yaml"
     chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+    v3_report_throughput_budget "$CONFIG_DIR/${config_name}.yaml"
 
     create_systemd_service "$config_name"
     svc="paqet-${config_name}"
@@ -5043,7 +5206,7 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
-			-X 'paqet/cmd/version.Version=v3.2.0-wildpaqet' \
+			-X 'paqet/cmd/version.Version=v3.4.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
@@ -5413,6 +5576,9 @@ v3_apply_tuning_migration() {
     [ "${changed:-0}" -gt 0 ] || return 0
 
     print_success "Updated $changed v3 config(s) with the upload throughput tuning keys"
+    local first
+    first=$(find "$CONFIG_DIR" -maxdepth 1 -name '*.yaml' -type f 2>/dev/null | head -1)
+    [ -n "$first" ] && v3_report_throughput_budget "$first"
     print_warning "Both Iran and Kharej must run this core build: smux_version 2 is not"
     print_warning "compatible with an older peer. Update every node, then restart them."
 

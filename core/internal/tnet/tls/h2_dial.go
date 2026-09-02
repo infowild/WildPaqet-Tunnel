@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -122,7 +123,15 @@ func dialH2(ctx context.Context, endpoint string, cfg *conf.TLS) (tnet.Conn, err
 }
 
 func dialCoverTLS(ctx context.Context, network, endpoint string, cfg *conf.TLS, roots *x509.CertPool) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: cfg.KeepAlive}
+	dialer := net.Dialer{
+		Timeout:   cfg.ConnectTimeout,
+		KeepAlive: cfg.KeepAlive,
+		Control: func(_, _ string, c syscall.RawConn) error {
+			// Best effort: a kernel without TCP_NOTSENT_LOWAT must still dial.
+			_ = setNotsentLowat(c)
+			return nil
+		},
+	}
 	raw, err := dialer.DialContext(ctx, network, endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("h2: dial %s: %w", endpoint, err)

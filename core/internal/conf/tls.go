@@ -10,6 +10,26 @@ import (
 	"time"
 )
 
+// Buffer defaults trade throughput against latency, and both directions of
+// that trade are real.
+//
+// Every window here bounds in-flight bytes to window/RTT, so a LAN-sized value
+// caps a single flow on a WAN path no matter how fast the link is: 2 MiB is
+// only ~170 Mbps at 100 ms. But smux multiplexes every user connection onto one
+// TCP stream, so whatever one bulk transfer has outstanding also sits ahead of
+// every other stream on that connection. Oversizing these therefore shows up as
+// ping and jitter climbing whenever the tunnel is busy - measurably so on a
+// path with deep buffers, which describes most consumer routes.
+//
+// 8 MiB / 4 MiB is the middle of that trade: roughly 340 Mbps for one flow at
+// 100 ms RTT, without the standing queue that 8 MiB of streambuf builds. Raise
+// them for a fast, well-buffered path; lower them if interactive latency under
+// load matters more than bulk speed.
+const (
+	defaultSmuxbuf   = 8 * 1024 * 1024
+	defaultStreambuf = 4 * 1024 * 1024
+)
+
 const (
 	defaultTLSALPN      = "h2"
 	defaultTLSMode      = "direct"
@@ -113,10 +133,10 @@ func (t *TLS) setDefaults() {
 		t.BreakerMax_ = 300
 	}
 	if t.Smuxbuf == 0 {
-		t.Smuxbuf = 4 * 1024 * 1024
+		t.Smuxbuf = defaultSmuxbuf
 	}
 	if t.Streambuf == 0 {
-		t.Streambuf = 2 * 1024 * 1024
+		t.Streambuf = defaultStreambuf
 	}
 	if t.SmuxVersion == 0 {
 		// smux v1 has no per-stream flow control: it ignores MaxStreamBuffer

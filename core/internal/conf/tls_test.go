@@ -321,7 +321,41 @@ transport:
 	if cfg.Transport.TLS.SmuxVersion != 2 {
 		t.Fatalf("smux_version = %d, want the v3 default of 2", cfg.Transport.TLS.SmuxVersion)
 	}
-	if cfg.Transport.TLS.Smuxbuf != 4*1024*1024 {
-		t.Fatalf("smuxbuf = %d, want 4194304", cfg.Transport.TLS.Smuxbuf)
+	if cfg.Transport.TLS.Smuxbuf != defaultSmuxbuf {
+		t.Fatalf("smuxbuf = %d, want %d", cfg.Transport.TLS.Smuxbuf, defaultSmuxbuf)
+	}
+	if cfg.Transport.TLS.Streambuf != defaultStreambuf {
+		t.Fatalf("streambuf = %d, want %d", cfg.Transport.TLS.Streambuf, defaultStreambuf)
+	}
+}
+
+// TestBufferDefaultsBalanceThroughputAgainstLatency pins both halves of the
+// trade these numbers make, because both have bitten this project once.
+//
+// Too small and a single flow is capped however fast the link is: window/RTT is
+// the ceiling, so 2 MiB is only ~168 Mbps at 100 ms. Too large and the standing
+// queue one bulk transfer builds sits ahead of every other stream on the same
+// multiplexed connection, which shows up as ping and jitter under load.
+func TestBufferDefaultsBalanceThroughputAgainstLatency(t *testing.T) {
+	const rttMs = 100
+	mbps := func(window int) int { return window * 8 / rttMs / 1000 }
+
+	// Floor: comfortably past the ~168 Mbps that 2 MiB allowed.
+	if got := mbps(defaultStreambuf); got < 300 {
+		t.Fatalf("streambuf caps one flow at %d Mbps over a 100 ms path", got)
+	}
+	// Ceiling: a bulk transfer may not park more than this ahead of every
+	// other stream on the same connection.
+	if got := mbps(defaultStreambuf); got > 400 {
+		t.Fatalf("streambuf allows %d Mbps of standing queue per flow; that is latency, not speed", got)
+	}
+	// The outer TCP receive window is the next ceiling up, and the network
+	// optimizer holds it at 8 MB so hosts keep advertising window scale 7.
+	const optimizerTCPWindow = 8000000
+	if defaultStreambuf > optimizerTCPWindow {
+		t.Fatalf("streambuf %d exceeds the outer TCP window the optimizer allows", defaultStreambuf)
+	}
+	if defaultStreambuf > defaultSmuxbuf {
+		t.Fatalf("streambuf %d exceeds smuxbuf %d; smux rejects that pairing", defaultStreambuf, defaultSmuxbuf)
 	}
 }

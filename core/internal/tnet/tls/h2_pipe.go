@@ -9,7 +9,7 @@ import (
 // h2PipeBuffer is the amount of upload data that may sit between smux and the
 // HTTP/2 writer. It is deliberately small: enough to keep both loops busy
 // across one flow-control round trip, not enough to add queueing latency.
-const h2PipeBuffer = 256 * 1024
+const h2PipeBuffer = 64 * 1024
 
 var errPipeClosed = errors.New("h2: cover stream closed")
 
