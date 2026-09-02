@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.12.1-v3
+# Version: 9.13-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.12.1-v3"
+readonly SCRIPT_VERSION="9.13-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -835,6 +835,121 @@ config_tls_mode() {
             value=$2; gsub(/"/, "", value); print value; exit
         }
     ' "$config" 2>/dev/null
+}
+
+# ------------------------------------------------------------------
+# v3 throughput tuning keys
+#
+# Upload used to run at roughly a quarter of download speed because Go's
+# HTTP/2 server defaults both of its receive windows to 1 MiB while its
+# transport defaults the reverse direction to 4 MiB. A flow-control window
+# bounds in-flight bytes to window/RTT, so on a 100 ms Iran<->Kharej path a
+# single upload flow was capped near 84 Mbps no matter how much bandwidth the
+# link had. The core now derives that window from smuxbuf, and smux v2 gives
+# streambuf real per-stream flow control (v1 ignored the value entirely).
+#
+# These keys are written into new v3 configs and back-filled into existing
+# ones so an upgraded install actually picks the tuning up.
+# ------------------------------------------------------------------
+readonly V3_DEFAULT_SMUXBUF=4194304
+readonly V3_DEFAULT_STREAMBUF=2097152
+readonly V3_DEFAULT_SMUX_VERSION=2
+
+v3_emit_tuning_keys() {
+    local indent="${1:-    }"
+    printf '%ssmuxbuf: %s
+' "$indent" "$V3_DEFAULT_SMUXBUF"
+    printf '%sstreambuf: %s
+' "$indent" "$V3_DEFAULT_STREAMBUF"
+    printf '%ssmux_version: %s
+' "$indent" "$V3_DEFAULT_SMUX_VERSION"
+}
+
+# Report whether a tls: block already carries the given key.
+v3_config_has_tls_key() {
+    local config="$1"
+    local key="$2"
+    [ -f "$config" ] || return 1
+    awk -v key="$key" '
+        /^[[:space:]]*tls:/ { in_tls=1; next }
+        in_tls && /^[^[:space:]]/ { exit }
+        in_tls && $1 == key ":" { found=1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$config"
+}
+
+# Back-fill the tuning keys into one h2 config. Existing values are left alone
+# so a hand-tuned host is never overwritten. Returns 0 when the file changed,
+# 2 when it was already complete, 1 when it is not a v3 h2 config.
+v3_migrate_config_tuning() {
+    local config="$1"
+    [ -f "$config" ] || return 1
+    [ "$(config_transport_protocol "$config")" = "tls" ] || return 1
+    [ "$(config_tls_mode "$config")" = "h2" ] || return 1
+
+    local missing="" key value pair
+    for pair in "smuxbuf $V3_DEFAULT_SMUXBUF" "streambuf $V3_DEFAULT_STREAMBUF" "smux_version $V3_DEFAULT_SMUX_VERSION"; do
+        key="${pair%% *}"
+        value="${pair##* }"
+        v3_config_has_tls_key "$config" "$key" && continue
+        missing="${missing:+$missing|}${key}: ${value}"
+    done
+    [ -n "$missing" ] || return 2
+
+    # Match the indentation the existing keys in the tls block already use.
+    local indent
+    indent=$(awk '
+        /^[[:space:]]*tls:[[:space:]]*$/ { in_tls=1; next }
+        in_tls && $1 == "alpn:" { match($0, /^[[:space:]]*/); print substr($0, 1, RLENGTH); exit }
+    ' "$config")
+    [ -n "$indent" ] || indent="    "
+
+    local tmp
+    tmp=$(mktemp) || return 1
+    if ! awk -v indent="$indent" -v extra="$missing" '
+        BEGIN { n = split(extra, keys, "|") }
+        function flush(  i) {
+            if (done) return
+            for (i = 1; i <= n; i++) if (keys[i] != "") print indent keys[i]
+            done = 1
+        }
+        {
+            if (!in_tls) {
+                if ($0 ~ /^[[:space:]]*tls:[[:space:]]*$/) {
+                    match($0, /^[[:space:]]*/)
+                    tls_indent = RLENGTH
+                    in_tls = 1
+                }
+                print
+                next
+            }
+            if ($0 ~ /^[[:space:]]*$/) { print; next }
+            match($0, /^[[:space:]]*/)
+            if (RLENGTH <= tls_indent) { flush(); in_tls = 0; print; next }
+            print
+        }
+        END { if (in_tls) flush() }
+    ' "$config" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    cat "$tmp" > "$config" && rm -f "$tmp" || { rm -f "$tmp"; return 1; }
+    return 0
+}
+
+# Walk every managed config and back-fill the tuning keys. Returns the number
+# of files changed on stdout.
+v3_migrate_all_configs() {
+    local dir="${1:-$CONFIG_DIR}"
+    local changed=0 config
+    [ -d "$dir" ] || { echo 0; return 0; }
+    while IFS= read -r -d '' config; do
+        if v3_migrate_config_tuning "$config"; then
+            changed=$((changed + 1))
+        fi
+    done < <(find "$dir" -maxdepth 1 -name '*.yaml' -type f -print0 2>/dev/null)
+    echo "$changed"
 }
 
 yaml_set_transport_conn() {
@@ -2850,6 +2965,7 @@ configure_v3_tls_server() {
         echo '    breaker_failures: 3'
         echo '    breaker_cooldown: 30'
         echo '    breaker_max_cooldown: 300'
+        v3_emit_tuning_keys '    '
     } > "$CONFIG_DIR/${config_name}.yaml"
     chmod 600 "$CONFIG_DIR/${config_name}.yaml"
 
@@ -3237,6 +3353,9 @@ configure_v3_tls_client() {
         echo '    breaker_failures: 3'
         echo '    breaker_cooldown: 30'
         echo '    breaker_max_cooldown: 300'
+        if [ "$cover_mode" = "h2" ]; then
+            v3_emit_tuning_keys '    '
+        fi
     } > "$CONFIG_DIR/${config_name}.yaml"
     chmod 600 "$CONFIG_DIR/${config_name}.yaml"
 
@@ -4924,7 +5043,7 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
-			-X 'paqet/cmd/version.Version=v3.1.0-wildpaqet' \
+			-X 'paqet/cmd/version.Version=v3.2.0-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
@@ -5278,10 +5397,31 @@ install_paqet() {
     
     # پاک کردن فایل موقت
     rm -f "/tmp/paqet.tar.gz"
-    
+
+    v3_apply_tuning_migration
+
     print_success "Paqet core installation completed!"
     pause
     return 0
+}
+
+# Back-fill the v3 throughput tuning keys after a core update and restart the
+# affected services, so an existing install benefits without a reconfigure.
+v3_apply_tuning_migration() {
+    local changed
+    changed=$(v3_migrate_all_configs "$CONFIG_DIR")
+    [ "${changed:-0}" -gt 0 ] || return 0
+
+    print_success "Updated $changed v3 config(s) with the upload throughput tuning keys"
+    print_warning "Both Iran and Kharej must run this core build: smux_version 2 is not"
+    print_warning "compatible with an older peer. Update every node, then restart them."
+
+    local config config_name
+    while IFS= read -r -d '' config; do
+        [ "$(config_tls_mode "$config")" = "h2" ] || continue
+        config_name=$(basename "$config" .yaml)
+        systemctl restart "paqet-${config_name}" >/dev/null 2>&1 || true
+    done < <(find "$CONFIG_DIR" -maxdepth 1 -name '*.yaml' -type f -print0 2>/dev/null)
 }
 
 # Install manager script
@@ -5517,45 +5657,103 @@ optimizer_ram_mb() {
     echo $((kb / 1024))
 }
 
+# Linux advertises a TCP window scale in every SYN and SYN-ACK, chosen from
+# max(net.core.rmem_max, net.ipv4.tcp_rmem[2]) with the kernel's own loop:
+#   space > 65535 -> halve, wscale++, capped at 14
+# Stock Linux (tcp_rmem max 6291456) therefore advertises wscale 7, which is by
+# far the most common value on the internet. This helper lets the profile and
+# its tests assert that WildPaqet hosts keep advertising the same value.
+optimizer_expected_wscale() {
+    local space="${1:-0}"
+    [[ "$space" =~ ^[0-9]+$ ]] || return 1
+    local w=0
+    while [ "$space" -gt 65535 ] && [ "$w" -lt 14 ]; do
+        space=$((space / 2))
+        w=$((w + 1))
+    done
+    echo "$w"
+}
+
+# Keys an earlier WildPaqet profile set that the current profile deliberately
+# no longer manages. Dropping a key from the drop-in does not reset the running
+# kernel, so the old value has to be put back explicitly.
+# Format: key|value WildPaqet used to set|distro default to restore
+optimizer_retired_sysctl_keys() {
+    cat <<'EOF'
+net.ipv4.ip_local_port_range|10000 65535|32768 60999
+EOF
+}
+
+# Restore the distro default for any retired key that still carries the old
+# WildPaqet value. A value the operator has since chosen themselves is left be.
+optimizer_revert_retired_keys() {
+    local key old new cur
+    while IFS='|' read -r key old new; do
+        [ -n "$key" ] || continue
+        cur=$(sysctl -n "$key" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//; s/ *$//')
+        [ "$cur" = "$old" ] || continue
+        if sysctl -w "$key=$new" >/dev/null 2>&1; then
+            print_success "Restored distro default: $key = $new"
+        else
+            print_warning "Could not restore $key to the distro default"
+        fi
+    done < <(optimizer_retired_sysctl_keys)
+}
+
 # Pure helper (also used by tests): print safe profile as "key = value"
 optimizer_build_safe_profile() {
     local ram_mb="${1:-0}"
-    local rmem_max=16777216
+
+    # Receive side is capped just under 8 MiB on purpose.
+    #
+    # The window scale is the one buffer setting a passive observer can read
+    # straight off the wire. Earlier profiles used 16-32 MB here, which made
+    # every handshake from these hosts advertise wscale 9 or 10 instead of the
+    # stock 7 - a cheap, stable fingerprint - and bought nothing: an 8 MiB
+    # receive window already sustains roughly 640 Mbps per connection at 100 ms
+    # RTT, far above what these links carry. Both values below keep wscale at 7.
+    local rmem_max=8000000
+    local tcp_rmem_max=8000000
+
+    # The send side has no equivalent on-the-wire signal, so it stays generous
+    # and scales with RAM.
     local wmem_max=16777216
+    local tcp_wmem_max=16777216
     local backlog=5000
     local somax=4096
-    local tcp_rmem_max=16777216
-    local tcp_wmem_max=16777216
     local file_max=1048576
 
     if [ "$ram_mb" -ge 8192 ] 2>/dev/null; then
-        rmem_max=33554432
         wmem_max=33554432
+        tcp_wmem_max=33554432
         backlog=10000
         somax=8192
-        tcp_rmem_max=33554432
-        tcp_wmem_max=33554432
         file_max=2097152
     elif [ "$ram_mb" -ge 4096 ] 2>/dev/null; then
-        rmem_max=25165824
         wmem_max=25165824
+        tcp_wmem_max=25165824
         backlog=8000
         somax=6144
-        tcp_rmem_max=25165824
-        tcp_wmem_max=25165824
     elif [ "$ram_mb" -gt 0 ] && [ "$ram_mb" -lt 2048 ] 2>/dev/null; then
-        rmem_max=8388608
+        rmem_max=4194304
+        tcp_rmem_max=4194304
         wmem_max=8388608
+        tcp_wmem_max=8388608
         backlog=2500
         somax=2048
-        tcp_rmem_max=8388608
-        tcp_wmem_max=8388608
         file_max=524288
     fi
 
     cat <<EOF
 # WildPaqet Safe/Auto network profile (${NETOPT_MARKER})
 # Paqet uses raw-packet inject; never set default_qdisc=fq on tunnel hosts.
+#
+# Receive buffers are capped so the kernel keeps advertising the stock TCP
+# window scale of 7. Raising them to 16-32 MB advertises wscale 9-10 in every
+# SYN, which is a passive fingerprint and gains nothing at these link speeds.
+# ip_local_port_range is deliberately left at the distro default: moving it to
+# 10000-65535 puts source ports outside the normal ephemeral range on every
+# outbound connection, and can collide with locally listening services.
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${wmem_max}
 net.core.netdev_max_backlog = ${backlog}
@@ -5567,7 +5765,6 @@ net.ipv4.tcp_wmem = 4096 16384 ${tcp_wmem_max}
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.ip_local_port_range = 10000 65535
 fs.file-max = ${file_max}
 EOF
 }
@@ -6028,6 +6225,9 @@ apply_kernel_optimizations() {
     print_step "Applying sysctl keys..."
     optimizer_apply_sysctl_file "$SYSCTL_FILE" || print_warning "Some sysctl keys failed (see above)"
 
+    print_step "Reverting retired keys to distro defaults..."
+    optimizer_revert_retired_keys
+
     print_step "Writing session limits (PAM)..."
     optimizer_write_limits_file
     print_success "Wrote $LIMITS_FILE"
@@ -6109,6 +6309,7 @@ optimizer_reset_owned_settings() {
     rm -f "$SYSCTL_FILE" "$LIMITS_FILE"
     optimizer_remove_qdisc_persistence
     sysctl --system >/dev/null 2>&1 || true
+    optimizer_revert_retired_keys
     sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
     optimizer_apply_qdisc_targets || true
     print_success "Owned settings removed"
@@ -6145,7 +6346,22 @@ view_kernel_status() {
     echo -e "  • default_qdisc: $(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
     echo -e "  • rmem_max / wmem_max: $(sysctl -n net.core.rmem_max 2>/dev/null) / $(sysctl -n net.core.wmem_max 2>/dev/null)"
     echo -e "  • backlog / somaxconn: $(sysctl -n net.core.netdev_max_backlog 2>/dev/null) / $(sysctl -n net.core.somaxconn 2>/dev/null)"
-    echo -e "  • port range: $(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo N/A)"
+    echo -e "  • port range: $(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo N/A) ${CYAN}(distro default: 32768 60999)${NC}"
+
+    # The window scale is the one buffer setting a passive observer reads off
+    # the wire, so show what this host advertises and what stock Linux does.
+    local wsc_space wsc tcp_rmem_max
+    tcp_rmem_max=$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null | awk '{print $3}')
+    wsc_space=$(sysctl -n net.core.rmem_max 2>/dev/null || echo 0)
+    if [ -n "$tcp_rmem_max" ] && [ "$tcp_rmem_max" -gt "${wsc_space:-0}" ] 2>/dev/null; then
+        wsc_space="$tcp_rmem_max"
+    fi
+    wsc=$(optimizer_expected_wscale "${wsc_space:-0}" 2>/dev/null || echo "?")
+    if [ "$wsc" = "7" ]; then
+        echo -e "  • advertised TCP window scale: ${GREEN}$wsc${NC} (matches stock Linux)"
+    else
+        echo -e "  • advertised TCP window scale: ${RED}$wsc${NC} (stock Linux is 7 — this is visible in every SYN)"
+    fi
 
     echo -e "\n${YELLOW}Default-route interfaces / live qdisc:${NC}"
     local iface found_fq=0
@@ -6204,6 +6420,15 @@ install_dns_finder() {
     echo -e "${YELLOW}This tool finds the best DNS servers for Iran by testing latency.${NC}"
     echo -e "${YELLOW}It will help improve your internet speed and connectivity.${NC}\n"
     
+    echo -e "${RED}Before you continue:${NC}"
+    echo -e "  • This runs a ${RED}third-party script as root${NC} from a GitHub branch that is"
+    echo -e "    not pinned or checksum-verified. WildPaqet cannot vouch for its contents."
+    echo -e "  • It changes this host's system DNS. ${YELLOW}DNS queries are visible on the wire${NC};"
+    echo -e "    pointing an Iran VPS at a foreign resolver is itself a distinguishing signal."
+    echo -e "  • ${CYAN}The tunnel does not need it.${NC} v3 endpoints are IP:port from the"
+    echo -e "    pairing codes, so WildPaqet resolves no hostname while it runs."
+    echo -e "  • Useful for other services on the box, not for tunnel throughput."
+    echo ""
     read -p "Do you want to find the best DNS servers? (y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -6247,6 +6472,11 @@ install_mirror_selector() {
     echo -e "${YELLOW}This tool finds the fastest apt repository mirror for your location.${NC}"
     echo -e "${YELLOW}It will significantly improve package download speeds.${NC}\n"
     
+    echo -e "${RED}Before you continue:${NC}"
+    echo -e "  • This runs a ${RED}third-party script as root${NC} from a GitHub branch that is"
+    echo -e "    not pinned or checksum-verified. WildPaqet cannot vouch for its contents."
+    echo -e "  • It rewrites your apt sources and does not affect tunnel throughput."
+    echo ""
     read -p "Do you want to find the fastest apt mirror? (y/N): " confirm
     
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then

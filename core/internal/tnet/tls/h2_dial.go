@@ -5,7 +5,6 @@ import (
 	stdtls "crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -30,7 +29,9 @@ func dialH2(ctx context.Context, endpoint string, cfg *conf.TLS) (tnet.Conn, err
 		return nil, err
 	}
 
-	reqReader, reqWriter := io.Pipe()
+	pipe := newBufferedPipe(h2PipeBuffer)
+	reqReader := bufferedPipeReader{p: pipe}
+	reqWriter := bufferedPipeWriter{p: pipe}
 	reqCtx, cancelRequest := context.WithCancel(ctx)
 	var baseMu sync.Mutex
 	var base net.Conn

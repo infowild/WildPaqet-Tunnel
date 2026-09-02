@@ -67,9 +67,18 @@ func listenH2(addr string, cfg *conf.TLS) (tnet.Listener, error) {
 			return context.WithValue(ctx, h2ConnContextKey{}, conn)
 		},
 	}
+	uploadWindow := h2UploadWindow(cfg.Smuxbuf)
 	if err := http2.ConfigureServer(l.server, &http2.Server{
 		MaxConcurrentStreams: 16,
 		IdleTimeout:          2 * cfg.KeepAliveTimeout,
+		// Go's HTTP/2 server defaults both receive windows to 1 MiB, while its
+		// transport defaults the opposite direction to 1 GiB connection /
+		// 4 MiB stream. Left alone that caps client->server throughput at a
+		// quarter of server->client throughput on the same path, because a
+		// window bounds in-flight bytes to window/RTT. Both directions now get
+		// the same budget as the smux session buffer.
+		MaxUploadBufferPerConnection: uploadWindow,
+		MaxUploadBufferPerStream:     uploadWindow,
 	}); err != nil {
 		_ = raw.Close()
 		return nil, fmt.Errorf("h2: configure server: %w", err)
@@ -218,4 +227,24 @@ func serveBuiltInDecoy(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, strings.NewReader(page))
+}
+
+const (
+	// h2MinUploadWindow keeps Go's own default as the floor.
+	h2MinUploadWindow = 1 << 20
+	// h2MaxUploadWindow bounds what a config file can ask the kernel to buffer
+	// per outer connection.
+	h2MaxUploadWindow = 64 << 20
+)
+
+// h2UploadWindow derives the HTTP/2 client->server receive window from the smux
+// session buffer, so neither layer becomes the narrower of the two.
+func h2UploadWindow(smuxbuf int) int32 {
+	if smuxbuf < h2MinUploadWindow {
+		return h2MinUploadWindow
+	}
+	if smuxbuf > h2MaxUploadWindow {
+		return h2MaxUploadWindow
+	}
+	return int32(smuxbuf)
 }

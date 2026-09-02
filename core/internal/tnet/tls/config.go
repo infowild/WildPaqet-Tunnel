@@ -136,7 +136,11 @@ func (r *certificateReloader) load() (*tls.Certificate, error) {
 
 func smuxConfig(cfg *conf.TLS) *smux.Config {
 	sc := smux.DefaultConfig()
+	if cfg.SmuxVersion == 1 || cfg.SmuxVersion == 2 {
+		sc.Version = cfg.SmuxVersion
+	}
 	sc.MaxReceiveBuffer = cfg.Smuxbuf
+	// MaxStreamBuffer only takes effect on smux v2; v1 silently ignores it.
 	sc.MaxStreamBuffer = cfg.Streambuf
 	sc.KeepAliveInterval = jitterDuration(cfg.KeepAlive, cfg.KeepAliveJitter)
 	sc.KeepAliveTimeout = cfg.KeepAliveTimeout

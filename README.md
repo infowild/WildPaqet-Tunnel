@@ -4,7 +4,7 @@
 
 **Real HTTP/2-covered TLS tunnel with direct-TLS and raw-KCP compatibility**
 
-[![Version](https://img.shields.io/badge/version-9.3--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.13--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -173,6 +173,48 @@ Use two connections per endpoint for low traffic, four for balanced production t
 
 See [the v3 install guide](docs/V3-INSTALL.md) and the [client](core/example/client-tls.yaml.example) / [server](core/example/server-tls.yaml.example) examples.
 
+## Upload throughput (9.13-v3)
+
+Uploads used to run at roughly a quarter of download speed on the same link.
+The cause was HTTP/2 flow control, not bandwidth: Go's HTTP/2 **server**
+defaults both of its receive windows to 1 MiB, while its **transport** defaults
+the opposite direction to 1 GiB connection / 4 MiB stream. A flow-control
+window bounds in-flight bytes to `window / RTT`, so on a 100 ms Iran-Kharej
+path a single upload flow was capped near 84 Mbps regardless of the link.
+
+| Direction | Before | Now |
+|---|---|---|
+| Iran to Kharej (upload) | 1 MiB connection / 1 MiB stream | `smuxbuf` (4 MiB by default) for both |
+| Kharej to Iran (download) | 1 GiB connection / 4 MiB stream | unchanged |
+
+Measured on a loopback path with 100 ms of injected latency, a single upload
+flow went from **81 Mbps to about 152 Mbps**. Four other changes go with it:
+
+- The client no longer feeds HTTP/2 through an unbuffered `io.Pipe`. That pipe
+  handed off every write synchronously, so smux's single sendLoop stalled for
+  the whole duration of each DATA frame write - and because that loop
+  serialises every stream on the session, one upload waiting on the peer's
+  window stopped all other users on the same outer connection.
+- The relay copy buffer is 32 KiB instead of 8 KiB, matching smux's frame size,
+  so a full frame is one DATA frame, one TLS record and one syscall instead of
+  four.
+- `smux_version` defaults to **2** in `h2` mode. v1 has no per-stream flow
+  control and ignored `streambuf` entirely, so that setting was a dead knob and
+  one slow stream could drain the shared session bucket. Legacy `direct` mode
+  stays on v1 for wire compatibility.
+- A stream is no longer torn down the instant one direction ends. smux has no
+  half-close, so a client that finished its upload and half-closed its socket
+  used to truncate the reply; the surviving direction now gets a bounded grace
+  period to drain.
+
+> **Update both ends.** `smux_version: 2` is not compatible with an older peer,
+> and a mismatch fails the connection outright. Rebuild the core with `0 -> 8`
+> on every Iran and Kharej node, then restart the services. Menu `0 -> 8` also
+> back-fills the tuning keys into existing v3 configs; hand-tuned values are
+> left alone. Set `smux_version: 1` on both ends to fall back.
+
+---
+
 ## Legacy raw wire hardening (8.7-v2)
 
 The tunnel leg between Iran and Kharej used to be easy to single out on the wire. Preset `default` now makes it behave like an ordinary TCP connection:
@@ -249,6 +291,40 @@ WildPaqet **8.6-v2+** ships a rewritten Safe/Auto optimizer for Ubuntu/Debian an
 - **Do not** re-run old manager “Kernel Optimization” / remote `teddysun/bbr.sh` flows — they can reintroduce `fq`.
 
 Menu: **7 → 1** Apply · **2** Status · **3** Rollback · **4** Reset owned drop-ins · DNS Finder / Mirror Selector.
+
+#### What the optimizer deliberately does *not* change (9.13-v3)
+
+Host tuning can leak. Two settings in the old profile were visible to a passive
+observer and bought nothing at these link speeds, so they are gone:
+
+| Setting | Old | Now | Why |
+|---|---|---|---|
+| `net.core.rmem_max`, `tcp_rmem[2]` | 8–32 MB | 4–8 MB | Linux picks the **TCP window scale it advertises in every SYN** from `max(rmem_max, tcp_rmem[2])`. Stock Linux advertises **wscale 7**; the old values advertised **9 or 10**, a stable passive fingerprint. 8 MiB of receive window already sustains ~640 Mbps per connection at 100 ms RTT. |
+| `net.ipv4.ip_local_port_range` | `10000 65535` | left at the distro default | A non-default ephemeral range puts the source port of every outbound connection outside the normal window, and can collide with locally listening services. |
+
+Send-side buffers (`wmem_max`, `tcp_wmem`) still scale with RAM: nothing about
+them is advertised on the wire. Applying the profile also restores
+`ip_local_port_range` on hosts that already carry the old value — dropping a key
+from the drop-in does not reset the running kernel. `7 → 2` (Status) now prints
+the window scale this host advertises so you can confirm it reads `7`.
+
+Kept on purpose, with the reasoning stated so you can decide for yourself:
+
+- **BBR** — passively distinguishable from CUBIC, but ubiquitous on the modern
+  internet, so it is not a tunnel marker.
+- **`tcp_slow_start_after_idle = 0`** — changes post-idle behaviour into a
+  burst, but this is standard tuning on real web servers and CDNs, which is
+  exactly what a Kharej node is presenting itself as.
+- **`tcp_mtu_probing = 1`** — only engages once an ICMP black hole is detected,
+  where the alternative is a stalled connection.
+- **`fq_codel`** — already the systemd default on Debian/Ubuntu. Plain `fq` is
+  still refused: it collapses raw-packet transports under load.
+
+> The **DNS Finder** and **Mirror Selector** entries run unpinned third-party
+> scripts from GitHub as root, and the DNS one rewrites system DNS. WildPaqet
+> cannot vouch for their contents, and the tunnel needs neither: v3 endpoints
+> are IP:port from the pairing codes, so no hostname is resolved while it runs.
+> Both prompts now say so before you confirm.
 
 ---
 

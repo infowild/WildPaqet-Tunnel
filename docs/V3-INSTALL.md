@@ -1,6 +1,6 @@
 # WildPaqet v3 installation
 
-v3.1 uses a real full-duplex HTTP/2 `CONNECT` request over TLS 1.3 on normal kernel TCP. Smux runs inside HTTP/2 DATA frames. It does not use WebSocket. Legacy direct TLS and raw KCP/pcap remain compatibility choices.
+v3.2 uses a real full-duplex HTTP/2 `CONNECT` request over TLS 1.3 on normal kernel TCP. Smux runs inside HTTP/2 DATA frames. It does not use WebSocket. Legacy direct TLS and raw KCP/pcap remain compatibility choices.
 
 ## Build and install
 
@@ -60,6 +60,46 @@ chmod 600 /etc/paqet/tls/kharej-ca-bundle.crt
 Manager v9.5 creates four outer connections per endpoint by default and distributes new streams round-robin. Four endpoints therefore use `transport.conn: 16`. A background supervisor recreates a closed pool slot without waiting for new user traffic. HTTP/2 connections have jittered startup, keepalive and maximum age. Rotation installs the replacement first and drains existing streams from the old connection. After three consecutive dial failures, an endpoint circuit opens for 30 seconds; cooldown grows up to five minutes, and only one half-open probe is allowed.
 
 Choose two connections per endpoint for low traffic, four for balanced traffic, or eight for high concurrency on a larger Iran VPS. More connections reduce the head-of-line impact of loss on one outer TCP flow, but they do not repair a poor route or create bandwidth. Size the Iran host by simultaneous throughput, not registered users; use a 1-vCPU/1-GB VPS only for testing and load-test production starting around 4 vCPU / 4 GB.
+
+## Upload throughput and tuning keys
+
+v3.2 fixes an upload/download asymmetry that was caused by HTTP/2 flow control
+rather than by the link. Go's HTTP/2 server defaults both of its receive windows
+to 1 MiB while its transport defaults the reverse direction to 1 GiB connection
+and 4 MiB stream. Because a window bounds in-flight bytes to `window / RTT`, a
+single upload flow on a 100 ms path was capped near 84 Mbps no matter how much
+bandwidth the servers had, while downloads on the same connection were not.
+
+Three keys now appear in the `tls:` block of v3 configs:
+
+| Key | Default | Effect |
+|---|---|---|
+| `smuxbuf` | `4194304` | smux session buffer, and the HTTP/2 client-to-server receive window on the server |
+| `streambuf` | `2097152` | per-stream smux buffer; requires `smux_version: 2` |
+| `smux_version` | `2` in `h2` mode, `1` in `direct` mode | v1 has no per-stream flow control and ignores `streambuf` |
+
+Raising `smuxbuf` raises the upload window with it, up to 64 MiB. Size it for
+your RTT: `smuxbuf / RTT` is the ceiling for one outer connection. At 100 ms the
+4 MiB default allows roughly 335 Mbps per connection, and `transport.conn`
+multiplies that across the pool.
+
+**Both ends must run the same core build.** `smux_version: 2` is not compatible
+with an older peer and a mismatch fails the connection rather than degrading
+quietly. Rebuild with `0 -> 8` on every Iran and Kharej node before restarting.
+The core installer back-fills these keys into existing v3 configs and leaves
+hand-tuned values alone; a config that omits them gets the defaults from the
+core anyway. Set `smux_version: 1` on both ends to fall back.
+
+To confirm the tunnel rather than the path is the limit, compare a single-flow
+and a parallel upload:
+
+```bash
+iperf3 -c <target-through-tunnel> -t 30
+iperf3 -c <target-through-tunnel> -t 30 -P 16
+```
+
+If the single-flow number sits close to `smuxbuf / RTT` while the parallel run
+scales, the window is the binding constraint and `smuxbuf` is the knob.
 
 ## Security model
 

@@ -45,3 +45,11 @@ transport:
     breaker_failures: 3
     breaker_cooldown: 30
     breaker_max_cooldown: 300
+    # Throughput tuning. smuxbuf also sizes the HTTP/2 client->server receive
+    # window: a flow-control window bounds in-flight bytes to window/RTT, so
+    # Go's 1 MiB server default capped a single upload flow near 84 Mbps on a
+    # 100 ms path while downloads got 4 MiB. streambuf needs smux_version 2;
+    # v1 ignores it. Both ends must run the same smux_version.
+    smuxbuf: 4194304
+    streambuf: 2097152
+    smux_version: 2

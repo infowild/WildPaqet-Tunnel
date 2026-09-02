@@ -46,6 +46,7 @@ type TLS struct {
 	BreakerMax_          int `yaml:"breaker_max_cooldown"`
 	Smuxbuf              int `yaml:"smuxbuf"`
 	Streambuf            int `yaml:"streambuf"`
+	SmuxVersion          int `yaml:"smux_version"`
 
 	ConnectTimeout      time.Duration `yaml:"-"`
 	HandshakeTimeout    time.Duration `yaml:"-"`
@@ -116,6 +117,18 @@ func (t *TLS) setDefaults() {
 	}
 	if t.Streambuf == 0 {
 		t.Streambuf = 2 * 1024 * 1024
+	}
+	if t.SmuxVersion == 0 {
+		// smux v1 has no per-stream flow control: it ignores MaxStreamBuffer
+		// entirely and lets a single slow stream drain the shared session
+		// bucket, stalling every other stream on the same outer connection.
+		// v3 transports therefore default to v2. Legacy direct mode keeps v1
+		// so it stays wire-compatible with older peers.
+		if t.Mode == "h2" {
+			t.SmuxVersion = 2
+		} else {
+			t.SmuxVersion = 1
+		}
 	}
 }
 
@@ -191,6 +204,12 @@ func (t *TLS) validate(role string) []error {
 	}
 	if t.Streambuf < 1024 {
 		errors = append(errors, fmt.Errorf("TLS streambuf must be >= 1024 bytes"))
+	}
+	if t.Streambuf > t.Smuxbuf {
+		errors = append(errors, fmt.Errorf("TLS streambuf must not exceed smuxbuf"))
+	}
+	if t.SmuxVersion != 1 && t.SmuxVersion != 2 {
+		errors = append(errors, fmt.Errorf("TLS smux_version must be 1 or 2"))
 	}
 
 	if role == "server" {
