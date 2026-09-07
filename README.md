@@ -4,7 +4,7 @@
 
 **Real HTTP/2-covered TLS tunnel with direct-TLS and raw-KCP compatibility**
 
-[![Version](https://img.shields.io/badge/version-9.15--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.16--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -46,6 +46,7 @@ WildPaqet is a production-oriented tunnel manager for Kharej ↔ Iran deployment
 | **Dual role** | Abroad server + Iran entry (forward / SOCKS5) |
 | **Multi tunnel** | Multiple services on one Iran VPS → many Kharej locations |
 | **Multi port** | Comma-separated forwards with tcp / udp / both |
+| **Safe migration** | Portable backup/restore with checksums, service state, cron, and TLS assets |
 | **Safe cleanup** | Full uninstall restores script-owned system changes |
 
 Forked and maintained from [Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager).
@@ -112,6 +113,40 @@ wildpaqet
 > ```bash
 > export PATH="/usr/local/bin:$PATH" && hash -r
 > ```
+
+---
+
+## Portable backup, restore, and migration (9.16-v3)
+
+Press **`B`** in the main menu. A portable backup includes configs and secrets,
+CA files, referenced TLS certificate/key files, Paqet service state, Paqet-only
+cron entries, and offline copies of the manager/core binaries. Every archived
+file is covered by an internal SHA-256 manifest that is checked before restore.
+The companion `.sha256` file is also checked automatically when present, so
+transfer both files when possible.
+
+```text
+B → 1  Create a portable backup
+B → 2  Restore or migrate
+B → 3  Verify an archive
+B → 4  List local archives
+```
+
+Archives are stored under `/root/wildpaqet-portable-backups/` with mode `600`
+and full uninstall leaves them intact. Transfer them only over SSH/SCP: they
+are not encrypted, contain tunnel secrets, and may contain private TLS keys.
+Restore uses merge semantics, overwrites configs with
+matching names, and first creates a rollback backup when the destination
+already has configs. A destination's installed binaries are preserved; bundled
+binaries are installed only when missing.
+
+Firewall allowances/protection are rebuilt from the restored configs. Network
+optimizer snapshots and raw firewall tables are intentionally not copied
+because they are host-specific. HTTP/2/TLS configs can be started after the
+restore confirmation. Raw KCP/pcap configs are not auto-started on a different
+machine until their interface, local address, and gateway MAC are reconfigured.
+Keep the old Iran host online until traffic tests pass, then move client IPs or
+DNS.
 
 ---
 
@@ -293,6 +328,7 @@ Set `network.tcp.preset: "legacy"` on both sides to restore the old wire behavio
 | 5 | Manage all (NAT, protection, bulk) |
 | 6 | Connectivity tests |
 | 7 | Optimize (Safe/Auto network + DNS / Mirror) |
+| B | Portable backup, restore, and migration |
 | 8 | **Full uninstall** |
 | 9 | Telegram bot |
 | 10 | Exit |
@@ -317,7 +353,7 @@ wildpaqet
 # option 8 → type YES
 ```
 
-Removes **all** script/tunnel artifacts: services, cron, core + backups, `$INSTALL_DIR`, the Core v3 source tree, the isolated Go toolchain, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, managed iptables/NAT rules, tracked UFW/firewalld allowances, `/root/paqet`, `/root/paqet-backups`, state under `/var/lib/wildpaqet`, and temporary build files. The final verifier reports any managed artifact that could not be removed. A separate opt-in prompt can flush untracked legacy/non-WildPaqet NAT rules.
+Removes **all** script/tunnel artifacts: services, cron, core + internal binary backups, `$INSTALL_DIR`, the Core v3 source tree, the isolated Go toolchain, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, managed iptables/NAT rules, tracked UFW/firewalld allowances, `/root/paqet`, `/root/paqet-backups`, state under `/var/lib/wildpaqet`, and temporary build files. Portable migration archives under `/root/wildpaqet-portable-backups` are deliberately preserved. The final verifier reports any managed artifact that could not be removed. A separate opt-in prompt can flush untracked legacy/non-WildPaqet NAT rules.
 
 Network optimizer cleanup during uninstall is **snapshot-aware**: it restores the oldest `/var/lib/wildpaqet/netopt/snap-*` as the true pre-WildPaqet baseline, including prior sysctl/limits files, captured runtime sysctl values, and qdisc kinds changed by the optimizer. It then removes the `wildpaqet-qdisc.service` boot unit and snapshot store without forcing `fq_codel`, `cubic`, or `pfifo_fast`. The NAT helper likewise restores a pre-existing `30-ip_forward.conf` instead of deleting user content.
 

@@ -4,7 +4,7 @@
 
 **تونل پوششی HTTP/2 واقعی روی TLS با سازگاری Direct-TLS و Raw-KCP**
 
-[![Version](https://img.shields.io/badge/version-9.15--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Version](https://img.shields.io/badge/version-9.16--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
@@ -45,6 +45,7 @@ wildpaqet
 | دو نقش | سرور خارج + کلاینت ایران (Forward / SOCKS5) |
 | چند لوکیشن | چند سرویس روی یک ایران → چند خارج |
 | چند پورت | لیست پورت با کاما + tcp/udp |
+| مهاجرت امن | بکاپ/ریستور قابل‌حمل همراه checksum، سرویس‌ها، cron و TLS |
 | پاکسازی کامل | Uninstall برای برگرداندن تغییرات اسکریپت |
 
 فورک نگهداری‌شده از [Paqet-Tunnel-Manager](https://github.com/behzadea12/Paqet-Tunnel-Manager).
@@ -105,6 +106,38 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 # یا
 /usr/local/bin/wildpaqet
 ```
+
+---
+
+## بکاپ، ریستور و انتقال به سرور جدید (9.16-v3)
+
+در منوی اصلی کلید **`B`** را بزن. بکاپ قابل‌حمل شامل تمام کانفیگ‌ها و
+Secretها، CAها، certificate/keyهای مورد استفاده، وضعیت سرویس‌ها، cronهای
+مربوط به Paqet و یک نسخه آفلاین از باینری‌هاست. برای تمام فایل‌های داخل بسته
+checksum ساخته می‌شود و قبل از ریستور بررسی می‌شود. فایل همراه `.sha256` نیز
+در صورت حضور خودکار بررسی می‌شود؛ هنگام انتقال بهتر است هر دو فایل را کپی کنی.
+
+```text
+B → 1  ساخت بکاپ
+B → 2  ریستور/مهاجرت
+B → 3  بررسی صحت بکاپ
+B → 4  فهرست بکاپ‌ها
+```
+
+فایل خروجی در `/root/wildpaqet-portable-backups/` با مجوز `600` ذخیره می‌شود
+و Full Uninstall آن را حذف نمی‌کند. آن را فقط روی SSH/SCP منتقل کن؛ بسته
+رمزگذاری نشده و Secret تانل و احتمالاً private key TLS داخل آن است. ریستور،
+کانفیگ‌ها را با وضعیت مقصد ادغام می‌کند و کانفیگ‌های
+هم‌نام را جایگزین می‌کند، اما پیش از آن از وضعیت مقصد یک rollback backup
+می‌سازد. باینری موجود مقصد حفظ می‌شود و نسخه داخل بسته فقط وقتی نصب می‌شود که
+باینری مقصد وجود نداشته باشد.
+
+قوانین فایروال از روی configها روی مقصد بازسازی می‌شوند؛ snapshotهای Optimizer
+و جدول خام فایروال کپی نمی‌شوند چون وابسته به میزبان‌اند. configهای HTTP/2/TLS
+پس از تأیید قابل اجرا هستند. config خام KCP/pcap هنگام مهاجرت به ماشین دیگر
+خودکار start نمی‌شود تا interface، IP محلی و gateway MAC برای میزبان جدید
+دوباره تنظیم شوند. سرور قبلی را تا پایان تست واقعی ترافیک روشن نگه دار و سپس
+IP یا DNS کلاینت‌ها را جابه‌جا کن.
 
 ---
 
@@ -246,6 +279,7 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 | 2 / 3 | کانفیگ خارج / ایران |
 | 4 / 5 | مدیریت سرویس‌ها |
 | 7 | بهینه‌سازی Safe/Auto شبکه + DNS / Mirror |
+| B | بکاپ، ریستور و مهاجرت قابل‌حمل |
 | 8 | حذف کامل |
 | 9 | ربات تلگرام |
 
@@ -267,7 +301,7 @@ wildpaqet
 # گزینه 8 → تایپ YES
 ```
 
-سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، سورس Core v3، ابزار Go ایزوله، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین علامت‌گذاری‌شدهٔ iptables/NAT، مجوزهای ثبت‌شدهٔ UFW/firewalld، کش `/root/paqet`، بکاپ‌ها، state مسیر `/var/lib/wildpaqet` و فایل‌های موقت build پاک می‌شوند. در پایان verifier هر مورد باقی‌مانده را گزارش می‌کند. Flush کامل قوانین قدیمی یا غیرمرتبط NAT فقط با تأیید جداگانه انجام می‌شود.
+سرویس، cron، هسته + بکاپ باینری، `$INSTALL_DIR`، سورس Core v3، ابزار Go ایزوله، کانفیگ‌ها، دستور `wildpaqet` / لینک‌های قدیمی، ربات تلگرام، sysctl/limits اسکریپت، قوانین علامت‌گذاری‌شدهٔ iptables/NAT، مجوزهای ثبت‌شدهٔ UFW/firewalld، کش `/root/paqet`، بکاپ‌های داخلی `/root/paqet-backups`، state مسیر `/var/lib/wildpaqet` و فایل‌های موقت build پاک می‌شوند. بکاپ‌های مهاجرت در `/root/wildpaqet-portable-backups` عمداً حفظ می‌شوند. در پایان verifier هر مورد باقی‌مانده را گزارش می‌کند. Flush کامل قوانین قدیمی یا غیرمرتبط NAT فقط با تأیید جداگانه انجام می‌شود.
 
 پاکسازی بهینه‌ساز شبکه هنگام حذف کامل **snapshot-aware** است: قدیمی‌ترین `/var/lib/wildpaqet/netopt/snap-*` به‌عنوان وضعیت واقعی قبل از WildPaqet بازگردانی می‌شود؛ فایل‌های قبلی sysctl/limits، مقادیر runtime و qdiscهایی که Optimizer تغییر داده بود نیز برمی‌گردند. سپس یونیت `wildpaqet-qdisc.service` و snapshotها حذف می‌شوند و دیگر `fq_codel`، `cubic` یا `pfifo_fast` به‌صورت اجباری اعمال نمی‌شود. NAT helper نیز فایل قبلی `30-ip_forward.conf` را بازمی‌گرداند و محتوای کاربر را کورکورانه حذف نمی‌کند.
 

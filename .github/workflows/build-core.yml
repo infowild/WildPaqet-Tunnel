@@ -45,6 +45,9 @@ jobs:
       - name: Test complete per-service removal
         run: bash .github/tests/service-removal.sh
 
+      - name: Test portable backup and restore
+        run: bash .github/tests/portable-backup.sh
+
       - name: Test certificate discovery
         run: bash .github/tests/certificate-discovery.sh
 

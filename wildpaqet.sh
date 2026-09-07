@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.15-v3
+# Version: 9.16-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,18 +26,21 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.15-v3"
+readonly SCRIPT_VERSION="9.16-v3"
 readonly MANAGER_NAME="wildpaqet"
-readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
+readonly MANAGER_PATH="${WILDPAQET_MANAGER_PATH:-${WILDPAQET_BIN_DIR:-/usr/local/bin}/$MANAGER_NAME}"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
 readonly MANAGER_BRANCH="wild-paqet-v3"
+readonly PORTABLE_BACKUP_FORMAT="1"
+readonly PORTABLE_BACKUP_ROOT="wildpaqet-backup"
 
 # Paths
 readonly CONFIG_DIR="${WILDPAQET_CONFIG_DIR:-/etc/paqet}"
 readonly SERVICE_DIR="${WILDPAQET_SERVICE_DIR:-/etc/systemd/system}"
-readonly BIN_DIR="/usr/local/bin"
-readonly INSTALL_DIR="/opt/paqet"
-readonly BACKUP_DIR="/root/paqet-backups"
+readonly BIN_DIR="${WILDPAQET_BIN_DIR:-/usr/local/bin}"
+readonly INSTALL_DIR="${WILDPAQET_INSTALL_DIR:-/opt/paqet}"
+readonly BACKUP_DIR="${WILDPAQET_BACKUP_DIR:-/root/paqet-backups}"
+readonly PORTABLE_BACKUP_DIR="${WILDPAQET_PORTABLE_BACKUP_DIR:-/root/wildpaqet-portable-backups}"
 readonly CORE_SRC_DIR="/opt/wildpaqet-core-src"
 readonly GO_TOOLCHAIN_DIR="/opt/wildpaqet-go"
 
@@ -5790,6 +5793,631 @@ uninstall_manager_script() {
 }
 
 # ================================================
+# PORTABLE BACKUP / RESTORE
+# ================================================
+# A portable backup is intentionally narrower than a machine image. It carries
+# WildPaqet configs (including secrets), TLS material, service state, Paqet-only
+# cron lines, and optional binaries. Host-specific optimizer snapshots and raw
+# firewall tables are rebuilt on the destination instead of being copied.
+
+portable_config_names() {
+    local file base name
+    [ -d "$CONFIG_DIR" ] || return 0
+    while IFS= read -r file; do
+        base=$(basename "$file")
+        name="${base%.yaml}"
+        name="${name%.yml}"
+        [ -n "$name" ] || continue
+        [ "$(clean_config_name "$name")" = "$name" ] || continue
+        printf '%s\n' "$name"
+    done < <(find "$CONFIG_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort)
+}
+
+portable_config_path_for_name() {
+    local name="$1"
+    if [ -f "$CONFIG_DIR/$name.yaml" ]; then
+        printf '%s\n' "$CONFIG_DIR/$name.yaml"
+    elif [ -f "$CONFIG_DIR/$name.yml" ]; then
+        printf '%s\n' "$CONFIG_DIR/$name.yml"
+    else
+        return 1
+    fi
+}
+
+portable_machine_id_hash() {
+    if [ -s /etc/machine-id ] && command -v sha256sum >/dev/null 2>&1; then
+        sha256sum /etc/machine-id 2>/dev/null | awk '{print $1}'
+    else
+        printf '%s' "$(hostname 2>/dev/null):$(uname -m 2>/dev/null)" \
+            | sha256sum 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+portable_backup_create() {
+    local label="${1:-manual}"
+    local -a config_names=()
+    mapfile -t config_names < <(portable_config_names | awk '!seen[$0]++')
+    if [ ${#config_names[@]} -eq 0 ]; then
+        print_error "No WildPaqet tunnel configs found in $CONFIG_DIR"
+        return 1
+    fi
+    for cmd in tar sha256sum find awk; do
+        command -v "$cmd" >/dev/null 2>&1 || {
+            print_error "$cmd is required for portable backups"
+            return 1
+        }
+    done
+
+    mkdir -p "$PORTABLE_BACKUP_DIR" || return 1
+    chmod 700 "$PORTABLE_BACKUP_DIR" 2>/dev/null || true
+    local work payload archive_tmp archive timestamp host_safe core_version machine_hash
+    work=$(mktemp -d "$PORTABLE_BACKUP_DIR/.portable.XXXXXX") || return 1
+    payload="$work/$PORTABLE_BACKUP_ROOT"
+    mkdir -p "$payload/configs" "$payload/bin" "$payload/state" "$payload/tls-assets"
+    chmod 700 "$payload" "$payload/configs" "$payload/bin" "$payload/state" "$payload/tls-assets"
+
+    # Dereference symlinks so the archive never depends on a certificate path
+    # or file that exists only on the source host.
+    if ! cp -RL "$CONFIG_DIR/." "$payload/configs/"; then
+        rm -rf "$work"
+        print_error "Could not copy $CONFIG_DIR"
+        return 1
+    fi
+
+    if [ -f "$BIN_DIR/paqet" ]; then
+        install -m 0755 "$BIN_DIR/paqet" "$payload/bin/paqet"
+    fi
+    if [ -f "$MANAGER_PATH" ]; then
+        install -m 0755 "$MANAGER_PATH" "$payload/bin/wildpaqet"
+    fi
+
+    timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    machine_hash=$(portable_machine_id_hash)
+    core_version=""
+    if [ -x "$BIN_DIR/paqet" ]; then
+        core_version=$("$BIN_DIR/paqet" version 2>/dev/null | awk -F: '/^Version:/{gsub(/^[[:space:]]+/,"",$2); print $2; exit}')
+    fi
+    cat > "$payload/metadata" << EOF
+format=$PORTABLE_BACKUP_FORMAT
+created_at=$timestamp
+label=$label
+source_hostname=$(hostname 2>/dev/null || echo unknown)
+source_machine_id_sha256=$machine_hash
+source_arch=$(uname -m 2>/dev/null || echo unknown)
+manager_version=$SCRIPT_VERSION
+core_version=${core_version:-unknown}
+EOF
+    chmod 600 "$payload/metadata"
+
+    : > "$payload/state/services.tsv"
+    : > "$payload/state/cron.txt"
+    : > "$payload/state/tls-assets.tsv"
+    local name cfg service enabled active root_cron key source rel
+    root_cron=$(crontab -l 2>/dev/null || true)
+    for name in "${config_names[@]}"; do
+        cfg=$(portable_config_path_for_name "$name") || continue
+        service="paqet-${name}.service"
+        enabled=0
+        active=0
+        systemctl is-enabled --quiet "$service" 2>/dev/null && enabled=1
+        systemctl is-active --quiet "$service" 2>/dev/null && active=1
+        printf '%s|%s|%s\n' "$name" "$enabled" "$active" >> "$payload/state/services.tsv"
+
+        if [ -n "$root_cron" ]; then
+            printf '%s\n' "$root_cron" \
+                | grep -F "systemctl restart paqet-${name}" \
+                >> "$payload/state/cron.txt" 2>/dev/null || true
+        fi
+
+        # Server certificates commonly live under Certbot/acme.sh outside
+        # /etc/paqet. Client CA files are copied too, which also repairs a
+        # custom absolute ca_file path during restore.
+        for key in cert_file key_file ca_file; do
+            source=$(v3_config_tls_value "$cfg" "$key" 2>/dev/null || true)
+            [ -n "$source" ] && [ -f "$source" ] || continue
+            rel="tls-assets/$name/$key.pem"
+            mkdir -p "$payload/tls-assets/$name"
+            chmod 700 "$payload/tls-assets/$name"
+            if cp -L "$source" "$payload/$rel"; then
+                chmod 600 "$payload/$rel"
+                printf '%s|%s|%s\n' "$name" "$key" "$rel" >> "$payload/state/tls-assets.tsv"
+            else
+                rm -rf "$work"
+                print_error "Could not copy TLS asset for $name ($key)"
+                return 1
+            fi
+        done
+    done
+    portable_filter_cron_lines "$payload/state/cron.txt" \
+        | awk '!seen[$0]++' > "$payload/state/cron.unique"
+    mv -f "$payload/state/cron.unique" "$payload/state/cron.txt"
+    chmod 600 "$payload/state/"*.tsv "$payload/state/cron.txt"
+
+    if ! (
+        cd "$payload" || exit 1
+        find . -type f ! -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+    ); then
+        rm -rf "$work"
+        print_error "Could not create the internal checksum manifest"
+        return 1
+    fi
+    chmod 600 "$payload/SHA256SUMS"
+
+    host_safe=$(hostname 2>/dev/null | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//')
+    host_safe="${host_safe:-host}"
+    timestamp=$(date -u +%Y%m%d-%H%M%S)
+    archive="$PORTABLE_BACKUP_DIR/wildpaqet-portable-${host_safe}-${timestamp}.tar.gz"
+    archive_tmp="$PORTABLE_BACKUP_DIR/.wildpaqet-portable-${timestamp}.tmp.$$"
+    if ! tar -czpf "$archive_tmp" -C "$work" "$PORTABLE_BACKUP_ROOT"; then
+        rm -rf "$work" "$archive_tmp"
+        print_error "Could not create the portable archive"
+        return 1
+    fi
+    chmod 600 "$archive_tmp"
+    mv -f "$archive_tmp" "$archive"
+    local archive_hash
+    archive_hash=$(sha256sum "$archive" | awk '{print $1}')
+    printf '%s  %s\n' "$archive_hash" "$(basename "$archive")" > "$archive.sha256"
+    chmod 600 "$archive.sha256"
+    rm -rf "$work"
+
+    PORTABLE_BACKUP_CREATED="$archive"
+    print_success "Portable backup created"
+    echo -e "  Archive: ${CYAN}$archive${NC}"
+    echo -e "  SHA-256: ${CYAN}$archive_hash${NC}"
+    echo -e "  Checksum file: ${CYAN}$archive.sha256${NC}"
+    echo -e "  Tunnels: ${CYAN}${#config_names[@]}${NC}"
+    print_warning "This archive contains tunnel secrets and may contain private TLS keys; keep mode 600 and transfer it only over SSH."
+    return 0
+}
+
+portable_backup_member_list_is_safe() {
+    local archive="$1"
+    tar -tzf "$archive" 2>/dev/null | awk -v root="$PORTABLE_BACKUP_ROOT" '
+        {
+            path=$0
+            if (path != root && index(path, root "/") != 1) bad=1
+            count=split(path, part, "/")
+            for (i=1; i<=count; i++) if (part[i] == "..") bad=1
+        }
+        END { exit bad ? 1 : 0 }
+    ' || return 1
+    # Portable backups contain only directories and regular files. Rejecting
+    # links/devices prevents a crafted archive from escaping the staging dir.
+    tar -tvzf "$archive" 2>/dev/null \
+        | awk 'substr($1,1,1) != "-" && substr($1,1,1) != "d" { bad=1 } END { exit bad ? 1 : 0 }'
+}
+
+portable_backup_prepare() {
+    local archive="$1"
+    [ -f "$archive" ] || { print_error "Backup not found: $archive"; return 1; }
+    command -v tar >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 || {
+        print_error "tar and sha256sum are required"
+        return 1
+    }
+    if [ -f "$archive.sha256" ]; then
+        local expected_hash actual_hash
+        expected_hash=$(awk 'NR==1 {print $1; exit}' "$archive.sha256" 2>/dev/null)
+        if [[ ! "$expected_hash" =~ ^[[:xdigit:]]{64}$ ]]; then
+            print_error "External checksum file is invalid: $archive.sha256"
+            return 1
+        fi
+        actual_hash=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
+        if [ "${actual_hash,,}" != "${expected_hash,,}" ]; then
+            print_error "External archive checksum verification failed"
+            return 1
+        fi
+    fi
+    if ! portable_backup_member_list_is_safe "$archive"; then
+        print_error "Archive layout is invalid or contains unsafe entries"
+        return 1
+    fi
+
+    local work root
+    work=$(mktemp -d /tmp/wildpaqet-restore.XXXXXX) || return 1
+    if ! tar -xzpf "$archive" -C "$work"; then
+        rm -rf "$work"
+        print_error "Could not extract backup"
+        return 1
+    fi
+    root="$work/$PORTABLE_BACKUP_ROOT"
+    if [ ! -f "$root/metadata" ] || [ ! -f "$root/SHA256SUMS" ] || [ ! -d "$root/configs" ]; then
+        rm -rf "$work"
+        print_error "Required backup metadata is missing"
+        return 1
+    fi
+    if [ "$(awk -F= '$1=="format"{print $2; exit}' "$root/metadata")" != "$PORTABLE_BACKUP_FORMAT" ]; then
+        rm -rf "$work"
+        print_error "Unsupported portable backup format"
+        return 1
+    fi
+    if ! (cd "$root" && sha256sum -c SHA256SUMS >/dev/null 2>&1); then
+        rm -rf "$work"
+        print_error "Internal checksum verification failed"
+        return 1
+    fi
+    PORTABLE_RESTORE_WORK="$work"
+    PORTABLE_RESTORE_ROOT="$root"
+    return 0
+}
+
+portable_backup_cleanup_prepare() {
+    [ -n "${PORTABLE_RESTORE_WORK:-}" ] && rm -rf "$PORTABLE_RESTORE_WORK"
+    PORTABLE_RESTORE_WORK=""
+    PORTABLE_RESTORE_ROOT=""
+}
+
+portable_metadata_value() {
+    local root="$1" key="$2"
+    awk -F= -v key="$key" '$1==key{sub(/^[^=]*=/,""); print; exit}' "$root/metadata" 2>/dev/null
+}
+
+portable_yaml_set_tls_path() {
+    local cfg="$1" key="$2" value="$3" tmp
+    tmp=$(mktemp) || return 1
+    if ! awk -v key="$key" -v value="$value" '
+        /^[[:space:]]*tls:[[:space:]]*$/ { in_tls=1; print; next }
+        in_tls && /^[^[:space:]]/ { in_tls=0 }
+        in_tls && $1 == key ":" {
+            match($0, /^[[:space:]]*/)
+            print substr($0,1,RLENGTH) key ": \"" value "\""
+            found=1
+            next
+        }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$cfg" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    cat "$tmp" > "$cfg" && rm -f "$tmp"
+}
+
+portable_yaml_role() {
+    awk '$1=="role:"{v=$2;gsub(/"/,"",v);print v;exit}' "$1" 2>/dev/null
+}
+
+portable_yaml_listen_port() {
+    awk '
+        /^listen:[[:space:]]*$/ { in_listen=1; next }
+        in_listen && /^[^[:space:]]/ { exit }
+        in_listen && $1=="addr:" { v=$2; gsub(/"/,"",v); sub(/^.*:/,"",v); print v; exit }
+    ' "$1" 2>/dev/null
+}
+
+portable_yaml_socks_ports() {
+    awk '
+        /^socks5:[[:space:]]*$/ { in_socks=1; next }
+        in_socks && /^[^[:space:]]/ { exit }
+        in_socks && ($1=="-" && $2=="listen:" || $1=="listen:") {
+            v=($1=="-" ? $3 : $2); gsub(/"/,"",v); sub(/^.*:/,"",v); print v
+        }
+    ' "$1" 2>/dev/null
+}
+
+# Keep restore from turning an archive's cron payload into arbitrary commands.
+# Manager-created restart entries have five plain cron fields followed by the
+# exact three-token command: systemctl restart paqet-NAME[.service].
+portable_filter_cron_lines() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    awk '
+        NF == 8 &&
+        $1 ~ /^[0-9*\/,-]+$/ && $2 ~ /^[0-9*\/,-]+$/ &&
+        $3 ~ /^[0-9*\/,-]+$/ && $4 ~ /^[0-9*\/,-]+$/ &&
+        $5 ~ /^[0-9*\/,-]+$/ && $6 == "systemctl" && $7 == "restart" &&
+        $8 ~ /^paqet-[A-Za-z0-9_-]+(\.service)?$/ { print }
+    ' "$file"
+}
+
+portable_restore_firewall_for_config() {
+    local cfg="$1" protocol role port entry listen target proto
+    protocol=$(config_transport_protocol "$cfg")
+    role=$(portable_yaml_role "$cfg")
+    if [ "$protocol" = "tls" ]; then
+        if [ "$role" = "server" ]; then
+            port=$(portable_yaml_listen_port "$cfg")
+            [ -n "$port" ] && configure_tls_firewall "$port" >/dev/null 2>&1 || true
+        else
+            while IFS='|' read -r listen target proto; do
+                [ -n "$listen" ] && apply_forward_listener_firewall "$listen" "$proto" >/dev/null 2>&1 || true
+            done < <(yaml_list_forward_entries "$cfg")
+            while IFS= read -r port; do
+                [ -n "$port" ] && apply_forward_listener_firewall "$port" tcp >/dev/null 2>&1 || true
+            done < <(portable_yaml_socks_ports "$cfg")
+        fi
+    elif [ "$role" = "server" ]; then
+        port=$(portable_yaml_listen_port "$cfg")
+        [ -n "$port" ] && configure_iptables "$port" tcp >/dev/null 2>&1 || true
+    else
+        configure_client_iptables "$cfg" >/dev/null 2>&1 || true
+        while IFS='|' read -r listen target proto; do
+            [ -n "$listen" ] && configure_iptables "$listen" "$proto" >/dev/null 2>&1 || true
+        done < <(yaml_list_forward_entries "$cfg")
+    fi
+}
+
+portable_restore_cron() {
+    local cron_file="$1"
+    shift
+    local -a names=("$@")
+    local tmp name
+    tmp=$(mktemp) || return 1
+    crontab -l 2>/dev/null > "$tmp" || true
+    for name in "${names[@]}"; do
+        grep -vF "systemctl restart paqet-${name}" "$tmp" > "$tmp.next" || true
+        mv -f "$tmp.next" "$tmp"
+    done
+    local line cron_service
+    while IFS= read -r line; do
+        cron_service=$(printf '%s\n' "$line" | awk '{print $8}')
+        cron_service="${cron_service%.service}"
+        for name in "${names[@]}"; do
+            if [ "$cron_service" = "paqet-${name}" ]; then
+                printf '%s\n' "$line" >> "$tmp"
+                break
+            fi
+        done
+    done < <(portable_filter_cron_lines "$cron_file")
+    awk 'NF && !seen[$0]++' "$tmp" > "$tmp.next"
+    if [ -s "$tmp.next" ]; then
+        crontab "$tmp.next"
+    else
+        crontab -r 2>/dev/null || true
+    fi
+    rm -f "$tmp" "$tmp.next"
+}
+
+portable_backup_restore() {
+    local archive="$1"
+    if ! portable_backup_prepare "$archive"; then
+        return 1
+    fi
+    local root="$PORTABLE_RESTORE_ROOT"
+    local source_host source_arch source_manager source_core source_machine current_machine current_arch
+    source_host=$(portable_metadata_value "$root" source_hostname)
+    source_arch=$(portable_metadata_value "$root" source_arch)
+    source_manager=$(portable_metadata_value "$root" manager_version)
+    source_core=$(portable_metadata_value "$root" core_version)
+    source_machine=$(portable_metadata_value "$root" source_machine_id_sha256)
+    current_machine=$(portable_machine_id_hash)
+    current_arch=$(uname -m 2>/dev/null || echo unknown)
+    local -a names=()
+    if [ -f "$root/state/services.tsv" ]; then
+        while IFS='|' read -r name _; do
+            [ -n "$name" ] && [ "$(clean_config_name "$name")" = "$name" ] && names+=("$name")
+        done < "$root/state/services.tsv"
+    fi
+    if [ ${#names[@]} -eq 0 ]; then
+        local file base
+        while IFS= read -r file; do
+            base=$(basename "$file")
+            name="${base%.yaml}"; name="${name%.yml}"
+            [ "$(clean_config_name "$name")" = "$name" ] && names+=("$name")
+        done < <(find "$root/configs" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) | sort)
+    fi
+    if [ ${#names[@]} -eq 0 ]; then
+        portable_backup_cleanup_prepare
+        print_error "Backup contains no valid tunnel configs"
+        return 1
+    fi
+
+    echo -e "${CYAN}Portable backup summary:${NC}"
+    echo "  Source host: ${source_host:-unknown}"
+    echo "  Architecture: ${source_arch:-unknown}"
+    echo "  Manager: ${source_manager:-unknown}"
+    echo "  Core: ${source_core:-unknown}"
+    echo "  Tunnels: ${names[*]}"
+    echo ""
+    print_warning "Restore merges these configs into $CONFIG_DIR and overwrites configs with the same names."
+    print_info "Existing binaries are preserved; bundled binaries are installed only when missing."
+    local confirm
+    read -r -p "Type RESTORE to continue: " confirm
+    if [ "$confirm" != "RESTORE" ]; then
+        portable_backup_cleanup_prepare
+        print_info "Restore cancelled"
+        return 0
+    fi
+
+    # Make a rollback point whenever this host already has managed configs.
+    if [ -d "$CONFIG_DIR" ] && find "$CONFIG_DIR" -maxdepth 1 -type f \( -name '*.yaml' -o -name '*.yml' \) -print -quit 2>/dev/null | grep -q .; then
+        print_step "Creating a pre-restore rollback backup..."
+        if ! portable_backup_create "pre-restore"; then
+            portable_backup_cleanup_prepare
+            print_error "Restore stopped because the rollback backup failed"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    if ! cp -a "$root/configs/." "$CONFIG_DIR/"; then
+        portable_backup_cleanup_prepare
+        print_error "Could not restore configs"
+        return 1
+    fi
+    chown -R root:root "$CONFIG_DIR" 2>/dev/null || true
+    find "$CONFIG_DIR" -type d -exec chmod 700 {} \;
+    find "$CONFIG_DIR" -type f -exec chmod 600 {} \;
+
+    # Put bundled TLS snapshots under the managed tree and rewrite only the
+    # corresponding tls keys. This avoids retaining a source-only Certbot path.
+    local key rel cfg dest restored_private_keys=0
+    if [ -f "$root/state/tls-assets.tsv" ]; then
+        while IFS='|' read -r name key rel; do
+            case "$key" in cert_file|key_file|ca_file) ;; *) continue ;; esac
+            [ "$rel" = "tls-assets/$name/$key.pem" ] || continue
+            [ -n "$name" ] && [ "$(clean_config_name "$name")" = "$name" ] && [ -f "$root/$rel" ] || continue
+            cfg=$(portable_config_path_for_name "$name" 2>/dev/null || true)
+            [ -n "$cfg" ] || continue
+            dest="$CONFIG_DIR/tls/$name/restored-$key.pem"
+            mkdir -p "$(dirname "$dest")"
+            chmod 700 "$(dirname "$dest")"
+            install -m 0600 "$root/$rel" "$dest" || continue
+            if portable_yaml_set_tls_path "$cfg" "$key" "$dest"; then
+                if [ "$key" = "key_file" ]; then
+                    restored_private_keys=$((restored_private_keys + 1))
+                fi
+            fi
+        done < "$root/state/tls-assets.tsv"
+    fi
+
+    if [ ! -x "$BIN_DIR/paqet" ] && [ -f "$root/bin/paqet" ]; then
+        if [ -n "$source_arch" ] && [ "$source_arch" != "unknown" ] && [ "$source_arch" != "$current_arch" ]; then
+            print_warning "Bundled core is for $source_arch, but this host is $current_arch"
+        else
+            atomic_install_binary "$root/bin/paqet" "$BIN_DIR/paqet" \
+                || print_warning "Could not install the bundled Paqet binary"
+        fi
+    else
+        print_info "Keeping the Paqet binary already installed on this host"
+    fi
+    if [ ! -x "$MANAGER_PATH" ] && [ -f "$root/bin/wildpaqet" ]; then
+        install -m 0755 "$root/bin/wildpaqet" "$MANAGER_PATH" \
+            || print_warning "Could not install the bundled manager"
+        ln -sf "$MANAGER_PATH" /usr/bin/wildpaqet 2>/dev/null || true
+    else
+        print_info "Keeping the WildPaqet manager already installed on this host"
+    fi
+    if [ ! -x "$BIN_DIR/paqet" ]; then
+        portable_backup_cleanup_prepare
+        print_error "Paqet binary is unavailable; services were not started"
+        return 1
+    fi
+
+    local start_choice
+    read -r -p "Start services that were active on the source host? (Y/n): " start_choice
+    local start_active=1
+    [[ "$start_choice" =~ ^[Nn]$ ]] && start_active=0
+    local enabled active service protocol role restored=0 started=0 skipped_raw=0 failed=0 same_machine=0 has_server=0
+    if [ -n "$source_machine" ] && [ "$source_machine" = "$current_machine" ]; then
+        same_machine=1
+    fi
+    for name in "${names[@]}"; do
+        if [ ! -f "$CONFIG_DIR/$name.yaml" ] && [ -f "$CONFIG_DIR/$name.yml" ]; then
+            mv -f "$CONFIG_DIR/$name.yml" "$CONFIG_DIR/$name.yaml"
+        fi
+        cfg=$(portable_config_path_for_name "$name" 2>/dev/null || true)
+        [ -n "$cfg" ] || { print_warning "Config missing for $name"; failed=$((failed + 1)); continue; }
+        v3_migrate_config_tuning "$cfg" >/dev/null 2>&1 || true
+        create_systemd_service "$name"
+        service="paqet-${name}.service"
+        enabled=0; active=0
+        if [ -f "$root/state/services.tsv" ]; then
+            IFS='|' read -r _ enabled active < <(grep -F "${name}|" "$root/state/services.tsv" | head -1)
+        fi
+        [ "$enabled" = "1" ] && systemctl enable "$service" >/dev/null 2>&1 \
+            || systemctl disable "$service" >/dev/null 2>&1 || true
+        portable_restore_firewall_for_config "$cfg"
+        protocol=$(config_transport_protocol "$cfg")
+        role=$(portable_yaml_role "$cfg")
+        if [ "$role" = "server" ]; then
+            has_server=1
+        fi
+        restored=$((restored + 1))
+        if [ "$start_active" -eq 1 ] && [ "$active" = "1" ]; then
+            if [ "$protocol" != "tls" ] && [ "$same_machine" -ne 1 ]; then
+                print_warning "$name is a raw KCP/pcap config; interface, local IP and gateway MAC must be reconfigured before start"
+                skipped_raw=$((skipped_raw + 1))
+                continue
+            fi
+            if systemctl restart "$service" >/dev/null 2>&1; then
+                started=$((started + 1))
+            else
+                print_warning "Could not start $service"
+                failed=$((failed + 1))
+            fi
+        fi
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    portable_restore_cron "$root/state/cron.txt" "${names[@]}" \
+        || print_warning "Could not restore Paqet cron entries"
+    save_iptables >/dev/null 2>&1 || true
+    sleep 2
+
+    echo ""
+    print_success "Portable restore finished"
+    echo -e "  Restored configs: ${CYAN}$restored${NC}"
+    echo -e "  Started services: ${CYAN}$started${NC}"
+    [ "$skipped_raw" -gt 0 ] && echo -e "  Raw configs awaiting network reconfiguration: ${YELLOW}$skipped_raw${NC}"
+    [ "$failed" -gt 0 ] && echo -e "  Warnings/failures: ${YELLOW}$failed${NC}"
+    if [ "$restored_private_keys" -gt 0 ]; then
+        print_warning "Restored TLS keys/certificates are snapshots. Reissue or reconnect ACME renewal on the destination before they expire."
+    fi
+    if [ "$has_server" -eq 1 ] && [ "$same_machine" -ne 1 ]; then
+        print_warning "Kharej server configs moved to a new host: update DNS/endpoints and export fresh pairing codes for Iran clients."
+    fi
+    echo -e "  Check: ${CYAN}systemctl --no-pager --full status 'paqet-*'${NC}"
+    print_info "Update phone/client IPs or DNS only after the restored services pass a traffic test. Keep the old Iran host online until then."
+    portable_backup_cleanup_prepare
+    return 0
+}
+
+portable_backup_list() {
+    mkdir -p "$PORTABLE_BACKUP_DIR"
+    chmod 700 "$PORTABLE_BACKUP_DIR" 2>/dev/null || true
+    local found=0 file
+    while IFS= read -r file; do
+        found=1
+        ls -lh "$file"
+        [ -f "$file.sha256" ] && sed 's/^/  SHA-256: /' "$file.sha256"
+    done < <(find "$PORTABLE_BACKUP_DIR" -maxdepth 1 -type f -name 'wildpaqet-portable-*.tar.gz' | sort -r)
+    [ "$found" -eq 1 ] || print_info "No portable backups found in $PORTABLE_BACKUP_DIR"
+}
+
+portable_backup_menu() {
+    while true; do
+        clear
+        show_banner
+        echo -e "${GREEN}Portable Backup / Restore / Migration${NC}\n"
+        echo " 1. Create portable backup"
+        echo " 2. Restore portable backup"
+        echo " 3. Verify portable backup"
+        echo " 4. List portable backups"
+        echo " 0. Back"
+        echo ""
+        local choice archive latest
+        read -r -p "Choose [0-4]: " choice
+        case "$choice" in
+            0) return ;;
+            1)
+                portable_backup_create "manual"
+                pause
+                ;;
+            2)
+                latest=$(find "$PORTABLE_BACKUP_DIR" -maxdepth 1 -type f -name 'wildpaqet-portable-*.tar.gz' 2>/dev/null | sort -r | head -1)
+                read -r -p "Backup archive${latest:+ [$latest]}: " archive
+                archive="${archive:-$latest}"
+                [ -n "$archive" ] && portable_backup_restore "$archive" \
+                    || print_error "No backup archive selected"
+                pause
+                ;;
+            3)
+                latest=$(find "$PORTABLE_BACKUP_DIR" -maxdepth 1 -type f -name 'wildpaqet-portable-*.tar.gz' 2>/dev/null | sort -r | head -1)
+                read -r -p "Backup archive${latest:+ [$latest]}: " archive
+                archive="${archive:-$latest}"
+                if [ -n "$archive" ] && portable_backup_prepare "$archive"; then
+                    print_success "Archive layout and available checksums are valid"
+                    echo "  Source: $(portable_metadata_value "$PORTABLE_RESTORE_ROOT" source_hostname)"
+                    echo "  Created: $(portable_metadata_value "$PORTABLE_RESTORE_ROOT" created_at)"
+                    portable_backup_cleanup_prepare
+                else
+                    [ -n "$archive" ] || print_error "No backup archive selected"
+                fi
+                pause
+                ;;
+            4)
+                portable_backup_list
+                pause
+                ;;
+            *) print_error "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+# ================================================
 # SAFE/AUTO NETWORK OPTIMIZER
 # ================================================
 # Designed for WildPaqet raw-packet tunnels:
@@ -9630,12 +10258,13 @@ main_menu() {
         echo -e "${CYAN}5.${NC}🔄 Manage All Services (Restart/Logs/Delete)"
         echo -e "${CYAN}6.${NC}📊 Test Connection"
         echo -e "${CYAN}7.${NC}🚀 Optimize Server"
+        echo -e "${CYAN}B.${NC}💾 Portable Backup / Restore / Migration"
         echo -e "${CYAN}8.${NC}🗑️  Uninstall WildPaqet (Full Cleanup)"
         echo -e "${CYAN}9.${NC}🤖 Telegram Bot Manager"
         echo -e "${CYAN}10.${NC}🚪 Exit"
         echo ""
         
-        read -p "Select option [0-10]: " choice
+        read -p "Select option [0-10/B]: " choice
         
         case $choice in
             0) install_paqet ;;
@@ -9646,6 +10275,7 @@ main_menu() {
             5) manage_all_services ;;
             6) test_connection ;;
             7) optimize_server ;;
+            b|B|11) portable_backup_menu ;;
             8) uninstall_paqet ;;
             9) telegram_bot_menu ;;
             10)
