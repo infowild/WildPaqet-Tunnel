@@ -228,6 +228,49 @@ network block or guarantee invisibility to DPI.
 
 ---
 
+## TLS certificate sync across Kharej servers (9.20-v3)
+
+Every Kharej server in one pool must serve a certificate for the **same name**:
+the `tls` block carries a single `server_name`, and it is the SNI, the name the
+client verifies, and the HTTP/2 `Host` header all at once.
+
+Where the domain's DNS provider has an API `acme.sh` supports, issue a
+certificate on each server with **DNS-01** instead — that needs none of this and
+survives losing any one server. This menu is for when no such API is available:
+one server owns the ACME account and the others copy the pair from it.
+
+```text
+C → 2  on the new Kharej: create its pull key (prints one line)
+C → 1  on the server that owns the certificate: register that key
+C → 3  on the new Kharej: pull the certificate + daily refresh
+C → 4  status and recent sync log
+```
+
+Three decisions behind it:
+
+**Pull, not push.** A renewal hook on the source runs once every sixty days, so
+a peer that happens to be unreachable at that moment loses the certificate
+silently and only finds out when it expires. A daily pull retries on its own,
+and warns in `journalctl -t wp-cert-pull` once fewer than 20 days remain.
+
+**The peer key is pinned to one command.** The `authorized_keys` line is written
+as `command="/usr/local/bin/wp-cert-export",restrict`, so a compromised replica
+cannot read anything else on the source.
+
+**Nothing is restarted.** The core re-reads the pair on the next handshake
+(`certificateReloader`), so a restart would only drop every user's session for a
+file swap they would otherwise never notice.
+
+A download is validated before it replaces anything: it must parse, be valid for
+that domain, and its key must match the certificate. All three are needed — a
+valid certificate for a *different* name passes the first two and then fails on
+the client, which verifies the name.
+
+`C → 5` and the full uninstall remove every part of it, and take **only** the
+pinned line out of `authorized_keys`, never your own key.
+
+---
+
 ## Portable backup, restore, and migration (9.16-v3)
 
 Press **`B`** in the main menu. A portable backup includes configs and secrets,
@@ -244,8 +287,10 @@ B → 3  Verify an archive
 B → 4  List local archives
 ```
 
-Archives are stored under `/root/wildpaqet-portable-backups/` with mode `600`
-and full uninstall leaves them intact. Transfer them only over SSH/SCP: they
+Archives are stored under `/root/wildpaqet-portable-backups/` with mode `600`.
+Since 9.19-v3 the full uninstall asks separately whether to remove them,
+defaulting to yes because they carry secrets and private keys; keeping them
+prints an explicit warning that those keys remain on the host. Transfer them only over SSH/SCP: they
 are not encrypted, contain tunnel secrets, and may contain private TLS keys.
 Restore uses merge semantics, overwrites configs with
 matching names, and first creates a rollback backup when the destination
@@ -441,6 +486,7 @@ Set `network.tcp.preset: "legacy"` on both sides to restore the old wire behavio
 | 6 | Connectivity tests |
 | 7 | Optimize (Safe/Auto network + DNS / Mirror) |
 | B | Portable backup, restore, and migration |
+| C | TLS certificate sync across Kharej servers |
 | 8 | **Full uninstall** |
 | 9 | Telegram bot |
 | 10 | Exit |
@@ -465,7 +511,7 @@ wildpaqet
 # option 8 → type YES
 ```
 
-Removes **all** script/tunnel artifacts: services, cron, core + internal binary backups, `$INSTALL_DIR`, the Core v3 source tree, the isolated Go toolchain, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, managed iptables/NAT rules, tracked UFW/firewalld allowances, `/root/paqet`, `/root/paqet-backups`, state under `/var/lib/wildpaqet`, and temporary build files. Portable migration archives under `/root/wildpaqet-portable-backups` are deliberately preserved. The final verifier reports any managed artifact that could not be removed. A separate opt-in prompt can flush untracked legacy/non-WildPaqet NAT rules.
+Removes **all** script/tunnel artifacts: services, cron, core + internal binary backups, `$INSTALL_DIR`, the Core v3 source tree, the isolated Go toolchain, configs, `wildpaqet` / legacy links, Telegram bot, script sysctl/limits, managed iptables/NAT rules, tracked UFW/firewalld allowances, `/root/paqet`, `/root/paqet-backups`, state under `/var/lib/wildpaqet`, certificate-sync scripts, key and cron, and temporary build files. Portable migration archives under `/root/wildpaqet-portable-backups` are asked about separately, because the archive is also the migration path off this host. The final verifier reports any managed artifact that could not be removed. A separate opt-in prompt can flush untracked legacy/non-WildPaqet NAT rules.
 
 Network optimizer cleanup during uninstall is **snapshot-aware**: it restores the oldest `/var/lib/wildpaqet/netopt/snap-*` as the true pre-WildPaqet baseline, including prior sysctl/limits files, captured runtime sysctl values, and qdisc kinds changed by the optimizer. It then removes the `wildpaqet-qdisc.service` boot unit and snapshot store without forcing `fq_codel`, `cubic`, or `pfifo_fast`. The NAT helper likewise restores a pre-existing `30-ip_forward.conf` instead of deleting user content.
 

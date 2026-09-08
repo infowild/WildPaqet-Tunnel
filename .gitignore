@@ -11,6 +11,7 @@ tests/
 # Published manager regression tests used by GitHub Actions.
 !.github/tests/
 !.github/tests/pairing-code.sh
+!.github/tests/cert-sync.sh
 
 # Security-critical v3 transport tests are part of the published source.
 !core/internal/client/endpoint_pool_test.go

@@ -63,6 +63,9 @@ jobs:
       - name: Test manager hardening (cover path, YAML, firewall, self-update)
         run: bash .github/tests/manager-hardening.sh
 
+      - name: Test TLS certificate sync between Kharej servers
+        run: bash .github/tests/cert-sync.sh
+
       - name: Test HTTP/2 cover at packet level
         working-directory: core
         run: go test -count=1 -run 'TestH2Cover(PacketLevelUsesRealPrefaceAndFrames|ClientHelloExposesOnlyPublicSNIAndALPN|TransportRoundTripAndDecoy)' ./internal/tnet/tls
