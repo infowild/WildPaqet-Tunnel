@@ -5,6 +5,7 @@
 **تونل پوششی HTTP/2 واقعی روی TLS با سازگاری Direct-TLS و Raw-KCP**
 
 [![Version](https://img.shields.io/badge/version-9.16--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Core](https://img.shields.io/badge/core-v3.4.1--wildpaqet-1B4332?style=for-the-badge)](./core)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 
@@ -109,6 +110,29 @@ export PATH="/usr/local/bin:$PATH" && hash -r
 
 ---
 
+## پایداری ترنسپورت در Core v3.4.1
+
+شاخهٔ v3 اکنون **WildPaqet Core v3.4.1** را می‌سازد. این انتشار بازیابی
+endpointها را اصلاح می‌کند، عمر نشست‌های اشتراکی HTTP/2 را به supervisor پس‌زمینه
+می‌سپارد تا deadline اتصال یک کاربر آن‌ها را نبندد، و تعداد setupهای معطل هر
+forwarder را به‌طور پیش‌فرض به ۲۵۶ اتصال با timeout پانزده‌ثانیه‌ای محدود می‌کند.
+relayهای فعال slot معطل مصرف نمی‌کنند و با این timeout قطع نمی‌شوند.
+
+فاصلهٔ heartbeat در H2 برای هر probe دوباره انتخاب می‌شود و هنگام وجود ترافیک
+خروجی، NOP اضافی فرستاده نمی‌شود. پچ همراه smux v1.5.53 قالب wire را تغییر
+نمی‌دهد؛ با این حال مقدار `smux_version` باید در دو سمت یکسان باشد.
+
+مقدار `tls.mode` اکنون باید صریح باشد. برای نصب قدیمی legacy در هر دو سمت
+`mode: direct` را نگه دار. فقط وقتی هر دو peer برای ترنسپورت HTTP/2 آماده‌اند
+از `mode: h2` استفاده کن. `decoy_url` خالی پاسخ استاندارد ۴۰۴ می‌دهد، خرابی
+backend تنظیم‌شده پاسخ ۵۰۲ دارد و CONNECT احرازنشده نیز با ۴۰۴ رد می‌شود.
+
+پیش از ارتقای دو سمت، [راهنمای پایداری و ارتقای v3.4.1](docs/V3-RESILIENCE.md)
+را بخوان. این اصلاحات نرم‌افزاری علت مسدودشدن شبکه را اثبات نمی‌کنند و تضمین
+غیرقابل‌شناسایی‌بودن توسط DPI نیستند.
+
+---
+
 ## بکاپ، ریستور و انتقال به سرور جدید (9.16-v3)
 
 در منوی اصلی کلید **`B`** را بزن. بکاپ قابل‌حمل شامل تمام کانفیگ‌ها و
@@ -157,7 +181,7 @@ IP یا DNS کلاینت‌ها را جابه‌جا کن.
 
 کانفیگ جدید `tls.mode: h2` با SNI قابل‌مشاهده، ALPN استاندارد `h2` و ClientHello پوششی uTLS وارد TLS می‌شود و سپس واقعاً preface، SETTINGS و frameهای HTTP/2 را می‌فرستد. smux داخل بدنهٔ دوطرفه و احرازشدهٔ یک درخواست استاندارد HTTP/2 `CONNECT` قرار می‌گیرد. این روش WebSocket نیست و برخلاف نسخهٔ قبلی، `h2` را اعلام نمی‌کند که بلافاصله پروتکل خصوصی دیگری صحبت کند.
 
-درخواست یا probe نامعتبر یک صفحهٔ معمولی داخلی یا وب‌سایت decoy محلی می‌بیند. احراز هویت تونل داخل TLS و با HMAC متصل به cover path مبهم، timestamp و nonce تصادفی انجام می‌شود؛ replay و اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شوند. برای مقاومت در برابر active probe، certificate عمومی معتبر قویاً توصیه می‌شود؛ self-signed همچنان برای probe قابل‌مشاهده است.
+درخواست HTTP معمولی به وب‌سایت محلی تنظیم‌شده می‌رسد یا پاسخ استاندارد ۴۰۴ می‌گیرد؛ CONNECT احرازنشده با ۴۰۴ رد می‌شود و خرابی backend پاسخ ۵۰۲ می‌دهد. احراز هویت تونل داخل TLS و با HMAC متصل به cover path مبهم، timestamp و nonce تصادفی انجام می‌شود؛ replay و اختلاف ساعت بیش از دو دقیقه fail-closed رد می‌شوند. برای مقاومت در برابر active probe، certificate عمومی معتبر قویاً توصیه می‌شود؛ self-signed همچنان برای probe قابل‌مشاهده است.
 
 فایل‌های certificate و key هنگام handshake جدید بررسی می‌شوند و اگر Certbot/ACME آن‌ها را جایگزین کرده باشد خودکار reload می‌شوند؛ تمدید معمول certificate به restart کردن Paqet نیاز ندارد.
 
@@ -404,5 +428,3 @@ MIT
 **WildPaqet** · [InfoWild](https://github.com/infowild)
 
 </div>
-
-جزئیات اصلاحات نسخهٔ ۳٫۴٫۱ و نحوهٔ ارتقا در [راهنمای اصلاحات](docs/V3-RESILIENCE.md) آمده است. صفحهٔ Welcome مشترک حذف شده؛ نبود سایت پوششی پاسخ استاندارد ۴۰۴ و خرابی آن پاسخ ۵۰۲ می‌دهد.

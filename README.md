@@ -5,6 +5,7 @@
 **Real HTTP/2-covered TLS tunnel with direct-TLS and raw-KCP compatibility**
 
 [![Version](https://img.shields.io/badge/version-9.16--v3-0B6E4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/tree/wild-paqet-v3)
+[![Core](https://img.shields.io/badge/core-v3.4.1--wildpaqet-1B4332?style=for-the-badge)](./core)
 [![License](https://img.shields.io/badge/license-MIT-1B4332?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
 [![Shell](https://img.shields.io/badge/shell-bash-081C15?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel/blob/wild-paqet-v3/wildpaqet.sh)
 [![Platform](https://img.shields.io/badge/platform-Linux-2D6A4F?style=for-the-badge)](https://github.com/infowild/WildPaqet-Tunnel)
@@ -113,6 +114,31 @@ wildpaqet
 > ```bash
 > export PATH="/usr/local/bin:$PATH" && hash -r
 > ```
+
+---
+
+## Core v3.4.1 transport resilience
+
+The v3 branch now builds **WildPaqet Core v3.4.1**. This release fixes endpoint
+recovery, keeps shared HTTP/2 sessions under the background supervisor instead
+of a user's setup deadline, and limits stalled TCP-forward setup work to 256
+pending connections per forwarder with a 15-second default timeout. Active
+relays do not consume pending slots and are not stopped by that setup timeout.
+
+HTTP/2 heartbeat intervals are resampled for every probe and redundant NOPs are
+suppressed while other outbound frames are active. The bundled smux v1.5.53
+patch does not change the wire format; `smux_version` must still match on both
+peers.
+
+`tls.mode` is now required explicitly. Existing legacy deployments must use
+`mode: direct` on both sides. Select `mode: h2` only when both peers are
+configured for the HTTP/2 carrier. An empty `decoy_url` returns standard 404,
+an unavailable configured backend returns 502, and unauthenticated CONNECT
+requests receive 404.
+
+Read the [v3.4.1 resilience and upgrade notes](docs/V3-RESILIENCE.md) before
+updating both peers. These software fixes do not establish the cause of a
+network block or guarantee invisibility to DPI.
 
 ---
 
@@ -482,5 +508,3 @@ MIT — aligned with upstream projects.
 `bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)`
 
 </div>
-
-See [v3.4.1 resilience and upgrade notes](docs/V3-RESILIENCE.md).
