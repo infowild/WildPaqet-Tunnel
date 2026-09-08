@@ -224,8 +224,18 @@ func (tc *timedConn) createTLSConn(ctx context.Context) (tnet.Conn, error) {
 	}
 	var lastErr error
 	for _, addr := range candidates {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if !tc.endpoints.acquire(addr, time.Now()) {
+			continue
+		}
 		conn, err := tlsnet.Dial(ctx, addr, tc.cfg.Transport.TLS)
 		if err != nil {
+			if ctx.Err() != nil {
+				tc.endpoints.release(addr)
+				return nil, ctx.Err()
+			}
 			tc.endpoints.failure(addr, time.Now())
 			lastErr = err
 			flog.Warnf("failed to dial TLS endpoint %s: %v", addr, err)
@@ -235,6 +245,9 @@ func (tc *timedConn) createTLSConn(ctx context.Context) (tnet.Conn, error) {
 		tc.addr = addr
 		flog.Infof("connected to TLS endpoint %s", addr)
 		return conn, nil
+	}
+	if lastErr == nil {
+		lastErr = tc.endpoints.unavailableError(addrs, time.Now())
 	}
 	return nil, lastErr
 }

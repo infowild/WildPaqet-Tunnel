@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -38,8 +39,26 @@ func waitRetry(ctx context.Context, attempt int) error {
 }
 
 func (c *Client) newConn(ctx context.Context) (tnet.Conn, error) {
-	tc := c.iter.Next()
-	return tc.ensureConn(ctx)
+	if len(c.iter.Items) == 0 {
+		return nil, fmt.Errorf("connection pool is empty")
+	}
+	if c.cfg.Transport.Protocol == "tls" {
+		// The supervisor owns the lifetime of shared TLS sessions. A user's
+		// setup deadline must never become the parent of an HTTP/2 session.
+		for range c.iter.Items {
+			tc := c.iter.Next()
+			if !tc.mu.TryLock() {
+				continue
+			}
+			conn := tc.conn
+			tc.mu.Unlock()
+			if conn != nil && !conn.IsClosed() {
+				return conn, nil
+			}
+		}
+		return nil, fmt.Errorf("no healthy TLS pool connection")
+	}
+	return c.iter.Next().ensureConn(ctx)
 }
 
 func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
@@ -65,6 +84,10 @@ func (c *Client) newStrm(ctx context.Context) (tnet.Strm, error) {
 			}
 			attempt++
 			continue
+		}
+		if err := ctx.Err(); err != nil {
+			_ = strm.Close()
+			return nil, err
 		}
 		return strm, nil
 	}

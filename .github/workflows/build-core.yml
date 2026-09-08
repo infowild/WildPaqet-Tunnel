@@ -2,6 +2,12 @@ name: Build WildPaqet Core v3
 
 on:
   workflow_dispatch:
+    inputs:
+      large_transfer:
+        description: Run the 12 GiB per-direction H2 regression
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - wild-paqet-v3
@@ -61,6 +67,21 @@ jobs:
       - name: Test core
         working-directory: core
         run: go test -count=1 ./...
+
+      - name: Test pinned smux and heartbeat scheduling
+        working-directory: core/third_party/smux
+        run: go test -count=1 ./...
+
+      - name: Race-test transport resilience
+        working-directory: core
+        run: go test -race -count=1 ./internal/client ./internal/forward ./internal/tnet/tls
+
+      - name: Test large H2 transfer
+        if: github.event_name == 'workflow_dispatch' && inputs.large_transfer
+        working-directory: core
+        env:
+          WILDPAQET_LARGE_TEST: '1'
+        run: go test -count=1 -run '^TestH2LargeTransfer$' -timeout 12m ./internal/tnet/tls
 
       - name: Vet core
         working-directory: core

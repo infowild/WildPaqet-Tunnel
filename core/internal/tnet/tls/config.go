@@ -143,6 +143,11 @@ func smuxConfig(cfg *conf.TLS) *smux.Config {
 	// MaxStreamBuffer only takes effect on smux v2; v1 silently ignores it.
 	sc.MaxStreamBuffer = cfg.Streambuf
 	sc.KeepAliveInterval = jitterDuration(cfg.KeepAlive, cfg.KeepAliveJitter)
+	if cfg.Mode == "h2" {
+		sc.KeepAliveInterval = cfg.KeepAlive
+		sc.KeepAliveIntervalFunc = func() time.Duration { return jitterDuration(cfg.KeepAlive, cfg.KeepAliveJitter) }
+		sc.KeepAliveOnIdle = true
+	}
 	sc.KeepAliveTimeout = cfg.KeepAliveTimeout
 	return sc
 }

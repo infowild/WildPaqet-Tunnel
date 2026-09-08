@@ -47,11 +47,31 @@ func (p *endpointPool) candidates(addrs []string, preferred int, now time.Time) 
 		if now.Before(state.openUntil) || state.probing {
 			continue
 		}
-		// Only one half-open probe is allowed for an endpoint at a time.
-		state.probing = true
 		result = append(result, addr)
 	}
 	return result
+}
+
+// acquire reserves only the endpoint about to be dialed. Candidate enumeration
+// must not reserve untried fallbacks when an earlier endpoint succeeds.
+func (p *endpointPool) acquire(addr string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	state := p.state(addr)
+	if state.failures < p.threshold {
+		return true
+	}
+	if now.Before(state.openUntil) || state.probing {
+		return false
+	}
+	state.probing = true
+	return true
+}
+
+func (p *endpointPool) release(addr string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.state(addr).probing = false
 }
 
 func (p *endpointPool) success(addr string) {

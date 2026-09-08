@@ -3017,7 +3017,7 @@ configure_v3_tls_server() {
 		pause
 		return 1
 	fi
-	read -r -p "Local decoy website URL [Enter = built-in page]: " decoy_url
+	read -r -p "Local website URL [Enter = standard 404; configure a real site for production]: " decoy_url
 	if [ -n "$decoy_url" ] && [[ ! "$decoy_url" =~ ^https?://[A-Za-z0-9.:[\]-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
 		print_error "Decoy URL must be a simple http(s) URL such as http://127.0.0.1:8080"
 		pause
@@ -5144,7 +5144,14 @@ build_wildpaqet_core_from_source() {
     # git clone often stalls on restricted networks, so fetch the branch tarball
     # over plain HTTPS (direct, then mirror) and keep git only as a last resort.
     local tarball="/tmp/wildpaqet-core-${MANAGER_BRANCH}.tar.gz"
-    local codeload="https://codeload.github.com/${MANAGER_GITHUB_REPO}/tar.gz/refs/heads/${MANAGER_BRANCH}"
+    local source_commit
+    source_commit=$(timeout 45 git ls-remote "https://github.com/${MANAGER_GITHUB_REPO}.git" "refs/heads/${MANAGER_BRANCH}" | awk 'NR == 1 { print $1 }')
+    if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+        print_error "Could not resolve a fixed source commit; retry when GitHub is reachable"
+        pause
+        return 1
+    fi
+    local codeload="https://codeload.github.com/${MANAGER_GITHUB_REPO}/tar.gz/${source_commit}"
     local sources=(
         "$codeload"
         "https://gh-proxy.com/${codeload}"
@@ -5168,7 +5175,9 @@ build_wildpaqet_core_from_source() {
         rm -rf "$CORE_SRC_DIR"
         if GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=30 \
             git clone --depth 1 --branch "$MANAGER_BRANCH" \
-            "https://github.com/${MANAGER_GITHUB_REPO}.git" "$CORE_SRC_DIR"; then
+            "https://github.com/${MANAGER_GITHUB_REPO}.git" "$CORE_SRC_DIR" \
+            && git -C "$CORE_SRC_DIR" fetch --depth 1 origin "$source_commit" \
+            && git -C "$CORE_SRC_DIR" checkout --detach "$source_commit"; then
             fetched=1
         fi
     fi
@@ -5209,8 +5218,9 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
-			-X 'paqet/cmd/version.Version=v3.4.0-wildpaqet' \
+			-X 'paqet/cmd/version.Version=v3.4.1-wildpaqet' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
+            -X 'paqet/cmd/version.GitCommit=${source_commit}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "$build_out" ./cmd/main.go
     )

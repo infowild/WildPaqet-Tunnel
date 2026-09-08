@@ -28,6 +28,9 @@ func TestEndpointCircuitBreakerHalfOpenProbe(t *testing.T) {
 	if !slices.Contains(got, addrs[0]) {
 		t.Fatalf("half-open probe not allowed after cooldown: %v", got)
 	}
+	if !pool.acquire(addrs[0], now.Add(11*time.Second)) {
+		t.Fatal("probe acquisition failed")
+	}
 	got = pool.candidates(addrs, 0, now.Add(12*time.Second))
 	if slices.Contains(got, addrs[0]) {
 		t.Fatalf("second concurrent half-open probe was allowed: %v", got)

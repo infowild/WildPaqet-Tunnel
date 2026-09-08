@@ -41,6 +41,7 @@ func startClient(cfg *conf.Conf) {
 		if err != nil {
 			flog.Fatalf("Failed to initialize Forward: %v", err)
 		}
+		f.SetConnectLimits(ff.ConnectTimeout, ff.MaxPending)
 		if err := f.Start(ctx, ff.Protocol); err != nil {
 			flog.Fatalf("Forward encountered an error: %v", err)
 		}

@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -202,32 +201,23 @@ func (l *h2Listener) DeleteClientTCPF(net.Addr)           {}
 
 func newDecoyHandler(rawURL string) http.Handler {
 	if rawURL != "" {
-		if target, err := url.Parse(rawURL); err == nil {
+		if target, err := url.Parse(rawURL); err == nil && target.Host != "" && (target.Scheme == "http" || target.Scheme == "https") {
 			proxy := httputil.NewSingleHostReverseProxy(target)
+			// Requests are made to an explicitly configured backend, not to the
+			// arbitrary Host supplied by a visitor.
+			director := proxy.Director
+			proxy.Director = func(r *http.Request) {
+				director(r)
+				r.Host = target.Host
+			}
 			proxy.ErrorLog = log.New(io.Discard, "", 0)
 			proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-				serveBuiltInDecoy(w)
+				http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 			}
 			return proxy
 		}
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			http.NotFound(w, r)
-			return
-		}
-		serveBuiltInDecoy(w)
-	})
-}
-
-func serveBuiltInDecoy(w http.ResponseWriter) {
-	const page = "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Welcome</title></head><body><h1>Welcome</h1><p>The service is running.</p></body></html>"
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.WriteHeader(http.StatusOK)
-	_, _ = io.Copy(w, strings.NewReader(page))
+	return http.NotFoundHandler()
 }
 
 const (

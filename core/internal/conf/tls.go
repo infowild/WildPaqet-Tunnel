@@ -32,7 +32,6 @@ const (
 
 const (
 	defaultTLSALPN      = "h2"
-	defaultTLSMode      = "direct"
 	defaultTLSCoverPath = "/api/v1/events"
 )
 
@@ -82,9 +81,6 @@ type TLS struct {
 }
 
 func (t *TLS) setDefaults() {
-	if t.Mode == "" {
-		t.Mode = defaultTLSMode
-	}
 	if t.ALPN == "" {
 		t.ALPN = defaultTLSALPN
 	}
@@ -155,7 +151,7 @@ func (t *TLS) setDefaults() {
 func (t *TLS) validate(role string) []error {
 	var errors []error
 	if !slices.Contains([]string{"direct", "h2"}, t.Mode) {
-		errors = append(errors, fmt.Errorf("TLS mode must be one of: direct, h2"))
+		errors = append(errors, fmt.Errorf("TLS mode must be explicitly set to h2 or direct (legacy)"))
 	}
 	if len(t.Secret) < 32 {
 		errors = append(errors, fmt.Errorf("TLS secret must be at least 32 characters"))
@@ -176,6 +172,9 @@ func (t *TLS) validate(role string) []error {
 		errors = append(errors, fmt.Errorf("TLS keepalive_timeout must be greater than keepalive and at most 900 seconds"))
 	}
 	if t.Mode == "h2" {
+		if t.KeepAliveTimeout_ <= 2*(t.KeepAlive_+t.KeepAliveJitter_) {
+			errors = append(errors, fmt.Errorf("TLS keepalive_timeout must exceed twice (keepalive plus keepalive_jitter) for idle heartbeats"))
+		}
 		if t.ALPN != "h2" {
 			errors = append(errors, fmt.Errorf("TLS h2 mode requires alpn %q", defaultTLSALPN))
 		}

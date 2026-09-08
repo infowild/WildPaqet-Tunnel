@@ -27,7 +27,7 @@ On each Kharej host:
 2. Use TCP port `443` when it is free.
 3. Use a publicly trusted certificate and a DNS name that resolves to the server. A self-signed certificate is retained for testing but is visible to an active probe. The wizard reuses a still-valid public certificate for the domain you enter, or requests one from Let's Encrypt with acme.sh/certbot (HTTP-01 on TCP/80) and then locates the issued files automatically.
 4. Use the same certificate name and 32+ character shared secret on all four servers. The wizard then derives the same opaque HTTP/2 cover path automatically. The path is pairing metadata, not an authentication secret.
-5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a built-in page is served.
+5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a standard 404 is served. Configure a real site for production; backend outages return 502 instead of a shared welcome page.
 6. Keep each private key on its own server.
 7. Copy the `WPQ4` pairing code printed by the wizard. A code that carries a certificate chain is longer than a terminal can accept on one line, so it is printed as a block of 120-character lines that ends with `WPQEND`; copy the whole block. It is also saved beside the certificate as `pairing-code.txt`, which can be copied to Iran with `scp` instead.
 
@@ -142,7 +142,7 @@ those before assuming the path is at fault.
 - Visible SNI and ALPN `h2` are followed by the standards-required HTTP/2 preface, SETTINGS and DATA frames.
 - The server certificate is verified against the configured CA bundle or system trust store.
 - HTTP/2 cover mode requires SNI. A publicly trusted certificate is recommended for active-probe resistance.
-- Invalid probes receive a built-in page or optional local decoy website rather than a tunnel-specific close pattern.
+- Ordinary requests reach the configured local website (or standard 404); unauthenticated CONNECT requests receive 404. Backend errors return 502.
 - An encrypted HMAC bearer token binds the opaque path, timestamp and random nonce.
 - Timestamps outside a two-minute window and reused nonces are rejected before smux starts.
 - Authentication and ALPN negotiation fail closed.
@@ -155,3 +155,13 @@ Keep the Iran and Kharej clocks synchronized with systemd-timesyncd, chrony, or 
 ## Firewall
 
 v3 uses normal kernel TCP. Do not install the pcap transport's `NOTRACK` or TCP RST-drop rules on the TLS port. The v3 wizard only opens an ordinary TCP input rule.
+
+
+## v3.4.1 resilience update
+
+Read [V3-RESILIENCE.md](V3-RESILIENCE.md) before upgrading. Explicit `tls.mode`
+is now required: preserve `direct` for existing legacy peers, or use `h2` on
+both sides for the real HTTP/2 carrier. Do not silently change old peers.
+The heartbeat remains wire-compatible with the same smux version. The local
+smux snapshot supplies per-probe jitter and idle-only NOPs for H2; its wire
+format is unchanged. Direct TLS and KCP retain their previous scheduling.

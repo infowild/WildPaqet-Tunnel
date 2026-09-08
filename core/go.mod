@@ -26,3 +26,6 @@ require (
 	golang.org/x/text v0.40.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
+
+// Wire-compatible smux heartbeat scheduling patch; see third_party/smux/UPSTREAM.md.
+replace github.com/xtaci/smux => ./third_party/smux

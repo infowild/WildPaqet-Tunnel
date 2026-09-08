@@ -29,6 +29,7 @@ server:
 transport:
   protocol: tls
   tls:
+    mode: direct
     ca_file: %q
     secret: "0123456789abcdef0123456789abcdef"
 `, caFile)
@@ -67,6 +68,7 @@ listen:
 transport:
   protocol: tls
   tls:
+    mode: direct
     cert_file: %q
     key_file: %q
     secret: "0123456789abcdef0123456789abcdef"
@@ -357,5 +359,22 @@ func TestBufferDefaultsBalanceThroughputAgainstLatency(t *testing.T) {
 	}
 	if defaultStreambuf > defaultSmuxbuf {
 		t.Fatalf("streambuf %d exceeds smuxbuf %d; smux rejects that pairing", defaultStreambuf, defaultSmuxbuf)
+	}
+}
+
+func TestTLSModeMustBeExplicit(t *testing.T) {
+	cfg := baseH2ClientConfig()
+	cfg.Mode = ""
+	cfg.setDefaults()
+	if !hasErrorContaining(cfg.validate("client"), "explicitly set") {
+		t.Fatal("missing mode silently accepted")
+	}
+}
+
+func TestHeartbeatTimeoutIncludesJitter(t *testing.T) {
+	cfg := baseH2ClientConfig()
+	cfg.KeepAliveTimeout_ = cfg.KeepAlive_ + cfg.KeepAliveJitter_
+	if !hasErrorContaining(cfg.validate("client"), "plus keepalive_jitter") {
+		t.Fatal("heartbeat can exceed liveness budget")
 	}
 }

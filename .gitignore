@@ -35,3 +35,10 @@ _review_*
 *.local.md
 .env
 .env.*
+
+# Transport resilience regression tests and pinned dependency tests.
+!core/internal/client/resilience_test.go
+!core/internal/forward/tcp_test.go
+!core/internal/conf/forward_test.go
+!core/internal/tnet/tls/resilience_test.go
+!core/third_party/smux/*_test.go

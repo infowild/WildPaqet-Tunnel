@@ -196,7 +196,7 @@ DNS.
 
 New `tls.mode: h2` configurations negotiate TLS with visible SNI, ALPN `h2`, and a uTLS ClientHello, then send the standards-required HTTP/2 preface, SETTINGS and DATA frames. Smux remains inside one authenticated, full-duplex HTTP/2 `CONNECT` request. This is not WebSocket and does not falsely advertise HTTP/2 while speaking a private protocol immediately after TLS.
 
-Unknown or unauthenticated HTTP requests receive a normal built-in page or an optional local decoy website. Tunnel authentication is an encrypted HMAC token bound to the opaque cover path, timestamp and random nonce. Replays and timestamps outside the two-minute window fail closed. A publicly trusted certificate is strongly recommended because a self-signed certificate remains visible to an active probe.
+Ordinary HTTP requests receive the configured local website or standard 404; unauthenticated CONNECT receives 404. A failed website backend returns 502, never a shared welcome page. Tunnel authentication is an encrypted HMAC token bound to the opaque cover path, timestamp and random nonce. Replays and timestamps outside the two-minute window fail closed. A publicly trusted certificate is strongly recommended because a self-signed certificate remains visible to an active probe.
 
 Certificate and key files are checked on each new TLS handshake and reloaded after ACME/Certbot replaces them; routine certificate renewal therefore does not require a Paqet restart.
 
@@ -482,3 +482,5 @@ MIT — aligned with upstream projects.
 `bash <(curl -fsSL https://raw.githubusercontent.com/infowild/WildPaqet-Tunnel/wild-paqet-v3/wildpaqet.sh)`
 
 </div>
+
+See [v3.4.1 resilience and upgrade notes](docs/V3-RESILIENCE.md).

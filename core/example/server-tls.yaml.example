@@ -19,7 +19,7 @@ transport:
     secret: "replace-with-at-least-32-random-characters"
     alpn: "h2"
     cover_path: "/api/v1/change-this/events"
-    # Optional real local site. Empty uses the built-in decoy page.
+    # Real local site. Empty returns standard 404; backend errors return 502.
     decoy_url: "http://127.0.0.1:8080"
     connect_timeout: 10
     handshake_timeout: 10

@@ -6,15 +6,20 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"paqet/internal/client"
 	"paqet/internal/flog"
+	"paqet/internal/tnet"
 )
 
 type Forward struct {
-	client     *client.Client
-	listenAddr string
-	targetAddr string
+	dialTCP        func(context.Context, string) (tnet.Strm, error)
+	client         *client.Client
+	pending        chan struct{}
+	connectTimeout time.Duration
+	listenAddr     string
+	targetAddr     string
 
 	udpMu   sync.RWMutex
 	udpPool map[netip.AddrPort]*udpSess
@@ -22,10 +27,13 @@ type Forward struct {
 
 func New(client *client.Client, listenAddr, targetAddr string) (*Forward, error) {
 	return &Forward{
-		client:     client,
-		listenAddr: listenAddr,
-		targetAddr: targetAddr,
-		udpPool:    make(map[netip.AddrPort]*udpSess),
+		client:         client,
+		dialTCP:        client.TCP,
+		pending:        make(chan struct{}, 256),
+		connectTimeout: 15 * time.Second,
+		listenAddr:     listenAddr,
+		targetAddr:     targetAddr,
+		udpPool:        make(map[netip.AddrPort]*udpSess),
 	}, nil
 }
 
@@ -71,4 +79,15 @@ func (f *Forward) startUDP(ctx context.Context) error {
 	context.AfterFunc(ctx, func() { conn.Close() })
 
 	return nil
+}
+
+// SetConnectLimits must be called before Start. Active relays do not consume
+// pending slots and are not subject to the setup timeout.
+func (f *Forward) SetConnectLimits(timeout time.Duration, maximum int) {
+	if timeout > 0 {
+		f.connectTimeout = timeout
+	}
+	if maximum > 0 {
+		f.pending = make(chan struct{}, maximum)
+	}
 }

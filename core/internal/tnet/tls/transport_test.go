@@ -28,6 +28,7 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 	secret := "0123456789abcdef0123456789abcdef"
 	serverCfg := testTLSConfig(secret)
 	serverCfg.Mode = "h2"
+	serverCfg.SmuxVersion = 2
 	serverCfg.ServerName = "cover.example.test"
 	serverCfg.CoverPath = "/api/v1/test/events"
 	serverCfg.CertFile = certFile
@@ -60,6 +61,7 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 
 	clientCfg := testTLSConfig(secret)
 	clientCfg.Mode = "h2"
+	clientCfg.SmuxVersion = 2
 	clientCfg.ServerName = "cover.example.test"
 	clientCfg.SendServerName = true
 	clientCfg.CoverPath = serverCfg.CoverPath
@@ -116,8 +118,8 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 		t.Fatalf("decoy request: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 {
-		t.Fatalf("decoy = %s over %s, want 200 over h2", resp.Status, resp.Proto)
+	if resp.StatusCode != http.StatusNotFound || resp.ProtoMajor != 2 {
+		t.Fatalf("decoy = %s over %s, want 404 over h2", resp.Status, resp.Proto)
 	}
 
 	h1Client := &http.Client{Transport: &http.Transport{
@@ -133,7 +135,7 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 		t.Fatalf("HTTP/1.1 decoy request: %v", err)
 	}
 	defer h1Resp.Body.Close()
-	if h1Resp.StatusCode != http.StatusOK || h1Resp.ProtoMajor != 1 {
+	if h1Resp.StatusCode != http.StatusNotFound || h1Resp.ProtoMajor != 1 {
 		t.Fatalf("HTTP/1.1 decoy = %s over %s", h1Resp.Status, h1Resp.Proto)
 	}
 }
