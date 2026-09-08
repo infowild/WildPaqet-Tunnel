@@ -7,9 +7,33 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer records the wire for a test that reads it from a different
+// goroutine than the relay writing it. A bare bytes.Buffer is a data race there
+// even when the read happens after the last write in practice, and -race is
+// right to say so.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// Bytes returns a copy: handing back the buffer's own slice would let the
+// caller read it while the relay is still appending.
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
 
 func TestStealthRoundTrip(t *testing.T) {
 	secret := "0123456789abcdef0123456789abcdef"
@@ -172,7 +196,7 @@ func TestStealthWireHasNoProtocolMarkers(t *testing.T) {
 		}
 	}()
 
-	var captured bytes.Buffer
+	var captured syncBuffer
 	relay, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -211,14 +235,23 @@ func TestStealthWireHasNoProtocolMarkers(t *testing.T) {
 	s.Close()
 	conn.Close()
 
-	wire := captured.String()
+	// Let the relay finish before reading what it recorded, so the assertions
+	// run against the whole client-to-server side rather than however much of
+	// it happened to have arrived.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the relay did not finish after the client closed")
+	}
+
+	raw := captured.Bytes()
+	wire := string(raw)
 	for _, marker := range []string{"wildpaqet", "WPQ", "h2", "http"} {
 		if strings.Contains(wire, marker) {
 			t.Fatalf("client-to-server bytes contain the marker %q", marker)
 		}
 	}
 	// A TLS record header would start 0x16 0x03; the Noise handshake must not.
-	raw := captured.Bytes()
 	if len(raw) > 2 && raw[0] == 0x16 && raw[1] == 0x03 {
 		t.Fatal("the first bytes look like a TLS record header")
 	}

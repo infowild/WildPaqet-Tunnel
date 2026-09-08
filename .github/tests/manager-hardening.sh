@@ -10,6 +10,14 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 failures=0
 fail() { echo "FAIL: $*" >&2; failures=$((failures + 1)); }
 
+# A section keeps running after a failed assertion so one run reports every
+# problem rather than only the first. That is worth keeping, but it means the
+# trailing "ok" has to be earned: printing it under a FAIL, as this did, makes
+# the log say a section passed on the line after it failed.
+section_mark=0
+sec() { section_mark=$failures; echo "== $* =="; }
+ok() { if [ "$failures" -eq "$section_mark" ]; then echo "  ok"; else echo "  FAILED"; fi; }
+
 work=$(mktemp -d /tmp/wildpaqet-hardening.XXXXXX)
 cleanup() { case "$work" in /tmp/wildpaqet-hardening.*) rm -rf -- "$work" ;; esac; }
 trap cleanup EXIT
@@ -23,7 +31,7 @@ mkdir -p "$work/state" "$work/backups" "$work/bin"
 # shellcheck source=/dev/null
 source "$repo_root/wildpaqet.sh"
 
-echo "== cover_path agrees with the core validator =="
+sec "cover_path agrees with the core validator"
 for good in /api/v1/events /api/v1/ab12cd34/events /a/b/c; do
     v3_validate_cover_path "$good" || fail "cover_path rejected a valid path: $good"
 done
@@ -32,9 +40,9 @@ done
 for bad in /api/v1/events/ /. /a/./b /a/../b /a//b / "" no-leading-slash; do
     if v3_validate_cover_path "$bad"; then fail "cover_path accepted an invalid path: $bad"; fi
 done
-echo "  ok"
+ok
 
-echo "== YAML escaping keeps a secret parseable =="
+sec "YAML escaping keeps a secret parseable"
 raw='abc"def'
 esc=$(yaml_escape_dq "$raw")
 [ -n "$esc" ] || fail "yaml_escape_dq produced nothing for quote"
@@ -54,9 +62,9 @@ s=$(yaml_escape_dq 'a\b')
 [ "$s" = 'a\\b' ] || fail "backslash not doubled: $s"
 yaml_value_is_safe "normal" || fail "yaml_value_is_safe rejected a normal value"
 yaml_value_is_safe "$(printf 'a\tb')" && fail "yaml_value_is_safe accepted a tab"
-echo "  ok"
+ok
 
-echo "== firewall cleanup removes udp rules too =="
+sec "firewall cleanup removes udp rules too"
 cat > "$work/bin/ufw" <<'STUB'
 #!/bin/bash
 [ "$1" = "show" ] && { cat "$UFW_DB"; exit 0; }
@@ -75,9 +83,9 @@ grep -q "8443/udp" "$UFW_DB" && fail "udp allowance survived cleanup"
 grep -q "443/tcp" "$UFW_DB" && fail "tcp allowance survived cleanup"
 grep -q "22/tcp" "$UFW_DB" || fail "cleanup removed an administrator rule it does not own"
 [ -f "$WILDPAQET_FIREWALL_STATE_FILE" ] && fail "firewall state file survived a complete cleanup"
-echo "  ok"
+ok
 
-echo "== self-update refuses a non-manager download =="
+sec "self-update refuses a non-manager download"
 cat > "$work/bin/curl" <<'STUB'
 #!/bin/bash
 out=""; prev=""
@@ -87,15 +95,23 @@ exit 0
 STUB
 chmod +x "$work/bin/curl"
 cp "$repo_root/wildpaqet.sh" "$WILDPAQET_MANAGER_PATH"
+# Every real install path chmods the manager, and is_manager_binary_ok checks
+# for it. The mode in git is 644, so a bare cp produces a copy that is already
+# invalid on Linux while looking fine on Windows, where every file reads as
+# executable - the assertion below would then blame the code under test for a
+# broken fixture.
+chmod +x "$WILDPAQET_MANAGER_PATH"
+is_manager_binary_ok "$WILDPAQET_MANAGER_PATH" \
+    || fail "fixture: the installed manager is not valid before the update even runs"
 before=$(wc -c < "$WILDPAQET_MANAGER_PATH")
 printf '\n' | update_manager_script >/dev/null 2>&1 || true
 after=$(wc -c < "$WILDPAQET_MANAGER_PATH")
 [ "$before" = "$after" ] || fail "a captive-portal response replaced the installed manager"
 is_manager_binary_ok "$WILDPAQET_MANAGER_PATH" || fail "installed manager is no longer valid"
 ls "$work"/installed-manager.update.* >/dev/null 2>&1 && fail "a staged download was left behind"
-echo "  ok"
+ok
 
-echo "== stealth wizard emits a config the core accepts =="
+sec "stealth wizard emits a config the core accepts"
 for fn in v3_stealth_warning v3_stealth_read_secret v3_stealth_emit_tls_block configure_v3_stealth_server configure_v3_stealth_client prompt_v3_padding; do
     declare -F "$fn" >/dev/null || fail "missing function: $fn"
 done
@@ -107,9 +123,9 @@ for key in alpn cover_path cert_file key_file ca_file server_name send_server_na
     grep -q "$key" <<< "$block" && fail "stealth block should not carry $key"
 done
 grep -q 'smux_version:' <<< "$block" || fail "stealth block has no smux_version"
-echo "  ok"
+ok
 
-echo "== padding is opt-in and defaults to off =="
+sec "padding is opt-in and defaults to off"
 # A here-string keeps the prompt in this shell; a pipe would run it in a
 # subshell and the variable it sets would never come back.
 V3_PADDING=""
@@ -119,7 +135,7 @@ prompt_v3_padding <<< "n" >/dev/null 2>&1
 [ "$V3_PADDING" = "false" ] || fail "n did not leave padding off (got: $V3_PADDING)"
 prompt_v3_padding <<< "y" >/dev/null 2>&1
 [ "$V3_PADDING" = "true" ] || fail "y did not enable padding (got: $V3_PADDING)"
-echo "  ok"
+ok
 
 if [ "$failures" -ne 0 ]; then
     echo "manager-hardening: $failures failure(s)" >&2

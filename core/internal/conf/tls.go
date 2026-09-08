@@ -54,7 +54,7 @@ type TLS struct {
 	// the fixed-size smux keepalive stops being a constant on the wire. It is a
 	// framing change between the two smux endpoints, so both ends must set it;
 	// a mismatch drops the session rather than degrading quietly.
-	Padding        bool   `yaml:"padding"`
+	Padding bool `yaml:"padding"`
 
 	ConnectTimeout_      int `yaml:"connect_timeout"`
 	HandshakeTimeout_    int `yaml:"handshake_timeout"`
