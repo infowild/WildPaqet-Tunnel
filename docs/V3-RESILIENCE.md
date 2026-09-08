@@ -27,7 +27,7 @@ Iran IP block and does not promise DPI invisibility.
 - `tls.mode` must be explicit. Omitted mode now fails validation before startup
   rather than silently selecting the legacy direct carrier.
 - The manager pins source downloads to a resolved Git commit and embeds that
-  commit in the binary's version output. The core version is v3.5.0-wildpaqet.
+  commit in the binary's version output. The core version is v3.5.1-wildpaqet.
 
 ## Before updating servers
 

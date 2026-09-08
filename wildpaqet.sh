@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.18-v3"
+readonly SCRIPT_VERSION="9.19-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="${WILDPAQET_MANAGER_PATH:-${WILDPAQET_BIN_DIR:-/usr/local/bin}/$MANAGER_NAME}"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -920,27 +920,49 @@ config_tls_mode() {
 # Oversizing shows up as ping and jitter climbing whenever the tunnel is busy,
 # measurably so on a path with deep buffers - which is most consumer routes.
 #
-# 8 MiB / 4 MiB is the middle of that trade: about 340 Mbps for one flow at
-# 100 ms RTT without the standing queue a larger streambuf builds. The wizard
-# prints both sides so the operator can move it deliberately.
+# A third constraint decides streambuf on a busy server, and it outranks both
+# of the above: smuxbuf is a token bucket for the whole smux session, shared by
+# every user on that outer connection, and streambuf is the most one stream may
+# hold. Unread bytes keep their tokens, so smuxbuf/streambuf is exactly how many
+# stalled streams it takes to empty the bucket - and an empty bucket stops smux
+# reading the connection for *everyone*, not only for the stalled streams.
+#
+# Measured with 20 active streams sharing one session (throughput of the active
+# streams as stalled streams are added):
+#
+#   8 MiB / 4 MiB     1 stalled: 99%   2 stalled: 0%    6 stalled: 0%
+#   8 MiB / 512 KiB   1 stalled: 97%   2 stalled: 96%   6 stalled: 99%
+#
+# The old 2:1 ratio meant two users who stop reading - a paused video, a closed
+# laptop - froze every other user on that connection. The presets below are 16:1
+# so it takes sixteen simultaneous stalls to do the same.
+#
+# The cost is the single-flow ceiling (streambuf/RTT): 42 Mbps per flow at
+# 100 ms instead of 340. On a server carrying many users the link is the limit,
+# not the window, so this is invisible there; a single-user install on a fast
+# path can raise streambuf by hand. The two ends never have to match - each
+# advertises its own window - so this is safe to roll out one server at a time.
 #
 # Worst-case memory is roughly 2 x smuxbuf per outer connection on the Kharej
 # side (smux buffers plus the HTTP/2 receive window).
 readonly V3_SMUXBUF_SMALL=4194304
-readonly V3_STREAMBUF_SMALL=2097152
+readonly V3_STREAMBUF_SMALL=262144
 readonly V3_SMUXBUF_LARGE=8388608
-readonly V3_STREAMBUF_LARGE=4194304
+readonly V3_STREAMBUF_LARGE=524288
 readonly V3_DEFAULT_SMUX_VERSION=2
 
 # Values earlier managers wrote that are now known to be wrong: 9.13-v3 sized
-# them for a LAN (too slow), and the first 9.14 attempt sized them purely for
-# throughput (too much standing queue). Both are replaced on migration; any
-# other value is treated as operator intent and left alone.
+# them for a LAN (too slow), the first 9.14 attempt sized them purely for
+# throughput (too much standing queue), and 9.14-9.18 shipped a 2:1
+# smuxbuf/streambuf ratio that lets two stalled users freeze a whole outer
+# connection. All are replaced on migration; any other value is treated as
+# operator intent and left alone.
 # Format: smuxbuf|streambuf
 v3_stale_buffer_pairs() {
     cat <<'EOF'
 4194304|2097152
 16777216|8388608
+8388608|4194304
 EOF
 }
 
@@ -1022,8 +1044,21 @@ ${CYAN}What it costs in latency${NC}"
     echo -e "  The core caps the unsent backlog per socket (TCP_NOTSENT_LOWAT), which"
     echo -e "  should keep the real figure far below it. Confirm on a busy tunnel with:"
     echo -e "    ${CYAN}ss -tim dst <kharej-ip> | grep -o 'notsent_lowat:[0-9]*'${NC}"
-    echo -e "  If ping under load is still high, lower ${CYAN}streambuf${NC} on both ends;"
-    echo -e "  raise it on a fast, well-buffered path when bulk speed matters more."
+    echo -e "  If ping under load is still high, lower ${CYAN}streambuf${NC}. Each side"
+    echo -e "  advertises its own window, so the two ends do not have to match and you"
+    echo -e "  can change one server at a time."
+
+    echo -e "
+${CYAN}How many stalled users it survives${NC}"
+    echo -e "  smuxbuf is a token bucket for the whole outer connection and streambuf is"
+    echo -e "  what one user may hold, so their ratio is how many users who stop reading"
+    echo -e "  it takes to stop that connection ${YELLOW}for everyone on it${NC}."
+    printf "    %-36s %s users
+" "stalled users tolerated" "$(( smuxbuf / streambuf ))"
+    if [ "$(( smuxbuf / streambuf ))" -lt 16 ]; then
+        print_warning "Under 16 is risky on a busy server: measured, a 2:1 ratio froze"
+        print_warning "every other user as soon as two of them paused a download."
+    fi
 
     local budget_mib ram_mb
     budget_mib=$(( smuxbuf * 2 * conn / 1024 / 1024 ))
@@ -6905,9 +6940,24 @@ net.ipv4.tcp_wmem
 net.ipv4.tcp_congestion_control
 net.ipv4.tcp_slow_start_after_idle
 net.ipv4.tcp_mtu_probing
+net.ipv4.tcp_max_syn_backlog
 net.ipv4.ip_local_port_range
+net.netfilter.nf_conntrack_max
+net.netfilter.nf_conntrack_tcp_timeout_time_wait
+net.netfilter.nf_conntrack_tcp_timeout_established
 fs.file-max
 EOF
+}
+
+# Whether this host has connection tracking loaded. The port-forwarding path
+# uses DNAT/MASQUERADE and the firewall rules match on conntrack state, so the
+# table is on the data path wherever those exist - but a host that has never
+# loaded the module has no such keys, and writing them there would print a
+# warning on every optimizer run for no reason.
+optimizer_conntrack_available() {
+    [ -e /proc/sys/net/netfilter/nf_conntrack_max ] && return 0
+    modprobe nf_conntrack 2>/dev/null || true
+    [ -e /proc/sys/net/netfilter/nf_conntrack_max ]
 }
 
 optimizer_ram_mb() {
@@ -6962,6 +7012,9 @@ optimizer_revert_retired_keys() {
 # Pure helper (also used by tests): print safe profile as "key = value"
 optimizer_build_safe_profile() {
     local ram_mb="${1:-0}"
+    # Off unless the caller says the module is loaded, so the profile stays a
+    # pure function of its arguments for the tests.
+    local conntrack="${2:-0}"
 
     # Receive side is capped just under 8 MiB on purpose.
     #
@@ -6981,6 +7034,9 @@ optimizer_build_safe_profile() {
     local backlog=5000
     local somax=4096
     local file_max=1048576
+    # Roughly 300 bytes per conntrack entry, so these cost about 79 MiB at
+    # 262144 and 40 MiB at 131072.
+    local ct_max=262144
 
     if [ "$ram_mb" -ge 8192 ] 2>/dev/null; then
         wmem_max=33554432
@@ -6988,6 +7044,7 @@ optimizer_build_safe_profile() {
         backlog=10000
         somax=8192
         file_max=2097152
+        ct_max=524288
     elif [ "$ram_mb" -ge 4096 ] 2>/dev/null; then
         wmem_max=25165824
         tcp_wmem_max=25165824
@@ -7001,6 +7058,7 @@ optimizer_build_safe_profile() {
         backlog=2500
         somax=2048
         file_max=524288
+        ct_max=131072
     fi
 
     cat <<EOF
@@ -7024,7 +7082,31 @@ net.ipv4.tcp_wmem = 4096 16384 ${tcp_wmem_max}
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
+# somaxconn is the accept queue; tcp_max_syn_backlog is the half-open queue in
+# front of it. Raising only the first leaves the default 1024 as the real limit
+# on a burst of new connections, so they move together.
+net.ipv4.tcp_max_syn_backlog = ${somax}
 fs.file-max = ${file_max}
+EOF
+
+    [ "$conntrack" = "1" ] || return 0
+    cat <<EOF
+
+# Connection tracking. Port forwarding uses DNAT/MASQUERADE and the managed
+# firewall rules match on conntrack state, so every forwarded flow takes a slot
+# and a closed one keeps it for the TIME_WAIT timeout. When the table fills the
+# kernel logs "nf_conntrack: table full, dropping packet" and drops new flows -
+# which reaches the user as connections that fail at random and looks exactly
+# like filtering, the one failure this project must never imitate by accident.
+#
+# 300 users opening two flows a second hold 300*2*120 = 72000 TIME_WAIT slots at
+# the stock 120 s timeout, which alone overruns a 65536-entry table. Shortening
+# that timeout is what buys the headroom; the larger table is the margin.
+net.netfilter.nf_conntrack_max = ${ct_max}
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30
+# The stock 432000 remembers an idle flow for five days. One day is still far
+# beyond any session that matters here, and the tunnel's own keepalive is 15 s.
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
 EOF
 }
 
@@ -7466,11 +7548,17 @@ apply_kernel_optimizations() {
     snap=$(optimizer_snapshot) || true
     [ -n "$snap" ] && print_success "Snapshot: $snap"
 
-    local ram_mb tmp_sysctl
+    local ram_mb tmp_sysctl conntrack=0
     ram_mb=$(optimizer_ram_mb)
     print_info "Detected RAM: ${ram_mb} MiB"
+    if optimizer_conntrack_available; then
+        conntrack=1
+        print_info "Connection tracking present: sizing the conntrack table too"
+    else
+        print_info "No connection tracking on this host: skipping conntrack keys"
+    fi
     tmp_sysctl=$(mktemp)
-    optimizer_build_safe_profile "$ram_mb" > "$tmp_sysctl"
+    optimizer_build_safe_profile "$ram_mb" "$conntrack" > "$tmp_sysctl"
 
     if ! optimizer_ensure_bbr_module; then
         print_warning "BBR not available; keeping cubic in profile"
@@ -9581,8 +9669,20 @@ cleanup_kernel_optimizations_silent() {
 }
 
 verify_full_uninstall_cleanup() {
+    # The portable backup directory is only a leftover when the operator chose
+    # to remove it; a deliberate keep must not fail the verification.
+    local expect_portable_gone="${1:-1}"
     local leftovers=()
     local path unit table chain
+    if [ "$expect_portable_gone" = "1" ] && [ -e "$PORTABLE_BACKUP_DIR" ]; then
+        leftovers+=("$PORTABLE_BACKUP_DIR")
+    fi
+    for path in "$PORTABLE_BACKUP_DIR"/.portable.* "$PORTABLE_BACKUP_DIR"/.wildpaqet-portable-*.tmp.*; do
+        [ -e "$path" ] && leftovers+=("$path")
+    done
+    for path in "$BIN_DIR"/.paqet.new.*; do
+        [ -e "$path" ] && leftovers+=("$path")
+    done
     for path in \
         "$BIN_DIR/paqet" "$CONFIG_DIR" "$INSTALL_DIR" "$CORE_SRC_DIR" "$GO_TOOLCHAIN_DIR" \
         "$MANAGER_PATH" /usr/local/bin/paqet-manager /usr/bin/paqet /usr/bin/wildpaqet \
@@ -9683,6 +9783,7 @@ uninstall_paqet() {
     echo -e "  • Download cache ${CYAN}/root/paqet${NC} and backups ${CYAN}$BACKUP_DIR${NC}"
     echo -e "  • Temp build/extract files under /tmp/paqet*"
     echo ""
+    echo -e "${CYAN}Asked separately:${NC} portable backups in ${CYAN}$PORTABLE_BACKUP_DIR${NC}"
     echo -e "${CYAN}Optional (asked once):${NC} flush untracked legacy NAT rules"
     echo ""
     echo -e "${RED}Type YES to continue full uninstall:${NC}"
@@ -9789,7 +9890,40 @@ uninstall_paqet() {
     hash -r 2>/dev/null || true
     print_success "Manager command removed (wildpaqet / paqet-manager)"
 
-    # --- 8) Caches, backups, temp artifacts (always for full uninstall) ---
+    # --- 8) Portable backups (asked, because they are also the migration path) ---
+    #
+    # A portable archive carries every config with its secret, the TLS private
+    # keys, the core binary and the manager. Deleting it without asking would
+    # destroy the one thing an operator needs to move to a new server; keeping
+    # it silently would leave the private keys on a host that was just wiped.
+    # So it is asked, defaults to removing, and says which way it went.
+    local portable_removed=0
+    if [ -d "$PORTABLE_BACKUP_DIR" ]; then
+        # Interrupted-run leftovers are never anyone's migration path.
+        rm -rf "$PORTABLE_BACKUP_DIR"/.portable.* 2>/dev/null || true
+        rm -f "$PORTABLE_BACKUP_DIR"/.wildpaqet-portable-*.tmp.* 2>/dev/null || true
+
+        local portable_count portable_size
+        portable_count=$(find "$PORTABLE_BACKUP_DIR" -maxdepth 1 -type f \
+            -name 'wildpaqet-portable-*.tar.gz' 2>/dev/null | wc -l | tr -d ' ')
+        portable_size=$(du -sh "$PORTABLE_BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+        echo ""
+        print_warning "Portable backups hold your secrets and TLS private keys"
+        print_info "$PORTABLE_BACKUP_DIR — ${portable_count:-0} archive(s), ${portable_size:-unknown}"
+        print_info "Keep them only if you are migrating this server somewhere else."
+        read -p "Remove portable backups too? (Y/n): " remove_portable
+        if [[ ! "$remove_portable" =~ ^[Nn]$ ]]; then
+            rm -rf "$PORTABLE_BACKUP_DIR" 2>/dev/null || true
+            portable_removed=1
+            print_success "Portable backups removed"
+        else
+            print_warning "Kept $PORTABLE_BACKUP_DIR — secrets and private keys stay on this host"
+        fi
+    else
+        portable_removed=1
+    fi
+
+    # --- 9) Caches, backups, temp artifacts (always for full uninstall) ---
     print_step "Removing caches, backups, and temp files..."
     rm -rf /root/paqet 2>/dev/null || true
     rm -rf "$BACKUP_DIR" 2>/dev/null || true
@@ -9801,18 +9935,21 @@ uninstall_paqet() {
     rm -f /tmp/wildpaqet-core-* 2>/dev/null || true
     # orphaned mktemp dirs if glob failed on some shells
     find /tmp -maxdepth 1 -type d -name 'paqet-extract.*' -exec rm -rf {} + 2>/dev/null || true
+    # A staged binary only survives here if the manager was killed mid-copy;
+    # atomic_install_binary clears it on both of its own failure paths.
+    rm -f "$BIN_DIR"/.paqet.new.* 2>/dev/null || true
     rmdir "$STATE_DIR" 2>/dev/null || true
     rmdir "$(dirname "$NETOPT_QDISC_SCRIPT")" 2>/dev/null || true
     print_success "Removed /root/paqet, $BACKUP_DIR, and /tmp/paqet* leftovers"
 
-    # --- 9) Persist firewall + reload units ---
+    # --- 10) Persist firewall + reload units ---
     print_step "Reloading systemd and saving firewall rules..."
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed 2>/dev/null || true
     save_iptables >/dev/null 2>&1 || true
 
     local verification_ok=1
-    verify_full_uninstall_cleanup || verification_ok=0
+    verify_full_uninstall_cleanup "$portable_removed" || verification_ok=0
 
     echo ""
     if [ "$verification_ok" -eq 1 ]; then
@@ -9823,6 +9960,12 @@ uninstall_paqet() {
         echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
         echo -e "${RED}⚠ WildPaqet uninstall completed with leftovers (listed above)${NC}"
         echo -e "${RED}══════════════════════════════════════════════════════════════${NC}"
+    fi
+    if [ "$portable_removed" -eq 0 ]; then
+        echo -e "${YELLOW}⚠ Portable backups were kept at${NC} $PORTABLE_BACKUP_DIR"
+        echo -e "${YELLOW}  They contain tunnel secrets and TLS private keys. Move them off this"
+        echo -e "  host and delete the directory once the migration is done.${NC}"
+        echo ""
     fi
     echo -e "${YELLOW}Notes:${NC}"
     echo -e "  • Distro packages (curl, iptables-persistent, golang, libpcap-dev, …) were NOT removed"

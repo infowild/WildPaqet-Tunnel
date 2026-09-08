@@ -21,13 +21,36 @@ import (
 // ping and jitter climbing whenever the tunnel is busy - measurably so on a
 // path with deep buffers, which describes most consumer routes.
 //
-// 8 MiB / 4 MiB is the middle of that trade: roughly 340 Mbps for one flow at
-// 100 ms RTT, without the standing queue that 8 MiB of streambuf builds. Raise
-// them for a fast, well-buffered path; lower them if interactive latency under
-// load matters more than bulk speed.
+// There is a third constraint that the throughput/latency trade above misses,
+// and on a busy server it dominates both: smuxbuf is a token bucket for the
+// whole session, shared by every user on that connection, while streambuf is
+// what a single stream may hold. Unread bytes keep their tokens, so
+// smuxbuf/streambuf is simply how many stalled streams it takes to empty the
+// bucket - and when it is empty smux stops reading the connection for
+// everyone, not just for the stalled streams (third_party/smux/session.go, the
+// recvLoop bucket wait).
+//
+// Measured with 20 active streams on one session, throughput of the active
+// streams as stalled streams are added:
+//
+//	8 MiB / 4 MiB      1 stalled: 99%    2 stalled: 0%    6 stalled: 0%
+//	8 MiB / 1 MiB      1 stalled: 98%    2 stalled: 99%   6 stalled: 102%
+//	8 MiB / 512 KiB    1 stalled: 97%    2 stalled: 96%   6 stalled: 99%
+//
+// At 4 MiB the ratio is 2:1, so two users who stop reading - a paused video, a
+// closed laptop - take down every other user sharing that connection. That is
+// not a tuning preference, so the default is a ratio rather than a size: 16:1
+// needs sixteen simultaneous stalls to do the same damage.
+//
+// The cost is the single-flow ceiling, which is streambuf/RTT: 42 Mbps per flow
+// at 100 ms instead of 340. For a server carrying many users that is invisible,
+// since the link, not the window, is the limit. A single-user install on a fast
+// path can raise streambuf in its config; nothing else has to change, because
+// each side advertises its own window (smux stream.go writes MaxStreamBuffer
+// into the UPD frame) and the two ends never have to agree.
 const (
 	defaultSmuxbuf   = 8 * 1024 * 1024
-	defaultStreambuf = 4 * 1024 * 1024
+	defaultStreambuf = 512 * 1024
 )
 
 const (

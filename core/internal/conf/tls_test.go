@@ -342,14 +342,26 @@ func TestBufferDefaultsBalanceThroughputAgainstLatency(t *testing.T) {
 	const rttMs = 100
 	mbps := func(window int) int { return window * 8 / rttMs / 1000 }
 
-	// Floor: comfortably past the ~168 Mbps that 2 MiB allowed.
-	if got := mbps(defaultStreambuf); got < 300 {
-		t.Fatalf("streambuf caps one flow at %d Mbps over a 100 ms path", got)
+	// This test used to require 300-400 Mbps for a single flow, which put
+	// streambuf at 4 MiB against an 8 MiB smuxbuf. That was the right reading
+	// of a two-way trade - too small starves one flow, too large builds a
+	// standing queue - but it missed the axis that decides the question on a
+	// server carrying many users: smuxbuf is a token bucket for the whole
+	// session, so smuxbuf/streambuf is how many stalled streams it takes to
+	// empty it, and an empty bucket stops smux reading the connection for
+	// everyone. At 2:1, two users who stop reading froze every other user on
+	// that connection - measured, and total, not merely slower.
+	//
+	// So the floor is now only "not back to the LAN-sized value that capped a
+	// flow at 168 Mbps", and the real constraint has moved to the ratio.
+	if got := mbps(defaultStreambuf); got < 30 {
+		t.Fatalf("streambuf caps one flow at %d Mbps over a 100 ms path; that is below any useful per-user rate", got)
 	}
-	// Ceiling: a bulk transfer may not park more than this ahead of every
-	// other stream on the same connection.
-	if got := mbps(defaultStreambuf); got > 400 {
-		t.Fatalf("streambuf allows %d Mbps of standing queue per flow; that is latency, not speed", got)
+	// A single stream may not be allowed to hold a large share of the session
+	// bucket. See TestDefaultBuffersSurviveStalledStreams for the measurement.
+	if defaultStreambuf > defaultSmuxbuf/16 {
+		t.Fatalf("streambuf %d is more than a sixteenth of smuxbuf %d; %d stalled streams would stop the session",
+			defaultStreambuf, defaultSmuxbuf, defaultSmuxbuf/defaultStreambuf)
 	}
 	// The outer TCP receive window is the next ceiling up, and the network
 	// optimizer holds it at 8 MB so hosts keep advertising window scale 7.

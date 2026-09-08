@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 export WILDPAQET_LIB_ONLY=1
 source "$repo_root/wildpaqet.sh"
 
-test "$SCRIPT_VERSION" = "9.18-v3"
+test "$SCRIPT_VERSION" = "9.19-v3"
 v3_validate_cover_path '/api/v1/cover/events'
 if v3_validate_cover_path '/api/../admin'; then
 	echo "unsafe cover path was accepted" >&2
@@ -127,24 +127,41 @@ trap 'cleanup_parse; cleanup_tuning' EXIT
 
 # --- per-RAM sizing -------------------------------------------------
 test "$(v3_default_smuxbuf 1024)"  = "4194304" || fail "1 GB host smuxbuf"
-test "$(v3_default_streambuf 1024)" = "2097152" || fail "1 GB host streambuf"
+test "$(v3_default_streambuf 1024)" = "262144" || fail "1 GB host streambuf"
 test "$(v3_default_smuxbuf 4096)"  = "8388608" || fail "4 GB host smuxbuf"
-test "$(v3_default_streambuf 4096)" = "4194304" || fail "4 GB host streambuf"
+test "$(v3_default_streambuf 4096)" = "524288" || fail "4 GB host streambuf"
+
+# smuxbuf is the session-wide token bucket and streambuf is the per-stream cap,
+# so smuxbuf/streambuf is how many stalled streams it takes to stop the outer
+# connection for every user on it. Measured: at the old 2:1 ratio two stalled
+# streams took the active ones to zero throughput. Keep it at 16:1 or wider.
+for ram in 1024 4096 8192; do
+    smux=$(v3_default_smuxbuf "$ram")
+    stream=$(v3_default_streambuf "$ram")
+    test "$stream" -le "$((smux / 16))" \
+        || fail "${ram}MB host ratio is $((smux / stream)):1; a handful of stalled users would freeze the connection"
+done
 
 # Capture first: piping into `grep -q` lets grep exit on the first match and
 # SIGPIPE the producer, which `set -o pipefail` then reports as a failure.
 emitted_large=$(v3_emit_tuning_keys '    ' 4096)
 emitted_small=$(v3_emit_tuning_keys '    ' 1024)
 grep -qx '    smuxbuf: 8388608'  <<<"$emitted_large" || fail "emit smuxbuf"
-grep -qx '    streambuf: 4194304' <<<"$emitted_large" || fail "emit streambuf"
+grep -qx '    streambuf: 524288' <<<"$emitted_large" || fail "emit streambuf"
 grep -qx '    smux_version: 2'    <<<"$emitted_large" || fail "emit smux_version"
 grep -qx '    smuxbuf: 4194304'   <<<"$emitted_small" || fail "emit small-host smuxbuf"
 
 # --- the numbers must actually clear a WAN path ----------------------
 # 2 MiB over a 100 ms path is ~168 Mbps: that was the 9.13-v3 regression.
 test "$(v3_window_mbps 2097152 100)" -lt 200  || fail "sanity: 2 MiB window"
-test "$(v3_window_mbps "$(v3_default_streambuf 4096)" 100)" -ge 300 \
-    || fail "default streambuf caps a single flow below 300 Mbps at 100 ms"
+# This used to demand 300 Mbps for one flow, which is what put streambuf at
+# 4 MiB against an 8 MiB smuxbuf. That reading of the trade was right as far as
+# it went and wrong about which constraint dominates: at a 2:1 ratio two stalled
+# users took every other user on the connection to zero throughput, measured.
+# The ratio check above is now the binding constraint; this one only guards
+# against sliding back to a rate no single user would accept.
+test "$(v3_window_mbps "$(v3_default_streambuf 4096)" 100)" -ge 30 \
+    || fail "default streambuf caps a single flow below 30 Mbps at 100 ms"
 # The other half of the trade: whatever one bulk transfer has outstanding also
 # sits ahead of every other stream on the same outer connection, so an oversized
 # window buys latency, not speed.
@@ -202,6 +219,21 @@ transport:
     smux_version: 2
 EOF
 
+# Written by 9.14-v3 through 9.18-v3: a 2:1 ratio, where two stalled users take
+# the whole outer connection to zero throughput. This is what is installed on
+# existing servers, so the migration has to pick it up.
+cat > "$tuning_dir/stale18.yaml" <<'EOF'
+role: "server"
+transport:
+  protocol: "tls"
+  tls:
+    mode: "h2"
+    alpn: "h2"
+    smuxbuf: 8388608
+    streambuf: 4194304
+    smux_version: 2
+EOF
+
 # Values the operator chose: never overwritten.
 cat > "$tuning_dir/custom.yaml" <<'EOF'
 role: "server"
@@ -246,16 +278,19 @@ transport:
 EOF
 
 changed=$(v3_migrate_all_configs "$tuning_dir")
-test "$changed" = "4" || fail "expected 4 migrated configs (iran, stale, stale14, mixed), got $changed"
+test "$changed" = "5" || fail "expected 5 migrated configs (iran, stale, stale14, stale18, mixed), got $changed"
 
 grep -qx '    smuxbuf: 8388608' "$tuning_dir/iran.yaml"   || fail "iran smuxbuf"
-grep -qx '    streambuf: 4194304' "$tuning_dir/iran.yaml"  || fail "iran streambuf"
+grep -qx '    streambuf: 524288' "$tuning_dir/iran.yaml"   || fail "iran streambuf"
 grep -qx '    smux_version: 2' "$tuning_dir/iran.yaml"     || fail "iran smux_version"
 
 grep -qx '    smuxbuf: 8388608' "$tuning_dir/stale.yaml"  || fail "9.13 smuxbuf not upgraded"
-grep -qx '    streambuf: 4194304' "$tuning_dir/stale.yaml" || fail "9.13 streambuf not upgraded"
+grep -qx '    streambuf: 524288' "$tuning_dir/stale.yaml"  || fail "9.13 streambuf not upgraded"
 grep -qx '    smuxbuf: 8388608' "$tuning_dir/stale14.yaml"  || fail "9.14 smuxbuf not corrected"
-grep -qx '    streambuf: 4194304' "$tuning_dir/stale14.yaml" || fail "9.14 streambuf not corrected"
+grep -qx '    streambuf: 524288' "$tuning_dir/stale14.yaml"  || fail "9.14 streambuf not corrected"
+# The one that matters for servers already in the field.
+grep -qx '    smuxbuf: 8388608' "$tuning_dir/stale18.yaml"  || fail "9.18 smuxbuf changed unexpectedly"
+grep -qx '    streambuf: 524288' "$tuning_dir/stale18.yaml"  || fail "9.18 2:1 ratio was not migrated"
 
 grep -qx '    smuxbuf: 33554432' "$tuning_dir/custom.yaml"  || fail "operator smuxbuf overwritten"
 grep -qx '    streambuf: 16777216' "$tuning_dir/custom.yaml" || fail "operator streambuf overwritten"
