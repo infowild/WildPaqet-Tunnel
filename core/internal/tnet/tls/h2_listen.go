@@ -52,7 +52,7 @@ func listenH2(addr string, cfg *conf.TLS) (tnet.Listener, error) {
 		replays:  newReplayCache(),
 		accepted: make(chan acceptResult, 128),
 		closed:   make(chan struct{}),
-		decoy:    newDecoyHandler(cfg.DecoyURL),
+		decoy:    newDecoyHandler(cfg.DecoyURL, []byte(cfg.Secret)),
 	}
 	l.server = &http.Server{
 		Handler:           http.HandlerFunc(l.routeHTTP),
@@ -137,7 +137,11 @@ func (l *h2Listener) handleCover(w http.ResponseWriter, r *http.Request) {
 			_ = r.Body.Close()
 		},
 	}
-	session, err := smux.Server(stream, smuxConfig(l.cfg))
+	var cover net.Conn = stream
+	if l.cfg.Padding {
+		cover = newPaddedConn(stream)
+	}
+	session, err := smux.Server(cover, smuxConfig(l.cfg))
 	if err != nil {
 		_ = stream.Close()
 		return
@@ -168,7 +172,7 @@ func (l *h2Listener) serveDecoy(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
 		// An origin server does not proxy. Answering Go's plain-text 404 here
 		// would set an unauthenticated CONNECT apart from every other probe.
-		writeDecoyStatus(w, http.StatusMethodNotAllowed)
+		l.decoy.ServeHTTP(w, r)
 		return
 	}
 	l.decoy.ServeHTTP(w, r)

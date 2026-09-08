@@ -22,6 +22,7 @@ type Listener struct {
 	accepted  chan acceptResult
 	closed    chan struct{}
 	sem       chan struct{}
+	handshake func(net.Conn) (tnet.Conn, error)
 	closeOnce sync.Once
 	workers   sync.WaitGroup
 }
@@ -34,6 +35,9 @@ type acceptResult struct {
 func Listen(addr string, cfg *conf.TLS) (tnet.Listener, error) {
 	if cfg.Mode == "h2" {
 		return listenH2(addr, cfg)
+	}
+	if cfg.Mode == "stealth" {
+		return listenStealth(addr, cfg)
 	}
 	tlsCfg, err := serverTLSConfig(cfg)
 	if err != nil {
@@ -52,6 +56,7 @@ func Listen(addr string, cfg *conf.TLS) (tnet.Listener, error) {
 		closed:   make(chan struct{}),
 		sem:      make(chan struct{}, 128),
 	}
+	l.handshake = l.handshakeDirectTLS
 	go l.acceptLoop()
 	return l, nil
 }
@@ -107,7 +112,7 @@ func (l *Listener) acceptLoop() {
 	}
 }
 
-func (l *Listener) handshake(raw net.Conn) (tnet.Conn, error) {
+func (l *Listener) handshakeDirectTLS(raw net.Conn) (tnet.Conn, error) {
 	fail := func(err error) (tnet.Conn, error) {
 		_ = raw.Close()
 		return nil, err
@@ -154,3 +159,38 @@ func (l *Listener) Addr() net.Addr { return l.listener.Addr() }
 // TCP flag filters only apply to the legacy pcap transport.
 func (l *Listener) SetClientTCPF(net.Addr, []conf.TCPF) {}
 func (l *Listener) DeleteClientTCPF(net.Addr)           {}
+
+// listenStealth reuses the direct listener's accept loop and bounded worker
+// pool; only the handshake differs. A peer that cannot complete NNpsk0 is
+// closed without a reply, so the port reads as dead to a scan.
+func listenStealth(addr string, cfg *conf.TLS) (tnet.Listener, error) {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("stealth: listen on %s: %w", addr, err)
+	}
+	l := &Listener{
+		listener: listener,
+		cfg:      cfg,
+		replays:  newReplayCache(),
+		accepted: make(chan acceptResult, 128),
+		closed:   make(chan struct{}),
+		sem:      make(chan struct{}, 128),
+	}
+	l.handshake = l.handshakeStealth
+	go l.acceptLoop()
+	return l, nil
+}
+
+func (l *Listener) handshakeStealth(raw net.Conn) (tnet.Conn, error) {
+	secured, err := stealthHandshake(raw, l.cfg.Secret, false, l.cfg.HandshakeTimeout)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	session, err := smux.Server(secured, smuxConfig(l.cfg))
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("stealth: create smux server: %w", err)
+	}
+	return newConn(secured, session), nil
+}

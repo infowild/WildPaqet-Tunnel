@@ -17,7 +17,7 @@ import (
 // every path with the literal body "404 page not found" and no Server header,
 // which identified the host as a bare Go program.
 func TestDecoyDoesNotLeakGoDefaultResponse(t *testing.T) {
-	handler := newDecoyHandler("")
+	handler := newDecoyHandler("", []byte("0123456789abcdef0123456789abcdef"))
 	for _, method := range []string{"GET", "HEAD", "POST", "PUT"} {
 		w := httptest.NewRecorder()
 		handler.ServeHTTP(w, httptest.NewRequest(method, "/anything", nil))
@@ -37,7 +37,7 @@ func TestDecoyDoesNotLeakGoDefaultResponse(t *testing.T) {
 // A failing decoy backend must render a gateway page, not Go's plain-text error.
 func TestDecoyProxyErrorIsNotPlainText(t *testing.T) {
 	// Port 0 is never connectable, so the proxy always fails.
-	handler := newDecoyHandler("http://127.0.0.1:1")
+	handler := newDecoyHandler("http://127.0.0.1:1", []byte("0123456789abcdef0123456789abcdef"))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest("GET", "https://public.example/", nil))
 	if w.Code != http.StatusBadGateway {

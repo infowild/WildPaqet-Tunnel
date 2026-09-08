@@ -49,6 +49,9 @@ _review_*
 !core/internal/conf/tcp_test.go
 !core/internal/client/dial_test.go
 !core/internal/tnet/tls/probe_surface_test.go
+!core/internal/tnet/tls/h2_pad_test.go
+!core/internal/tnet/tls/stealth_test.go
+!core/internal/conf/stealth_config_test.go
 
 # Transport resilience regression tests and pinned dependency tests.
 !core/internal/client/resilience_test.go

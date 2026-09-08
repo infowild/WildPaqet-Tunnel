@@ -77,7 +77,11 @@ jobs:
 
       - name: Race-test transport resilience
         working-directory: core
-        run: go test -race -count=1 ./internal/client ./internal/forward ./internal/tnet/tls
+        run: go test -race -count=1 ./internal/client ./internal/forward ./internal/tnet/tls ./internal/conf
+
+      - name: Test the stealth carrier and the padding layer
+        working-directory: core
+        run: go test -race -count=1 -run 'TestStealth|TestPadded|TestDecoy' ./internal/tnet/tls
 
       - name: Test large H2 transfer
         if: github.event_name == 'workflow_dispatch' && inputs.large_transfer

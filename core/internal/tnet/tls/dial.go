@@ -17,6 +17,9 @@ func Dial(ctx context.Context, addr string, cfg *conf.TLS) (tnet.Conn, error) {
 	if cfg.Mode == "h2" {
 		return dialH2(ctx, addr, cfg)
 	}
+	if cfg.Mode == "stealth" {
+		return dialStealth(ctx, addr, cfg)
+	}
 	dialer := net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: cfg.KeepAlive}
 	raw, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -55,4 +58,29 @@ func Dial(ctx context.Context, addr string, cfg *conf.TLS) (tnet.Conn, error) {
 		return fail(fmt.Errorf("tls: create smux client: %w", err))
 	}
 	return newConn(tlsConn, session), nil
+}
+
+// dialStealth brings up the Noise carrier. The connect jitter that the h2
+// cover uses applies here too: a pool that redials in lockstep is a pattern
+// even when each connection is unreadable.
+func dialStealth(ctx context.Context, addr string, cfg *conf.TLS) (tnet.Conn, error) {
+	if err := waitConnectJitter(ctx, cfg.ConnectJitter); err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: cfg.ConnectTimeout, KeepAlive: cfg.KeepAlive}
+	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("stealth: dial %s: %w", addr, err)
+	}
+	secured, err := stealthHandshake(raw, cfg.Secret, true, cfg.HandshakeTimeout)
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("stealth: handshake with %s: %w", addr, err)
+	}
+	session, err := smux.Client(secured, smuxConfig(cfg))
+	if err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("stealth: create smux client: %w", err)
+	}
+	return newConn(secured, session), nil
 }

@@ -27,7 +27,7 @@ Iran IP block and does not promise DPI invisibility.
 - `tls.mode` must be explicit. Omitted mode now fails validation before startup
   rather than silently selecting the legacy direct carrier.
 - The manager pins source downloads to a resolved Git commit and embeds that
-  commit in the binary's version output. The core version is v3.4.2-wildpaqet.
+  commit in the binary's version output. The core version is v3.5.0-wildpaqet.
 
 ## Before updating servers
 
@@ -103,3 +103,30 @@ increase was added. Those require baseline traffic/latency measurements and
 can worsen throughput or introduce new patterns. TLS 1.3 and authentication
 remain enforced; changing the transport does not remove network-level IP
 blocking. A real site and public certificate still need operator configuration.
+
+## v3.5.0: carriers and traffic shape
+
+**The decoy differs per install.** Its nginx build, `server_tokens` setting,
+`Last-Modified` and `ETag` are derived from the shared secret, so no two
+deployments answer a probe alike and the fleet cannot be found with one scan.
+`/` serves that page; every other path, the cover path included, is a 404. It
+honours `If-None-Match`, `If-Modified-Since` and `Range`, so a probe that
+replays the `ETag` is answered `304` as a file on disk would be.
+
+**`padding: true` (h2 only, off by default).** Varies the length of every small
+record so the fixed-size smux keepalive stops being a constant on the wire.
+Measured idle: without it, 12 of 16 records after the handshake were exactly 39
+bytes; with it, 19 records had 19 distinct lengths. This changes the framing
+between the two smux endpoints, so **set it on the server and on every client
+together** — a mismatch drops the session the way a `smux_version` mismatch
+does. Bulk transfers are not padded and pay nothing on the wire.
+
+**`mode: stealth`.** A Noise NNpsk0 carrier with no TLS, no certificate, no SNI
+and no ALPN: two handshake messages indistinguishable from random bytes, then a
+ChaCha20-Poly1305 record layer with padding always on. A peer without the shared
+secret receives nothing at all, so a port scan finds a dead port.
+
+Use it when the HTTP/2 cover is the thing being filtered. It is not strictly
+better: traffic with no recognisable protocol is a category a censor can block
+on its own, and there is no cover story to fall back on. Both ends must run the
+same carrier.

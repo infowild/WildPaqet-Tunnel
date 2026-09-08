@@ -114,7 +114,11 @@ func dialH2(ctx context.Context, endpoint string, cfg *conf.TLS) (tnet.Conn, err
 			transport.CloseIdleConnections()
 		},
 	}
-	session, err := smux.Client(stream, smuxConfig(cfg))
+	var cover net.Conn = stream
+	if cfg.Padding {
+		cover = newPaddedConn(stream)
+	}
+	session, err := smux.Client(cover, smuxConfig(cfg))
 	if err != nil {
 		_ = stream.Close()
 		return nil, fmt.Errorf("h2: create smux client: %w", err)

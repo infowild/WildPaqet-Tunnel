@@ -118,8 +118,13 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 		t.Fatalf("decoy request: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound || resp.ProtoMajor != 2 {
-		t.Fatalf("decoy = %s over %s, want 404 over h2", resp.Status, resp.Proto)
+	// The root now serves the derived index page, as an ordinary web server
+	// does; every other path is still a 404. See h2_decoy.go.
+	if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 {
+		t.Fatalf("decoy = %s over %s, want 200 over h2", resp.Status, resp.Proto)
+	}
+	if resp.Header.Get("Server") == "" {
+		t.Fatal("decoy sent no Server header")
 	}
 
 	h1Client := &http.Client{Transport: &http.Transport{
@@ -135,7 +140,9 @@ func TestH2CoverTransportRoundTripAndDecoy(t *testing.T) {
 		t.Fatalf("HTTP/1.1 decoy request: %v", err)
 	}
 	defer h1Resp.Body.Close()
-	if h1Resp.StatusCode != http.StatusNotFound || h1Resp.ProtoMajor != 1 {
+	// The same site over HTTP/1.1: a real server does not change what it
+	// serves based on the protocol version the visitor negotiated.
+	if h1Resp.StatusCode != http.StatusOK || h1Resp.ProtoMajor != 1 {
 		t.Fatalf("HTTP/1.1 decoy = %s over %s", h1Resp.Status, h1Resp.Proto)
 	}
 }

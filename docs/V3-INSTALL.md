@@ -142,7 +142,9 @@ those before assuming the path is at fault.
 - Visible SNI and ALPN `h2` are followed by the standards-required HTTP/2 preface, SETTINGS and DATA frames.
 - The server certificate is verified against the configured CA bundle or system trust store.
 - HTTP/2 cover mode requires SNI. A publicly trusted certificate is recommended for active-probe resistance.
-- Ordinary requests reach the configured local website (or a web-server 404 page); unauthenticated CONNECT receives 405, the way an origin server that does not proxy would answer. Backend errors return 502. None of these responses expose Go's own default bodies or a missing `Server` header.
+- Ordinary requests reach the configured local website. Without `decoy_url` the server answers `/` with a default page whose nginx version, date and `ETag` are derived from this install's own secret, and every other path with that build's 404 - so no two deployments answer alike. Unauthenticated CONNECT receives 405, the way an origin server that does not proxy would answer, and backend errors return 502. None of these expose Go's own default bodies or a missing `Server` header.
+- `padding: true` (both ends, off by default) varies the length of small records so an idle tunnel stops emitting a fixed-size heartbeat.
+- `mode: stealth` replaces the whole cover with a Noise handshake that looks like random bytes and answers nothing without the secret. Use it when the HTTP/2 cover itself is filtered.
 - An encrypted HMAC bearer token binds the opaque path, timestamp and random nonce.
 - Timestamps outside a two-minute window and reused nonces are rejected before smux starts.
 - Authentication and ALPN negotiation fail closed.

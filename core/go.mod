@@ -3,6 +3,7 @@ module paqet
 go 1.25.0
 
 require (
+	github.com/flynn/noise v1.1.0
 	github.com/goccy/go-yaml v1.19.2
 	github.com/gopacket/gopacket v1.7.0
 	github.com/refraction-networking/utls v1.8.2

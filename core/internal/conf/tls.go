@@ -50,6 +50,11 @@ type TLS struct {
 	CoverPath      string `yaml:"cover_path"`
 	DecoyURL       string `yaml:"decoy_url"`
 	ClientHello    string `yaml:"client_hello"`
+	// Padding varies the length of every small record on the cover stream, so
+	// the fixed-size smux keepalive stops being a constant on the wire. It is a
+	// framing change between the two smux endpoints, so both ends must set it;
+	// a mismatch drops the session rather than degrading quietly.
+	Padding        bool   `yaml:"padding"`
 
 	ConnectTimeout_      int `yaml:"connect_timeout"`
 	HandshakeTimeout_    int `yaml:"handshake_timeout"`
@@ -150,13 +155,16 @@ func (t *TLS) setDefaults() {
 
 func (t *TLS) validate(role string) []error {
 	var errors []error
-	if !slices.Contains([]string{"direct", "h2"}, t.Mode) {
-		errors = append(errors, fmt.Errorf("TLS mode must be explicitly set to h2 or direct (legacy)"))
+	if !slices.Contains([]string{"direct", "h2", "stealth"}, t.Mode) {
+		errors = append(errors, fmt.Errorf("TLS mode must be explicitly set to h2, stealth, or direct (legacy)"))
 	}
 	if len(t.Secret) < 32 {
 		errors = append(errors, fmt.Errorf("TLS secret must be at least 32 characters"))
 	}
-	if t.ALPN != defaultTLSALPN {
+	// The stealth carrier has no TLS and no certificate: it is a Noise
+	// handshake straight over TCP, so ALPN, SNI and certificate paths mean
+	// nothing there and are not required.
+	if t.Mode != "stealth" && t.ALPN != defaultTLSALPN {
 		errors = append(errors, fmt.Errorf("TLS alpn must be %q", defaultTLSALPN))
 	}
 	if t.ConnectTimeout_ < 1 || t.ConnectTimeout_ > 60 {
@@ -227,11 +235,21 @@ func (t *TLS) validate(role string) []error {
 	if t.Streambuf > t.Smuxbuf {
 		errors = append(errors, fmt.Errorf("TLS streambuf must not exceed smuxbuf"))
 	}
+	// The stealth carrier always pads; the flag is only meaningful for h2,
+	// where padding is opt-in because it changes the framing between peers.
+	if t.Padding && t.Mode != "h2" {
+		errors = append(errors, fmt.Errorf("TLS padding is only available in h2 mode"))
+	}
 	if t.SmuxVersion != 1 && t.SmuxVersion != 2 {
 		errors = append(errors, fmt.Errorf("TLS smux_version must be 1 or 2"))
 	}
 
-	if role == "server" {
+	// Certificates and a CA bundle belong to the TLS carriers. The stealth
+	// carrier authenticates with the shared secret alone, so requiring them
+	// there would ask an operator to install material nothing reads.
+	switch {
+	case t.Mode == "stealth":
+	case role == "server":
 		if t.CertFile == "" || t.KeyFile == "" {
 			errors = append(errors, fmt.Errorf("TLS cert_file and key_file are required on the server"))
 		} else {
@@ -242,7 +260,7 @@ func (t *TLS) validate(role string) []error {
 				errors = append(errors, fmt.Errorf("TLS key_file: %v", err))
 			}
 		}
-	} else {
+	default:
 		if t.CAFile != "" {
 			if _, err := os.Stat(t.CAFile); err != nil {
 				errors = append(errors, fmt.Errorf("TLS ca_file: %v", err))

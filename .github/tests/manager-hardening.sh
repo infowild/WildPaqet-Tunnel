@@ -95,6 +95,32 @@ is_manager_binary_ok "$WILDPAQET_MANAGER_PATH" || fail "installed manager is no 
 ls "$work"/installed-manager.update.* >/dev/null 2>&1 && fail "a staged download was left behind"
 echo "  ok"
 
+echo "== stealth wizard emits a config the core accepts =="
+for fn in v3_stealth_warning v3_stealth_read_secret v3_stealth_emit_tls_block configure_v3_stealth_server configure_v3_stealth_client prompt_v3_padding; do
+    declare -F "$fn" >/dev/null || fail "missing function: $fn"
+done
+block=$(v3_stealth_emit_tls_block "0123456789abcdef0123456789abcdef0123")
+grep -q 'mode: "stealth"' <<< "$block" || fail "stealth block has no stealth mode"
+grep -q 'secret:' <<< "$block" || fail "stealth block has no secret"
+# Stealth carries no TLS, so none of these belong in its config.
+for key in alpn cover_path cert_file key_file ca_file server_name send_server_name; do
+    grep -q "$key" <<< "$block" && fail "stealth block should not carry $key"
+done
+grep -q 'smux_version:' <<< "$block" || fail "stealth block has no smux_version"
+echo "  ok"
+
+echo "== padding is opt-in and defaults to off =="
+# A here-string keeps the prompt in this shell; a pipe would run it in a
+# subshell and the variable it sets would never come back.
+V3_PADDING=""
+prompt_v3_padding <<< "" >/dev/null 2>&1
+[ "$V3_PADDING" = "false" ] || fail "an empty answer did not leave padding off (got: $V3_PADDING)"
+prompt_v3_padding <<< "n" >/dev/null 2>&1
+[ "$V3_PADDING" = "false" ] || fail "n did not leave padding off (got: $V3_PADDING)"
+prompt_v3_padding <<< "y" >/dev/null 2>&1
+[ "$V3_PADDING" = "true" ] || fail "y did not enable padding (got: $V3_PADDING)"
+echo "  ok"
+
 if [ "$failures" -ne 0 ]; then
     echo "manager-hardening: $failures failure(s)" >&2
     exit 1

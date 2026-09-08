@@ -117,6 +117,53 @@ wildpaqet
 
 ---
 
+## Stealth carrier, per-install decoy, traffic padding (9.18-v3 / Core v3.5.0)
+
+Three changes, all aimed at what an observer can see rather than read.
+
+**The decoy is now different on every install.** Answering a probe plausibly is
+only half the job; if every WildPaqet server replies with the same bytes, one
+internet-wide scan for that reply enumerates the whole fleet. Each server now
+derives a web-server identity from its own shared secret - which nginx build it
+claims to be, whether that build prints its version, when its `index.html` was
+written, and therefore its `ETag`. It answers `/` with that page and everything
+else with a 404, honours conditional and range requests, and replays of the
+`ETag` get a `304` the way a file on disk would. Two installs measured
+side by side now differ in `Server`, `ETag` and `Last-Modified`.
+
+This replaces the earlier rule that forbade a welcome page outright. That rule
+aimed at the right risk but paid for it by serving nothing at all, and a domain
+with a valid public certificate that 404s its own root is its own anomaly.
+
+**Traffic-shape padding, opt-in.** Measured on an idle tunnel, the wire carried
+a TLS record of *exactly 39 bytes* every few seconds for as long as the
+connection lived - twelve of the sixteen records after the handshake were that
+one length. With `padding: true` the same run produced 19 records of 19
+different lengths. Filler goes inside the encryption and only onto small
+records, so a bulk transfer pays nothing on the wire. It changes the framing
+between the two smux endpoints, so **both ends must set it**; it is off by
+default and a mismatch drops the session, exactly as a `smux_version` mismatch
+does.
+
+**A stealth carrier: `mode: stealth`.** The HTTP/2 cover answers "what is this
+connection?" with a plausible lie. That is the right answer where a censor
+classifies traffic; it is the wrong one where the connection is being filtered
+rather than fingerprinted. Stealth gives no answer at all: a Noise NNpsk0
+handshake whose two messages are indistinguishable from random bytes, then a
+ChaCha20-Poly1305 record layer that looks the same, with padding always on. The
+pre-shared key comes from the tunnel secret, and because NNpsk0 mixes it in from
+the first message, a peer without it gets **no reply whatsoever** - a scan finds
+a dead port. It needs no certificate, no SNI and no ALPN.
+
+It is not strictly better than the cover, and the wizard says so: traffic with
+no recognisable protocol is itself a category a censor can decide to block.
+Reach for it when the HTTP/2 cover is the thing being filtered.
+
+Both ends must run the same carrier. Nothing here changes the h2 wire format
+unless you turn padding on.
+
+---
+
 ## Probe resistance and manager hardening (9.17-v3 / Core v3.4.2)
 
 An active prober is the part of the threat model the cover story used to fail.

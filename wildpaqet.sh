@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.17-v3
+# Version: 9.18-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.17-v3"
+readonly SCRIPT_VERSION="9.18-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="${WILDPAQET_MANAGER_PATH:-${WILDPAQET_BIN_DIR:-/usr/local/bin}/$MANAGER_NAME}"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -1033,6 +1033,29 @@ ${CYAN}What it costs in latency${NC}"
     if [ "${ram_mb:-0}" -gt 0 ] && [ "$budget_mib" -gt $(( ram_mb / 4 )) ]; then
         print_warning "That is over a quarter of this host's ${ram_mb} MiB of RAM."
         print_info "Lower 'conn' (menu 4) or smuxbuf if the box is memory tight."
+    fi
+}
+
+# Ask whether to pad the cover stream.
+#
+# Measured on an idle h2 tunnel: the wire carried a TLS record of exactly 39
+# bytes every few seconds, for as long as the connection lived. Padding varies
+# that length. It is opt-in because it changes the framing between the two
+# smux endpoints - like smux_version, a mismatch drops the session.
+V3_PADDING="false"
+prompt_v3_padding() {
+    local answer
+    echo -e "${CYAN}Traffic-shape padding${NC}"
+    echo "  Without it an idle tunnel emits a fixed-size record every few seconds,"
+    echo "  which is a pattern an observer can count without decrypting anything."
+    echo "  Padding varies that length. It costs a little CPU and no measurable"
+    echo "  bandwidth on a real link."
+    print_warning "Both Iran and every Kharej server must use the same setting."
+    read -r -p "Enable padding? (y/N): " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        V3_PADDING="true"
+    else
+        V3_PADDING="false"
     fi
 }
 
@@ -3103,6 +3126,8 @@ configure_v3_tls_server() {
 		return 1
 	fi
 
+    prompt_v3_padding
+    echo ""
     echo "Certificate source:"
 	echo " 1. Public certificate for $identity (reuse or Let's Encrypt)"
 	echo " 2. Generate a self-signed certificate (testing only; probe-visible)"
@@ -3195,6 +3220,7 @@ configure_v3_tls_server() {
         echo "    secret: \"$(yaml_escape_dq "$secret_key")\""
         echo '    alpn: "h2"'
 		echo "    cover_path: \"$cover_path\""
+		echo "    padding: $V3_PADDING"
 		[ -n "$decoy_url" ] && echo "    decoy_url: \"$decoy_url\""
         echo '    connect_timeout: 10'
         echo '    handshake_timeout: 10'
@@ -3480,6 +3506,10 @@ configure_v3_tls_client() {
         return 1
     fi
 
+    if [ "$cover_mode" = "h2" ]; then
+        prompt_v3_padding
+        echo ""
+    fi
     echo "TLS connection pool:"
     echo "  2 per Kharej: low traffic / lower memory"
     echo "  4 per Kharej: balanced and recommended"
@@ -3597,6 +3627,7 @@ configure_v3_tls_client() {
         echo '    alpn: "h2"'
 		if [ "$cover_mode" = "h2" ]; then
 			echo "    cover_path: \"$cover_path\""
+			echo "    padding: $V3_PADDING"
 			echo '    client_hello: "chrome"'
 			echo '    connect_jitter: 2'
 			echo '    keepalive_jitter: 5'
@@ -3631,18 +3662,301 @@ configure_v3_tls_client() {
 }
 
 # Configure as Server
+# ------------------------------------------------------------------
+# v3 stealth carrier (Noise NNpsk0)
+#
+# No certificate, no SNI, no TLS: two short bursts that look like random bytes
+# and then an encrypted stream that looks the same. A peer without the shared
+# secret gets no reply at all, so a scan sees a dead port.
+#
+# This is the answer where the connection itself is being filtered rather than
+# fingerprinted. Where the HTTP/2 cover still works it is the better choice,
+# because traffic with no recognisable protocol is a category a censor can also
+# decide to block.
+# ------------------------------------------------------------------
+
+v3_stealth_warning() {
+    echo -e "${YELLOW}Stealth carrier${NC} - no cover story, no certificate."
+    echo "  On the wire it is indistinguishable from random bytes, and the port"
+    echo "  answers nothing at all without the shared secret."
+    echo -e "  ${CYAN}Use it when the HTTP/2 cover is being filtered.${NC} Unstructured traffic"
+    echo "  is itself a category a censor can block, so it is not strictly better."
+    echo "  Both ends must run this carrier; there is nothing to negotiate."
+    echo ""
+}
+
+v3_stealth_read_secret() {
+    local prompt_text="$1"
+    local generate="${2:-0}"
+    local answer
+    V3_STEALTH_SECRET=""
+    if [ "$generate" = "1" ]; then
+        V3_STEALTH_SECRET=$(generate_secret_key)
+        read -r -s -p "$prompt_text" answer
+        echo
+        [ -n "$answer" ] && V3_STEALTH_SECRET="$answer"
+    else
+        read -r -s -p "$prompt_text" V3_STEALTH_SECRET
+        echo
+    fi
+    if [ ${#V3_STEALTH_SECRET} -lt 32 ]; then
+        print_error "The v3 shared secret must be at least 32 characters"
+        return 1
+    fi
+    if ! yaml_value_is_safe "$V3_STEALTH_SECRET"; then
+        print_error "The shared secret may not contain tabs, newlines or control characters"
+        return 1
+    fi
+    return 0
+}
+
+# Emit the tls block every stealth config shares. Stealth carries no ALPN,
+# cover path, certificate or SNI, so none of those keys appear.
+v3_stealth_emit_tls_block() {
+    local secret_key="$1"
+    echo '  tls:'
+    echo '    mode: "stealth"'
+    echo "    secret: \"$(yaml_escape_dq "$secret_key")\""
+    echo '    connect_timeout: 10'
+    echo '    handshake_timeout: 10'
+    echo '    keepalive: 15'
+    echo '    keepalive_timeout: 60'
+    echo '    connect_jitter: 2'
+    echo '    keepalive_jitter: 5'
+    echo '    breaker_failures: 3'
+    echo '    breaker_cooldown: 30'
+    echo '    breaker_max_cooldown: 300'
+    v3_emit_tuning_keys '    '
+}
+
+configure_v3_stealth_server() {
+    clear
+    show_banner
+    echo -e "${GREEN}Configure v3 Stealth Server (Kharej)${NC}\n"
+    v3_stealth_warning
+
+    local config_name port answer svc public_ip public_endpoint default_endpoint
+    public_ip=$(get_public_ip)
+    read -r -p "Service name [server-stealth]: " config_name
+    config_name=$(clean_config_name "${config_name:-server-stealth}")
+    if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
+        read -r -p "Config exists. Overwrite? (y/N): " answer
+        [[ ! "$answer" =~ ^[Yy]$ ]] && return 0
+    fi
+
+    read -r -p "Listen port [443]: " port
+    port="${port:-443}"
+    validate_port "$port" || { print_error "Invalid port"; pause; return 1; }
+    check_port_conflict "$port" || { pause; return 1; }
+
+    default_endpoint="${public_ip}:${port}"
+    [[ "$public_ip" == *:* ]] && default_endpoint="[${public_ip}]:${port}"
+    read -r -p "Public endpoint for Iran [${default_endpoint}]: " public_endpoint
+    public_endpoint="${public_endpoint:-$default_endpoint}"
+    v3_validate_endpoint "$public_endpoint" \
+        || { print_error "Invalid public endpoint (expected host:port)"; pause; return 1; }
+
+    v3_stealth_read_secret "Shared secret [Enter = generated]: " 1 || { pause; return 1; }
+
+    ensure_v3_core || return 1
+    configure_tls_firewall "$port" || { print_error "Firewall configuration failed"; pause; return 1; }
+
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# WildPaqet v3 stealth server (Noise NNpsk0, no TLS)"
+        echo 'role: "server"'
+        echo 'log:'
+        echo '  level: "info"'
+        echo 'listen:'
+        echo "  addr: \":$port\""
+        echo 'transport:'
+        echo '  protocol: "tls"'
+        echo '  conn: 1'
+        v3_stealth_emit_tls_block "$V3_STEALTH_SECRET"
+    } > "$CONFIG_DIR/${config_name}.yaml"
+    chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+    v3_report_throughput_budget "$CONFIG_DIR/${config_name}.yaml"
+
+    create_systemd_service "$config_name"
+    svc="paqet-${config_name}"
+    if ! enable_and_refresh_service "$svc" || ! systemctl is-active --quiet "$svc"; then
+        print_error "Stealth server failed to start"
+        systemctl status "$svc" --no-pager -l
+        pause
+        return 1
+    fi
+
+    print_success "v3 stealth server started on TCP/$port"
+    echo -e "${YELLOW}The Iran wizard needs two things. There is no pairing code and no certificate:${NC}"
+    echo -e "  ${CYAN}Endpoint:${NC} $public_endpoint"
+    echo -e "  ${CYAN}Secret:${NC}   $V3_STEALTH_SECRET"
+    echo "The secret is the only credential; carry it over a channel you trust."
+    pause
+}
+
+configure_v3_stealth_client() {
+    clear
+    show_banner
+    echo -e "${GREEN}Configure v3 Stealth Client (Iran)${NC}\n"
+    v3_stealth_warning
+
+    local config_name endpoints_raw svc endpoint traffic_type
+    local connections_per_endpoint total_connections
+    local -a endpoints forward_entries socks5_entries clean_endpoints
+    read -r -p "Service name [iran-stealth]: " config_name
+    config_name=$(clean_config_name "${config_name:-iran-stealth}")
+    if [ -f "$CONFIG_DIR/${config_name}.yaml" ]; then
+        read -r -p "Config exists. Overwrite? (y/N): " endpoints_raw
+        [[ ! "$endpoints_raw" =~ ^[Yy]$ ]] && return 0
+    fi
+
+    echo "Enter every Kharej endpoint that runs the stealth server."
+    print_info "Use IP:port, not a hostname: a name is resolved at runtime and that DNS query is visible."
+    read -r -p "Endpoints (comma-separated IP:port): " endpoints_raw
+    IFS=',' read -ra endpoints <<< "$endpoints_raw"
+    clean_endpoints=()
+    for endpoint in "${endpoints[@]}"; do
+        endpoint=$(echo "$endpoint" | xargs)
+        [ -n "$endpoint" ] || continue
+        if v3_validate_endpoint "$endpoint"; then
+            clean_endpoints+=("$endpoint")
+        else
+            print_error "Invalid endpoint: $endpoint"
+            pause
+            return 1
+        fi
+    done
+    endpoints=("${clean_endpoints[@]}")
+    [ ${#endpoints[@]} -gt 0 ] || { print_error "At least one endpoint is required"; pause; return 1; }
+
+    echo "Outer connection pool:"
+    echo "  2 per Kharej: low traffic / lower memory"
+    echo "  4 per Kharej: balanced and recommended"
+    read -r -p "Outer connections per Kharej [${DEFAULT_V3_CONNECTIONS_PER_ENDPOINT}]: " connections_per_endpoint
+    connections_per_endpoint="${connections_per_endpoint:-$DEFAULT_V3_CONNECTIONS_PER_ENDPOINT}"
+    if ! total_connections=$(v3_total_outer_connections "${#endpoints[@]}" "$connections_per_endpoint"); then
+        print_error "Connections per Kharej must be between 1 and 16 (256 total maximum)"
+        pause
+        return 1
+    fi
+    print_info "Outer pool: ${#endpoints[@]} Kharej endpoint(s) x ${connections_per_endpoint} = ${total_connections} connections"
+
+    v3_stealth_read_secret "Shared secret from Kharej: " 0 || { pause; return 1; }
+
+    echo "Traffic mode:"
+    echo " 1. TCP port forwarding"
+    echo " 2. SOCKS5 proxy"
+    read -r -p "Choose [1]: " traffic_type
+    traffic_type="${traffic_type:-1}"
+    forward_entries=()
+    socks5_entries=()
+    if [ "$traffic_type" = "2" ]; then
+        local socks_port socks_user socks_pass
+        read -r -p "SOCKS5 port [1080]: " socks_port
+        socks_port="${socks_port:-1080}"
+        validate_port "$socks_port" || { print_error "Invalid SOCKS5 port"; pause; return 1; }
+        read -r -p "SOCKS5 username (Enter = none): " socks_user
+        if [ -n "$socks_user" ]; then
+            read -r -s -p "SOCKS5 password: " socks_pass; echo
+            [ -n "$socks_pass" ] || { print_error "Password is required"; pause; return 1; }
+            if ! yaml_value_is_safe "$socks_user" || ! yaml_value_is_safe "$socks_pass"; then
+                print_error "SOCKS5 credentials may not contain tabs, newlines or control characters"
+                pause
+                return 1
+            fi
+            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"\n    username: \"$(yaml_escape_dq "$socks_user")\"\n    password: \"$(yaml_escape_dq "$socks_pass")\"")
+        else
+            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"")
+        fi
+        configure_tls_firewall "$socks_port" || true
+    else
+        local forward_ports p proto_choice display_ports=""
+        local -a stealth_ports
+        read -r -p "Forward ports (comma-separated) [$DEFAULT_V2RAY_PORTS]: " forward_ports
+        forward_ports=$(clean_port_list "${forward_ports:-$DEFAULT_V2RAY_PORTS}")
+        [ -n "$forward_ports" ] || { print_error "No valid forward port"; pause; return 1; }
+        IFS=',' read -ra stealth_ports <<< "$forward_ports"
+        for p in "${stealth_ports[@]}"; do
+            proto_choice=$(prompt_forward_protocol "$p")
+            case "$proto_choice" in
+                both)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"udp\"")
+                    display_ports+=" $p (TCP+UDP)"
+                    apply_forward_listener_firewall "$p" both || true
+                    ;;
+                udp)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"udp\"")
+                    display_ports+=" $p (UDP)"
+                    apply_forward_listener_firewall "$p" udp || true
+                    ;;
+                *)
+                    forward_entries+=("  - listen: \"0.0.0.0:$p\"\n    target: \"127.0.0.1:$p\"\n    protocol: \"tcp\"")
+                    display_ports+=" $p (TCP)"
+                    apply_forward_listener_firewall "$p" tcp || true
+                    ;;
+            esac
+        done
+        [ -n "$display_ports" ] && print_info "Forward:${display_ports}"
+    fi
+
+    ensure_v3_core || return 1
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# WildPaqet v3 stealth client (Noise NNpsk0, no TLS)"
+        echo 'role: "client"'
+        echo 'log:'
+        echo '  level: "info"'
+        if [ ${#forward_entries[@]} -gt 0 ]; then
+            echo 'forward:'
+            printf '%b\n' "${forward_entries[@]}"
+        fi
+        if [ ${#socks5_entries[@]} -gt 0 ]; then
+            echo 'socks5:'
+            printf '%b\n' "${socks5_entries[@]}"
+        fi
+        echo 'server:'
+        echo "  addr: \"${endpoints[0]}\""
+        if [ ${#endpoints[@]} -gt 1 ]; then
+            echo '  addrs:'
+            for endpoint in "${endpoints[@]:1}"; do
+                echo "    - \"$endpoint\""
+            done
+        fi
+        echo 'transport:'
+        echo '  protocol: "tls"'
+        echo "  conn: $total_connections"
+        v3_stealth_emit_tls_block "$V3_STEALTH_SECRET"
+    } > "$CONFIG_DIR/${config_name}.yaml"
+    chmod 600 "$CONFIG_DIR/${config_name}.yaml"
+    v3_report_throughput_budget "$CONFIG_DIR/${config_name}.yaml"
+
+    create_systemd_service "$config_name"
+    svc="paqet-${config_name}"
+    if ! enable_and_refresh_service "$svc" || ! systemctl is-active --quiet "$svc"; then
+        print_error "Stealth client failed to start"
+        systemctl status "$svc" --no-pager -l
+        pause
+        return 1
+    fi
+    print_success "v3 stealth client started with $total_connections connection(s) across ${#endpoints[@]} Kharej endpoint(s)"
+    pause
+}
+
 configure_server() {
     echo -e "${CYAN}Transport:${NC}"
 	echo " 1. v3 real HTTP/2-covered TLS (recommended, no WebSocket)"
-    echo " 2. Legacy raw KCP/pcap"
-    echo " 3. Export pairing code for an existing v3 server"
+    echo " 2. v3 stealth (Noise, no cover story - use when the cover is filtered)"
+    echo " 3. Legacy raw KCP/pcap"
+    echo " 4. Export pairing code for an existing v3 server"
     echo " 0. Back"
     local transport_choice
     read -p "Choose [1]: " transport_choice
     case "${transport_choice:-1}" in
         1) configure_v3_tls_server; return ;;
-        2) ;;
-        3) show_v3_pairing_code; return ;;
+        2) configure_v3_stealth_server; return ;;
+        3) ;;
+        4) show_v3_pairing_code; return ;;
         0) return ;;
         *) print_error "Invalid transport"; pause; return ;;
     esac
@@ -3998,13 +4312,15 @@ configure_server() {
 configure_client() {
     echo -e "${CYAN}Transport:${NC}"
 	echo " 1. v3 real HTTP/2-covered TLS (recommended, no WebSocket)"
-    echo " 2. Legacy raw KCP/pcap"
+    echo " 2. v3 stealth (Noise, no cover story - use when the cover is filtered)"
+    echo " 3. Legacy raw KCP/pcap"
     echo " 0. Back"
     local transport_choice
     read -p "Choose [1]: " transport_choice
     case "${transport_choice:-1}" in
         1) configure_v3_tls_client; return ;;
-        2) ;;
+        2) configure_v3_stealth_client; return ;;
+        3) ;;
         0) return ;;
         *) print_error "Invalid transport"; pause; return ;;
     esac
