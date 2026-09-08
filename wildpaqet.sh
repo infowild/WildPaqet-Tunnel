@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # WildPaqet Tunnel Manager
-# Version: 9.16-v3
+# Version: 9.17-v3
 # Branch: wild-paqet-v3 (real HTTP/2 cover + TLS 1.3 + authenticated resilient pools)
 # HTTP/2-covered TLS with legacy direct TLS and raw KCP compatibility
 # Core (vendored): ./core  ·  Upstream: https://github.com/hanselime/paqet
@@ -26,7 +26,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="9.16-v3"
+readonly SCRIPT_VERSION="9.17-v3"
 readonly MANAGER_NAME="wildpaqet"
 readonly MANAGER_PATH="${WILDPAQET_MANAGER_PATH:-${WILDPAQET_BIN_DIR:-/usr/local/bin}/$MANAGER_NAME}"
 readonly MANAGER_SCRIPT_FILE="wildpaqet.sh"
@@ -606,6 +606,23 @@ validate_forward_rules() {
 }
 
 # Generate secret key
+# Escape a value so it survives a YAML double-quoted scalar.
+#
+# A secret or SOCKS5 password containing a double quote or a backslash
+# otherwise produces a config the core cannot parse, and the resulting YAML
+# syntax error never names the value that broke it - in the server wizard that
+# failure only surfaces after a full Let's Encrypt issue has already run.
+yaml_escape_dq() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# Reject a value that cannot live on a single YAML line at all. Stripping the
+# control characters must leave the value unchanged.
+yaml_value_is_safe() {
+    local value="$1"
+    [ "$(printf '%s' "$value" | tr -d '[:cntrl:]')" = "$value" ]
+}
+
 generate_secret_key() {
     if command -v openssl &>/dev/null; then
         openssl rand -base64 32 | tr -dc 'a-zA-Z0-9' | head -c 32
@@ -651,6 +668,46 @@ resolve_core_download_url() {
 }
 
 # Compare floats (with bc fallback)
+# Verify a downloaded core archive against the checksum published beside it.
+#
+# The archive is unpacked and its binary is run as root, so a wrong file is a
+# code-execution problem, not a convenience one. Releases built by
+# .github/workflows/build-core.yml publish a .sha256 next to each tarball.
+# Older releases and third-party URLs do not, so a missing checksum is
+# reported and allowed; a checksum that is present and does not match is fatal.
+verify_core_tarball_checksum() {
+    local archive="$1"
+    local url="$2"
+    [ -f "$archive" ] || return 1
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        print_warning "sha256sum is not available; core archive integrity not verified"
+        return 0
+    fi
+    local sums="${archive}.sha256"
+    rm -f "$sums"
+    if ! curl -fsSL --connect-timeout 15 --max-time 60 "${url}.sha256" -o "$sums" 2>/dev/null; then
+        rm -f "$sums"
+        print_warning "This release publishes no checksum; core archive integrity not verified"
+        return 0
+    fi
+    local expected actual
+    expected=$(awk 'NR==1 {print $1; exit}' "$sums" 2>/dev/null)
+    rm -f "$sums"
+    if [[ ! "$expected" =~ ^[[:xdigit:]]{64}$ ]]; then
+        print_warning "Published checksum is malformed; core archive integrity not verified"
+        return 0
+    fi
+    actual=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
+    if [ "${actual,,}" != "${expected,,}" ]; then
+        print_error "Core archive checksum does not match the published value"
+        print_info "expected: $expected"
+        print_info "actual:   $actual"
+        return 1
+    fi
+    print_success "Core archive checksum verified"
+    return 0
+}
+
 compare_floats() {
     local value=$1
     local threshold=$2
@@ -2365,7 +2422,19 @@ v3_validate_endpoint() {
 v3_validate_cover_path() {
 	local cover_path="$1"
 	[[ "$cover_path" =~ ^/[A-Za-z0-9._~/-]{1,159}$ ]] || return 1
-	[[ "$cover_path" != *".."* && "$cover_path" != *"//"* ]]
+	# The core additionally requires path.Clean(cover_path) == cover_path
+	# (conf/tls.go). Without the checks below the wizard happily accepts
+	# "/api/v1/events/", "/." or "/a/./b", writes them into the YAML and the
+	# pairing code, and the service then refuses to start with an error that
+	# never mentions the path - on the server only after a full ACME issue.
+	[[ "$cover_path" != *"//"* ]] || return 1
+	[[ "$cover_path" != */ ]] || return 1
+	local segment
+	local IFS='/'
+	for segment in $cover_path; do
+		[ "$segment" != "." ] && [ "$segment" != ".." ] || return 1
+	done
+	return 0
 }
 
 v3_b64_encode() {
@@ -2989,6 +3058,11 @@ configure_v3_tls_server() {
         pause
         return 1
     fi
+    if ! yaml_value_is_safe "$secret_key"; then
+        print_error "The shared secret may not contain tabs, newlines or control characters"
+        pause
+        return 1
+    fi
 
     read -r -p "Public TLS domain (A/AAAA must point to this server): " identity
     if [ -z "$identity" ]; then
@@ -3017,7 +3091,12 @@ configure_v3_tls_server() {
 		pause
 		return 1
 	fi
-	read -r -p "Local website URL [Enter = standard 404; configure a real site for production]: " decoy_url
+	echo -e "${YELLOW}Decoy site${NC} - this is what an active prober sees on this domain."
+	echo "  Iran DPI probes endpoints. A domain with a valid certificate that answers"
+	echo "  nothing but an error page on every path is itself a signal, even though the"
+	echo "  error page now looks like an ordinary web server rather than a Go program."
+	echo -e "  ${CYAN}Point this at a real site you already run${NC} (for example http://127.0.0.1:8080)."
+	read -r -p "Local website URL [Enter = built-in 404 page; a real site is strongly recommended]: " decoy_url
 	if [ -n "$decoy_url" ] && [[ ! "$decoy_url" =~ ^https?://[A-Za-z0-9.:[\]-]+(/[A-Za-z0-9._~/-]*)?$ ]]; then
 		print_error "Decoy URL must be a simple http(s) URL such as http://127.0.0.1:8080"
 		pause
@@ -3111,9 +3190,9 @@ configure_v3_tls_server() {
         echo '  tls:'
 		echo '    mode: "h2"'
 		echo "    server_name: \"$identity\""
-        echo "    cert_file: \"$cert_file\""
-        echo "    key_file: \"$key_file\""
-        echo "    secret: \"$secret_key\""
+        echo "    cert_file: \"$(yaml_escape_dq "$cert_file")\""
+        echo "    key_file: \"$(yaml_escape_dq "$key_file")\""
+        echo "    secret: \"$(yaml_escape_dq "$secret_key")\""
         echo '    alpn: "h2"'
 		echo "    cover_path: \"$cover_path\""
 		[ -n "$decoy_url" ] && echo "    decoy_url: \"$decoy_url\""
@@ -3373,7 +3452,11 @@ configure_v3_tls_client() {
         fi
 		echo "TLS carrier:"
 		echo " 1. Real HTTP/2 cover (recommended)"
-		echo " 2. Legacy direct TLS"
+		echo " 2. Legacy direct TLS (compatibility only - see the warning below)"
+		echo -e "    ${YELLOW}Direct TLS has no DPI cover:${NC} it uses the Go TLS fingerprint instead"
+		echo "    of a browser one, sends no SNI unless you enable it, and follows the"
+		echo "    handshake with a fixed-size authentication record that no real HTTPS"
+		echo "    session produces. Choose it only to talk to an older peer."
 		read -r -p "Choose [1]: " carrier_choice
 		carrier_choice="${carrier_choice:-1}"
 		if [ "$carrier_choice" = "1" ]; then
@@ -3417,6 +3500,11 @@ configure_v3_tls_client() {
         pause
         return 1
     fi
+    if ! yaml_value_is_safe "$secret_key"; then
+        print_error "The shared secret may not contain tabs, newlines or control characters"
+        pause
+        return 1
+    fi
 
     echo "Traffic mode:"
     echo " 1. TCP port forwarding"
@@ -3434,7 +3522,12 @@ configure_v3_tls_client() {
         if [ -n "$socks_user" ]; then
             read -r -s -p "SOCKS5 password: " socks_pass; echo
             [ -n "$socks_pass" ] || { print_error "Password is required"; pause; return 1; }
-            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"\n    username: \"$socks_user\"\n    password: \"$socks_pass\"")
+            if ! yaml_value_is_safe "$socks_user" || ! yaml_value_is_safe "$socks_pass"; then
+                print_error "SOCKS5 credentials may not contain tabs, newlines or control characters"
+                pause
+                return 1
+            fi
+            socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"\n    username: \"$(yaml_escape_dq "$socks_user")\"\n    password: \"$(yaml_escape_dq "$socks_pass")\"")
         else
             socks5_entries+=("  - listen: \"0.0.0.0:$socks_port\"")
         fi
@@ -3499,8 +3592,8 @@ configure_v3_tls_client() {
 		echo "    mode: \"$cover_mode\""
         [ -n "$server_name" ] && echo "    server_name: \"$server_name\""
 		[ "$send_server_name" = "true" ] && echo '    send_server_name: true'
-        [ -n "$ca_file" ] && echo "    ca_file: \"$ca_file\""
-        echo "    secret: \"$secret_key\""
+        [ -n "$ca_file" ] && echo "    ca_file: \"$(yaml_escape_dq "$ca_file")\""
+        echo "    secret: \"$(yaml_escape_dq "$secret_key")\""
         echo '    alpn: "h2"'
 		if [ "$cover_mode" = "h2" ]; then
 			echo "    cover_path: \"$cover_path\""
@@ -3804,7 +3897,7 @@ configure_server() {
             [[ -n "$transport_udpbuf" ]] && echo "  udpbuf: $transport_udpbuf"
             
             echo "  kcp:"
-            echo "    key: \"$secret_key\""
+            echo "    key: \"$(yaml_escape_dq "$secret_key")\""
             
             if [ "$mode_name" = "manual" ] && [ -n "$kcp_fragment" ]; then
                 # For manual mode, add block and mtu separately
@@ -4227,7 +4320,7 @@ configure_client() {
                     echo -e "Authentication: ${GREEN}Enabled${NC}"
                     SOCKS5_USER="$socks_user"
                     SOCKS5_PASS="$socks_pass"
-                    socks5_entries+=("  - listen: \"127.0.0.1:$socks_port\"\n    username: \"$socks_user\"\n    password: \"$socks_pass\"")
+                    socks5_entries+=("  - listen: \"127.0.0.1:$socks_port\"\n    username: \"$(yaml_escape_dq "$socks_user")\"\n    password: \"$(yaml_escape_dq "$socks_pass")\"")
                 else
                     echo -e "Authentication: ${YELLOW}Disabled${NC}"
                     socks5_entries+=("  - listen: \"127.0.0.1:$socks_port\"")
@@ -4319,7 +4412,7 @@ configure_client() {
             [[ -n "$transport_udpbuf" ]] && echo "  udpbuf: $transport_udpbuf"
             
             echo "  kcp:"
-            echo "    key: \"$secret_key\""
+            echo "    key: \"$(yaml_escape_dq "$secret_key")\""
             
             if [ "$mode_name" = "manual" ] && [ -n "$kcp_fragment" ]; then
                 echo "    mode: \"manual\""
@@ -5205,12 +5298,22 @@ build_wildpaqet_core_from_source() {
         echo -e "  ${CYAN}Kharej:${NC} cd $BIN_DIR && python3 -m http.server 8899"
         echo -e "  ${CYAN}Here:${NC}   curl -fsSL http://<KHAREJ_IP>:8899/paqet -o /tmp/paqet.new \\"
         echo -e "           && chmod +x /tmp/paqet.new && mv -f /tmp/paqet.new $BIN_DIR/paqet"
+        echo -e "  ${YELLOW}Then stop the staging server on Kharej (Ctrl+C).${NC} An open 8899 serves"
+        echo    "  your binaries to any internet scanner and is a finding in its own right."
+        echo -e "  ${CYAN}scp${NC} avoids the open port entirely and is preferred when it is available."
         pause
         return 1
     fi
 
     local build_out="/tmp/paqet_linux_${arch_name}"
-    print_info "Compiling (CGO + libpcap)..."
+    # Read the version out of the source that is about to be compiled.
+    # Hard-coding it here meant the manager and core/cmd/version/version.go
+    # had to be bumped in lockstep, and a missed bump silently produced a
+    # binary that reported the wrong version.
+    local core_version
+    core_version=$(awk -F'"' '/Version[[:space:]]*=[[:space:]]*"/ {print $2; exit}' "$CORE_SRC_DIR/core/cmd/version/version.go" 2>/dev/null)
+    [ -n "$core_version" ] || core_version="unknown-wildpaqet"
+    print_info "Compiling (CGO + libpcap) $core_version..."
     (
         cd "$CORE_SRC_DIR/core" || exit 1
         export CGO_ENABLED=1
@@ -5218,7 +5321,7 @@ build_wildpaqet_core_from_source() {
         export GOPROXY="${GOPROXY:-https://goproxy.cn,direct}"
         export GOSUMDB="${GOSUMDB:-sum.golang.google.cn}"
         timeout 1800 "$BUILD_GO_BIN" build -trimpath -ldflags "-s -w \
-			-X 'paqet/cmd/version.Version=v3.4.1-wildpaqet' \
+			-X 'paqet/cmd/version.Version=${core_version}' \
             -X 'paqet/cmd/version.GitTag=${MANAGER_BRANCH}' \
             -X 'paqet/cmd/version.GitCommit=${source_commit}' \
             -X 'paqet/cmd/version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
@@ -5340,6 +5443,11 @@ install_paqet() {
                 pause
                 return 1
             else
+                if ! verify_core_tarball_checksum "/tmp/paqet.tar.gz" "$download_url"; then
+                    rm -f "/tmp/paqet.tar.gz"
+                    pause
+                    return 1
+                fi
                 print_success "Downloaded version ${latest_version}"
                 cp "/tmp/paqet.tar.gz" "/root/paqet/$expected_file" 2>/dev/null && \
                 print_info "Saved copy to /root/paqet/$expected_file for future use"
@@ -5418,6 +5526,8 @@ install_paqet() {
                 return 1
             fi
             
+            print_warning "A custom URL is unverified code that will run as root on this host."
+            print_info "Use it only for a build you produced yourself."
             print_info "Downloading from custom URL..."
             if ! curl -fsSL "$custom_url" -o "/tmp/paqet.tar.gz" 2>/dev/null; then
                 print_error "Download failed"
@@ -5427,6 +5537,11 @@ install_paqet() {
                 pause
                 return 1
             else
+                if ! verify_core_tarball_checksum "/tmp/paqet.tar.gz" "$custom_url"; then
+                    rm -f "/tmp/paqet.tar.gz"
+                    pause
+                    return 1
+                fi
                 print_success "Downloaded from custom URL"
             fi
             ;;
@@ -5664,8 +5779,31 @@ update_manager_script() {
     
     print_info "Downloading latest version..."
     
-    if curl -fsSL "$manager_url" -o "$MANAGER_PATH" 2>/dev/null; then
-        sed -i 's/\r$//' "$MANAGER_PATH" 2>/dev/null || true
+    # Stage the download and validate it before it replaces the live command.
+    #
+    # curl -f only rejects an HTTP error status. A captive portal, a proxy
+    # notice or a truncated CDN response all arrive as 200 and would otherwise
+    # be installed straight over $MANAGER_PATH, leaving the host without a
+    # working manager - the same failure mode as the 2026-08-03 outage. The
+    # install path already guards this with is_manager_binary_ok; this one
+    # did not.
+    local staged="${MANAGER_PATH}.update.$$"
+    if curl -fsSL "$manager_url" -o "$staged" 2>/dev/null; then
+        sed -i 's/\r$//' "$staged" 2>/dev/null || true
+        chmod +x "$staged" 2>/dev/null || true
+        if ! is_manager_binary_ok "$staged"; then
+            rm -f "$staged"
+            print_error "Downloaded file is not a valid WildPaqet manager"
+            print_info "The installed manager was left untouched"
+            pause
+            return 1
+        fi
+        if ! mv -f "$staged" "$MANAGER_PATH"; then
+            rm -f "$staged"
+            print_error "Could not install the downloaded manager"
+            pause
+            return 1
+        fi
         chmod +x "$MANAGER_PATH"
         rm -f "/usr/local/bin/paqet-manager" 2>/dev/null || true
         ln -sf "$MANAGER_PATH" /usr/bin/wildpaqet 2>/dev/null || true
@@ -5679,8 +5817,9 @@ update_manager_script() {
         new_version=$(grep "SCRIPT_VERSION=" "$MANAGER_PATH" | head -1 | cut -d'"' -f2)
         [ -n "$new_version" ] && echo -e "${CYAN}New version:${NC} $new_version"
     else
+        rm -f "$staged"
         print_error "Failed to download manager script"
-        mv "$backup_path" "$MANAGER_PATH" 2>/dev/null
+        [ -f "$MANAGER_PATH" ] || mv "$backup_path" "$MANAGER_PATH" 2>/dev/null
         pause
         return 1
     fi
@@ -8815,7 +8954,11 @@ cleanup_managed_firewall_rules() {
     rm -f "$remaining_file" "$firewalld_reload_file" 2>/dev/null || true
     if [ -f "$FIREWALL_STATE_FILE" ]; then
         while IFS='|' read -r backend protocol port; do
-            if ! validate_port "$port" 2>/dev/null || [ "$protocol" != "tcp" ]; then
+            # UDP port forwards record a udp allowance (see
+            # apply_forward_listener_firewall). Skipping it here left the
+            # port open after a full uninstall and made this function report
+            # failure, which in turn kept $STATE_DIR on disk.
+            if ! validate_port "$port" 2>/dev/null \n                || { [ "$protocol" != "tcp" ] && [ "$protocol" != "udp" ]; }; then
                 printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
                 failed=1
                 continue
@@ -8827,8 +8970,8 @@ cleanup_managed_firewall_rules() {
                         || ! ufw_added=$(ufw show added 2>/dev/null); then
                         printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
                         failed=1
-                    elif printf '%s\n' "$ufw_added" | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${port}/tcp([[:space:]]|$)" \
-                        && ! ufw --force delete allow "$port/tcp" >/dev/null 2>&1; then
+                    elif printf '%s\n' "$ufw_added" | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${port}/${protocol}([[:space:]]|$)" \
+                        && ! ufw --force delete allow "$port/$protocol" >/dev/null 2>&1; then
                         printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$remaining_file"
                         failed=1
                     fi
@@ -8836,8 +8979,8 @@ cleanup_managed_firewall_rules() {
                 firewalld)
                     if command -v firewall-cmd >/dev/null 2>&1 \
                         && firewall-cmd --state >/dev/null 2>&1; then
-                        if firewall-cmd --permanent --query-port="$port/tcp" >/dev/null 2>&1; then
-                            if firewall-cmd --permanent --remove-port="$port/tcp" >/dev/null 2>&1; then
+                        if firewall-cmd --permanent --query-port="$port/$protocol" >/dev/null 2>&1; then
+                            if firewall-cmd --permanent --remove-port="$port/$protocol" >/dev/null 2>&1; then
                                 firewalld_changed=1
                                 printf '%s|%s|%s\n' "$backend" "$protocol" "$port" >> "$firewalld_reload_file"
                             else
@@ -8929,9 +9072,15 @@ cleanup_managed_firewall_for_config() {
 
     while IFS='|' read -r backend protocol tracked_port; do
         matched=0
-        for port in "${ports[@]}"; do
-            [ "$protocol" = "tcp" ] && [ "$tracked_port" = "$port" ] && matched=1
-        done
+        # A port opened for this config belongs to it in both protocols: a
+        # TCP+UDP forward records one entry per protocol.
+        case "$protocol" in
+            tcp|udp)
+                for port in "${ports[@]}"; do
+                    [ "$tracked_port" = "$port" ] && matched=1
+                done
+                ;;
+        esac
         if [ "$matched" -eq 0 ]; then
             printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
             continue
@@ -8943,8 +9092,8 @@ cleanup_managed_firewall_for_config() {
                     printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
                     failed=1
                 elif ufw show added 2>/dev/null \
-                    | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${tracked_port}/tcp([[:space:]]|$)" \
-                    && ! ufw --force delete allow "$tracked_port/tcp" >/dev/null 2>&1; then
+                    | grep -Eq "^ufw[[:space:]]+allow[[:space:]]+${tracked_port}/${protocol}([[:space:]]|$)" \
+                    && ! ufw --force delete allow "$tracked_port/$protocol" >/dev/null 2>&1; then
                     printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
                     failed=1
                 fi
@@ -8954,8 +9103,8 @@ cleanup_managed_firewall_for_config() {
                     || ! firewall-cmd --state >/dev/null 2>&1; then
                     printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"
                     failed=1
-                elif firewall-cmd --permanent --query-port="$tracked_port/tcp" >/dev/null 2>&1; then
-                    if firewall-cmd --permanent --remove-port="$tracked_port/tcp" >/dev/null 2>&1; then
+                elif firewall-cmd --permanent --query-port="$tracked_port/$protocol" >/dev/null 2>&1; then
+                    if firewall-cmd --permanent --remove-port="$tracked_port/$protocol" >/dev/null 2>&1; then
                         firewalld_changed=1
                     else
                         printf '%s|%s|%s\n' "$backend" "$protocol" "$tracked_port" >> "$remaining_file"

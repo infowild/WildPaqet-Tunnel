@@ -60,6 +60,9 @@ jobs:
       - name: Test full uninstall cleanup and state restoration
         run: bash .github/tests/uninstall-cleanup.sh
 
+      - name: Test manager hardening (cover path, YAML, firewall, self-update)
+        run: bash .github/tests/manager-hardening.sh
+
       - name: Test HTTP/2 cover at packet level
         working-directory: core
         run: go test -count=1 -run 'TestH2Cover(PacketLevelUsesRealPrefaceAndFrames|ClientHelloExposesOnlyPublicSNIAndALPN|TransportRoundTripAndDecoy)' ./internal/tnet/tls
@@ -173,13 +176,23 @@ jobs:
             example/client.yaml.example example/server.yaml.example \
             example/client-tls.yaml.example example/server-tls.yaml.example \
             -C /src docs/V3-INSTALL.md
+
+          # Publish a checksum beside every tarball. The manager fetches
+          # "<tarball-url>.sha256" and refuses to install an archive whose
+          # digest does not match, so the binary it runs as root is not
+          # trusted on transport security alone.
+          ARCHIVE=paqet-linux-${FILENAME}-${VERSION}.tar.gz
+          cd /src/dist
+          sha256sum "$ARCHIVE" | awk '{print $1}' > "$ARCHIVE.sha256"
           EOF
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: paqet-linux-${{ matrix.filename }}
-          path: dist/paqet-linux-${{ matrix.filename }}-${{ steps.ref_id.outputs.ref }}.tar.gz
+          path: |
+            dist/paqet-linux-${{ matrix.filename }}-${{ steps.ref_id.outputs.ref }}.tar.gz
+            dist/paqet-linux-${{ matrix.filename }}-${{ steps.ref_id.outputs.ref }}.tar.gz.sha256
           retention-days: 14
 
   release:

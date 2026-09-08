@@ -19,12 +19,15 @@ Iran IP block and does not promise DPI invisibility.
   A minimal, MIT-licensed smux v1.5.53 snapshot implements this scheduling; see
   `core/third_party/smux/UPSTREAM.md`. The wire protocol is unchanged.
 - The shared Welcome page is removed. Without `decoy_url`, ordinary requests
-  receive standard 404. A configured site's routes are preserved; backend
-  outages return standard 502. Unauthenticated CONNECT is rejected with 404.
+  receive a web-server 404 page. A configured site's routes are preserved;
+  backend outages return a 502 page. Unauthenticated CONNECT is rejected with
+  405. Since v3.4.2 none of these responses carry Go's default bodies, and all
+  of them send a `Server` header - the previous defaults identified the host as
+  a bare Go program to any prober.
 - `tls.mode` must be explicit. Omitted mode now fails validation before startup
   rather than silently selecting the legacy direct carrier.
 - The manager pins source downloads to a resolved Git commit and embeds that
-  commit in the binary's version output. The core version is v3.4.1-wildpaqet.
+  commit in the binary's version output. The core version is v3.4.2-wildpaqet.
 
 ## Before updating servers
 

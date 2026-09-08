@@ -36,6 +36,20 @@ _review_*
 .env
 .env.*
 
+# Invariant tests that must run in CI. Without these lines the *_test.go rule
+# above hides them from the repository, so internal/pkg/buffer and
+# internal/socket ship with no tests at all and the half-close, frame-size,
+# HTTP/2 window and SEQ/ACK guarantees are never checked on a clean checkout.
+!core/internal/pkg/buffer/relay_test.go
+!core/internal/tnet/tls/h2_pipe_test.go
+!core/internal/tnet/tls/h2_window_test.go
+!core/internal/socket/send_handle_test.go
+!core/internal/socket/socket_test.go
+!core/internal/conf/kcp_test.go
+!core/internal/conf/tcp_test.go
+!core/internal/client/dial_test.go
+!core/internal/tnet/tls/probe_surface_test.go
+
 # Transport resilience regression tests and pinned dependency tests.
 !core/internal/client/resilience_test.go
 !core/internal/forward/tcp_test.go

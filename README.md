@@ -117,6 +117,45 @@ wildpaqet
 
 ---
 
+## Probe resistance and manager hardening (9.17-v3 / Core v3.4.2)
+
+An active prober is the part of the threat model the cover story used to fail.
+Two measured signals are gone:
+
+- **The default decoy no longer identifies the host as a Go program.** With
+  `decoy_url` unset the endpoint answered every path and every method with Go's
+  literal `404 page not found` body and no `Server` header. It now answers like
+  an ordinary web server. Pointing `decoy_url` at a site you already run is
+  still the better configuration and the wizard now says so.
+- **The server accepts TLS 1.2 again.** Practically every real HTTPS site does;
+  refusing one separated this endpoint from the web in a single unauthenticated
+  handshake. The tunnel itself never downgrades - the cover client now rejects
+  any session that does not negotiate TLS 1.3, because in 1.2 the server
+  certificate travels in the clear.
+
+The wizard also warns that legacy `direct` TLS has no cover at all: it uses the
+Go TLS fingerprint rather than a browser one, omits SNI unless enabled, and
+follows the handshake with a fixed-size authentication record.
+
+On the manager side:
+
+- `wildpaqet` `0 -> 5` now stages and validates its download before replacing
+  the live command. A captive portal or proxy notice returns HTTP 200 and used
+  to overwrite the installed manager with an error page.
+- Downloaded core archives are checked against a `.sha256` published beside each
+  release tarball; a mismatch aborts the install.
+- UDP port-forward firewall rules are removed on service removal and full
+  uninstall. They were left open, and their presence made uninstall report
+  failure and keep its state directory.
+- A cover path such as `/api/v1/events/` is rejected by the wizard instead of
+  producing a config the core refuses to load.
+- A shared secret or SOCKS5 password containing a quote or backslash is escaped
+  into the YAML instead of corrupting it.
+
+Both ends can be upgraded independently; nothing here changes the wire protocol.
+
+---
+
 ## Core v3.4.1 transport resilience
 
 The v3 branch now builds **WildPaqet Core v3.4.1**. This release fixes endpoint

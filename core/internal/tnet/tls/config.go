@@ -75,8 +75,16 @@ func serverTLSConfig(cfg *conf.TLS) (*tls.Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load TLS certificate: %w", err)
 	}
+	// Accepting TLS 1.2 is a cover requirement, not a security concession.
+	//
+	// Practically every real HTTPS site still answers a TLS 1.2 ClientHello.
+	// A server that refuses one outright is a small enough minority that a
+	// single unauthenticated probe separates it from the web, which is exactly
+	// the signal the HTTP/2 cover exists to avoid. The tunnel itself never
+	// downgrades: the direct client pins MinVersion TLS 1.3, and the h2 client
+	// rejects any handshake that does not negotiate 1.3 (see dialCoverTLS).
 	return &tls.Config{
-		MinVersion:     tls.VersionTLS13,
+		MinVersion:     tls.VersionTLS12,
 		GetCertificate: reloader.getCertificate,
 		NextProtos:     []string{cfg.ALPN},
 	}, nil

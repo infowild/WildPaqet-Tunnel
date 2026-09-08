@@ -9,8 +9,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"sync"
 	"syscall"
 	"time"
@@ -168,7 +166,9 @@ func (l *h2Listener) serveDecoy(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("Authorization")
 	r.Header.Del("Proxy-Authorization")
 	if r.Method == http.MethodConnect {
-		http.NotFound(w, r)
+		// An origin server does not proxy. Answering Go's plain-text 404 here
+		// would set an unauthenticated CONNECT apart from every other probe.
+		writeDecoyStatus(w, http.StatusMethodNotAllowed)
 		return
 	}
 	l.decoy.ServeHTTP(w, r)
@@ -198,27 +198,6 @@ func (l *h2Listener) Close() error {
 func (l *h2Listener) Addr() net.Addr                      { return l.listener.Addr() }
 func (l *h2Listener) SetClientTCPF(net.Addr, []conf.TCPF) {}
 func (l *h2Listener) DeleteClientTCPF(net.Addr)           {}
-
-func newDecoyHandler(rawURL string) http.Handler {
-	if rawURL != "" {
-		if target, err := url.Parse(rawURL); err == nil && target.Host != "" && (target.Scheme == "http" || target.Scheme == "https") {
-			proxy := httputil.NewSingleHostReverseProxy(target)
-			// Requests are made to an explicitly configured backend, not to the
-			// arbitrary Host supplied by a visitor.
-			director := proxy.Director
-			proxy.Director = func(r *http.Request) {
-				director(r)
-				r.Host = target.Host
-			}
-			proxy.ErrorLog = log.New(io.Discard, "", 0)
-			proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
-				http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-			}
-			return proxy
-		}
-	}
-	return http.NotFoundHandler()
-}
 
 const (
 	// h2MinUploadWindow keeps Go's own default as the floor.

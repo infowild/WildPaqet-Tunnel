@@ -27,7 +27,7 @@ On each Kharej host:
 2. Use TCP port `443` when it is free.
 3. Use a publicly trusted certificate and a DNS name that resolves to the server. A self-signed certificate is retained for testing but is visible to an active probe. The wizard reuses a still-valid public certificate for the domain you enter, or requests one from Let's Encrypt with acme.sh/certbot (HTTP-01 on TCP/80) and then locates the issued files automatically.
 4. Use the same certificate name and 32+ character shared secret on all four servers. The wizard then derives the same opaque HTTP/2 cover path automatically. The path is pairing metadata, not an authentication secret.
-5. Optionally point `decoy_url` at a real local website such as `http://127.0.0.1:8080`; otherwise a standard 404 is served. Configure a real site for production; backend outages return 502 instead of a shared welcome page.
+5. Point `decoy_url` at a real local website such as `http://127.0.0.1:8080`. Without it the endpoint answers every path with a web-server 404 page - unremarkable, but a certificate-bearing domain that serves nothing is still something an active prober can notice. Backend outages return a 502 page, never a shared welcome page.
 6. Keep each private key on its own server.
 7. Copy the `WPQ4` pairing code printed by the wizard. A code that carries a certificate chain is longer than a terminal can accept on one line, so it is printed as a block of 120-character lines that ends with `WPQEND`; copy the whole block. It is also saved beside the certificate as `pairing-code.txt`, which can be copied to Iran with `scp` instead.
 
@@ -142,7 +142,7 @@ those before assuming the path is at fault.
 - Visible SNI and ALPN `h2` are followed by the standards-required HTTP/2 preface, SETTINGS and DATA frames.
 - The server certificate is verified against the configured CA bundle or system trust store.
 - HTTP/2 cover mode requires SNI. A publicly trusted certificate is recommended for active-probe resistance.
-- Ordinary requests reach the configured local website (or standard 404); unauthenticated CONNECT requests receive 404. Backend errors return 502.
+- Ordinary requests reach the configured local website (or a web-server 404 page); unauthenticated CONNECT receives 405, the way an origin server that does not proxy would answer. Backend errors return 502. None of these responses expose Go's own default bodies or a missing `Server` header.
 - An encrypted HMAC bearer token binds the opaque path, timestamp and random nonce.
 - Timestamps outside a two-minute window and reused nonces are rejected before smux starts.
 - Authentication and ALPN negotiation fail closed.

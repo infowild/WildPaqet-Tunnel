@@ -156,8 +156,16 @@ func dialCoverTLS(ctx context.Context, network, endpoint string, cfg *conf.TLS, 
 	if err := uconn.HandshakeContext(handshakeCtx); err != nil {
 		return fail(fmt.Errorf("h2: TLS handshake with %s: %w", endpoint, err))
 	}
-	if uconn.ConnectionState().NegotiatedProtocol != "h2" {
+	state := uconn.ConnectionState()
+	if state.NegotiatedProtocol != "h2" {
 		return fail(fmt.Errorf("h2: peer did not negotiate HTTP/2"))
+	}
+	// The ClientHello offers the browser range so it stays a browser
+	// ClientHello, but the tunnel must not actually run below TLS 1.3: in 1.2
+	// the server certificate travels in the clear, which would hand an observer
+	// the one identity the handshake otherwise keeps encrypted.
+	if state.Version != utls.VersionTLS13 {
+		return fail(fmt.Errorf("h2: peer negotiated TLS 0x%04x, want TLS 1.3", state.Version))
 	}
 	return uconn, nil
 }
