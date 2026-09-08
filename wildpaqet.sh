@@ -7053,10 +7053,20 @@ if ! openssl x509 -in "$tmp/cert.pem" -noout -subject >/dev/null 2>&1; then
 fi
 # Parsing is not enough. A valid certificate for some other name passes every
 # other check here and then fails on the client, which verifies the name.
-if ! openssl x509 -in "$tmp/cert.pem" -noout -checkhost "$DOMAIN" >/dev/null 2>&1; then
-    logger -t wp-cert-pull "downloaded certificate is not valid for $DOMAIN"
-    exit 1
-fi
+#
+# The result is read from the output rather than the exit status on purpose:
+# older openssl builds print "does NOT match" and still exit 0, so trusting the
+# status accepts a certificate for any name at all. The wording is stable
+# (apps/x509.c prints "Hostname %s does%s match certificate"), and an openssl
+# that fails outright produces no match either, so this fails closed.
+hostcheck=$(openssl x509 -in "$tmp/cert.pem" -noout -checkhost "$DOMAIN" 2>/dev/null || true)
+case "$hostcheck" in
+    *"does match"*) ;;
+    *)
+        logger -t wp-cert-pull "downloaded certificate is not valid for $DOMAIN"
+        exit 1
+        ;;
+esac
 cert_pub=$(openssl x509 -in "$tmp/cert.pem" -noout -pubkey 2>/dev/null | openssl sha256)
 key_pub=$(openssl pkey -in "$tmp/key.pem" -pubout 2>/dev/null | openssl sha256)
 if [ -z "$cert_pub" ] || [ "$cert_pub" != "$key_pub" ]; then
@@ -7078,10 +7088,14 @@ mv -f "$DEST_KEY.wpnew" "$DEST_KEY"
 logger -t wp-cert-pull "installed a renewed certificate for $DOMAIN"
 
 # If the pull has been failing quietly, this is what makes it visible while
-# there is still time to do something about it.
-if ! openssl x509 -in "$DEST_CERT" -noout -checkend 1728000 >/dev/null 2>&1; then
-    logger -t wp-cert-pull "WARNING: certificate for $DOMAIN expires in under 20 days"
-fi
+# there is still time to do something about it. Read the text here too, and
+# treat anything unexpected as a reason to warn: a warning nobody needed costs
+# a log line, a warning that never fires costs the tunnel.
+expiry=$(openssl x509 -in "$DEST_CERT" -noout -checkend 1728000 2>/dev/null || true)
+case "$expiry" in
+    *"will not expire"*) ;;
+    *) logger -t wp-cert-pull "WARNING: certificate for $DOMAIN expires in under 20 days" ;;
+esac
 CERTSYNC_PULL_BODY
     } > "$CERTSYNC_PULL_SCRIPT"
     chmod 755 "$CERTSYNC_PULL_SCRIPT"

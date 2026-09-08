@@ -123,6 +123,34 @@ bundle_of "$trunc"
 [ "$(cat "$work/dest/cert.pem")" = "$good" ] || fail "a truncated certificate replaced the working one"
 ok
 
+sec "the name check does not depend on openssl's exit status"
+# Older openssl builds print "does NOT match" and still exit 0. A check written
+# against the exit status therefore passes on a modern developer machine and
+# accepts a certificate for any name at all on an older runner - which is
+# exactly how this shipped broken once. The stub reproduces that build.
+real_openssl=$(command -v openssl)
+cat > "$work/stub/openssl" <<STUB
+#!/bin/sh
+for a in "\$@"; do
+    if [ "\$a" = "-checkhost" ]; then
+        "$real_openssl" "\$@" 2>/dev/null || true
+        exit 0
+    fi
+done
+exec "$real_openssl" "\$@"
+STUB
+chmod +x "$work/stub/openssl"
+# Sanity: the stub really does mask the failure the way the old build did.
+"$work/stub/openssl" x509 -in "$wrong/cert.pem" -noout -checkhost crm.example.test >/dev/null 2>&1 \
+    || fail "the stub does not reproduce an exit-0 openssl"
+bundle_of "$wrong"
+"$WILDPAQET_CERTSYNC_PULL" >/dev/null 2>&1 \
+    && fail "the wrong name was accepted when openssl exits 0"
+[ "$(cat "$work/dest/cert.pem")" = "$good" ] \
+    || fail "a certificate for the wrong name replaced the working one on an exit-0 openssl"
+rm -f "$work/stub/openssl"
+ok
+
 sec "removal leaves nothing behind"
 certsync_write_state replica crm.example.test root@198.51.100.7 "$work/dest/cert.pem" "$work/dest/key.pem"
 [ -f "$WILDPAQET_CERTSYNC_STATE" ] || fail "state file was not written"
